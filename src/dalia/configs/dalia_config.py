@@ -41,7 +41,7 @@ class DaliaConfig(BaseModel):
     # exit BFGS early if the reduction in the objective function is less than f_reduction_tol after f_reduction_lag iterations
     f_reduction_lag: int = 3
     f_reduction_tol: float = 1e-4
-    
+
     # exit BFGS early if the change in theta is less than theta_reduction_tol after theta_reduction_lag iterations
     theta_reduction_lag: int = 3
     theta_reduction_tol: float = 1e-4
@@ -50,6 +50,9 @@ class DaliaConfig(BaseModel):
     eps_inner_iteration: float = 1e-3
     eps_gradient_f: float = 1e-3
     eps_hessian_f: float = 5 * 1e-3
+
+    # --- Gradient computation method ------------------------------------------
+    gradient_method: Literal["finite_diff", "jax_autodiff"] = "finite_diff"
 
     # --- Directory paths ------------------------------------------------------
     simulation_dir: Path = Path("./dalia/")

@@ -28,6 +28,8 @@ from dalia.utils import (
     DummyCommunicator,
 )
 
+from dalia.core.jax_autodiff import create_pure_jax_objective
+
 if backend_flags["mpi_avail"]:
     from mpi4py import MPI
 
@@ -215,7 +217,30 @@ class DALIA:
         self.t_construction_qconditional = 0.0
         self.solver.t_cholesky = 0.0
         self.solver.t_solve = 0.0
-        
+
+        # --- Initialize JAX autodiff if specified
+        self.jax_objective = None
+        self.jax_grad_func = None
+        if self.config.gradient_method == "jax_autodiff":
+            # Only support Gaussian likelihood + dense solver + single process for now
+            can_use_pure_jax = (
+                self.model.is_likelihood_gaussian()
+                and self.config.solver.type == "dense"
+                and (not backend_flags["mpi_avail"] or comm_size == 1)
+            )
+
+            if can_use_pure_jax:
+                print_msg("Using JAX automatic differentiation with JIT compilation")
+                self.jax_objective, self.jax_grad_func = create_pure_jax_objective(
+                    dalia_instance=self,
+                )
+            else:
+                raise NotImplementedError(
+                    "JAX autodiff currently only supports: "
+                    "Gaussian likelihood + dense solver + single process. "
+                    "For other configurations, use gradient_method='finite_diff'."
+                )
+
         self._print_init()
 
         logging.info("DALIA initialized.")
@@ -453,9 +478,17 @@ class DALIA:
 
                         raise OptimizationConvergedEarlyExit()
 
+            # Choose objective function based on gradient method
+            if self.config.gradient_method == "jax_autodiff":
+                objective_func = self._objective_function_jax
+                print_msg("Using JAX automatic differentiation with JIT compilation")
+            else:
+                objective_func = self._objective_function
+                print_msg(f"Using finite differences (eps={self.eps_gradient_f})")
+
             try:
                 scipy_result = optimize.minimize(
-                    fun=self._objective_function,
+                    fun=objective_func,
                     x0=get_host(self.theta_optimizer),
                     method="L-BFGS-B",
                     jac=self.config.minimize.jac,
@@ -582,6 +615,45 @@ class DALIA:
 
         f_0 = get_host(self.f_values_i[0])
         grad_f = get_host(self.gradient_f)
+
+        synchronize(comm=self.comm_world)
+        toc = time.perf_counter()
+        self.objective_function_time.append(toc - tic)
+        self.solver_time.append(self.solver.t_cholesky + self.solver.t_solve)
+        self.construction_time.append(
+            self.t_construction_qprior + self.t_construction_qconditional
+        )
+
+        if self.iter > 0:
+            print(
+                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]} | solver_time: {self.solver_time[1:]} | construction_time: {self.construction_time[1:]}",
+                flush=True,
+            )
+        self.iter += 1
+
+        return (f_0, grad_f)
+
+    def _objective_function_jax(
+        self,
+        theta_i: NDArray,
+    ) -> tuple:
+        """Objective function using JAX automatic differentiation.
+
+        inputs:
+        theta_i : Hyperparameters theta.
+
+        Returns:
+        objective_function_evalutation : Function value f(theta) evaluated at theta_i and its gradient.
+        """
+        self.t_construction_qprior = 0.0
+        self.t_construction_qconditional = 0.0
+        self.solver.t_cholesky = 0.0
+        self.solver.t_solve = 0.0
+
+        synchronize(comm=self.comm_world)
+        tic = time.perf_counter()
+
+        f_0, grad_f = self.jax_grad_func(theta_i)
 
         synchronize(comm=self.comm_world)
         toc = time.perf_counter()

@@ -38,6 +38,7 @@ dependencies = [
 mpi4py = ["mpi4py"]
 cupy = ["cupy==13.2.0"]
 serinv = ["serinv @ git+https://github.com/vincent-maillou/serinv"]
+jax = ["jax>=0.4.0", "jaxlib>=0.4.0"]
 
 [project.urls]
 Code = "https://github.com/lisa-gm/DALIA"
