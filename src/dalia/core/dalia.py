@@ -222,22 +222,24 @@ class DALIA:
         self.jax_objective = None
         self.jax_grad_func = None
         if self.config.gradient_method == "jax_autodiff":
-            # Only support Gaussian likelihood + dense solver + single process for now
+            # JAX autodiff supports: Gaussian/Poisson/Binomial + dense solver + single process
+            supported_likelihoods = ["gaussian", "poisson", "binomial"]
             can_use_pure_jax = (
-                self.model.is_likelihood_gaussian()
+                self.model.likelihood_config.type in supported_likelihoods
                 and self.config.solver.type == "dense"
                 and (not backend_flags["mpi_avail"] or comm_size == 1)
             )
 
             if can_use_pure_jax:
-                print_msg("Using JAX automatic differentiation with JIT compilation")
+                likelihood_name = self.model.likelihood_config.type.capitalize()
+                print_msg(f"Using JAX automatic differentiation with JIT compilation ({likelihood_name} likelihood)")
                 self.jax_objective, self.jax_grad_func = create_pure_jax_objective(
                     dalia_instance=self,
                 )
             else:
                 raise NotImplementedError(
                     "JAX autodiff currently only supports: "
-                    "Gaussian likelihood + dense solver + single process. "
+                    "Gaussian/Poisson/Binomial likelihoods + dense solver + single process. "
                     "For other configurations, use gradient_method='finite_diff'."
                 )
 
@@ -341,15 +343,20 @@ class DALIA:
             "theta": minimization_result["theta"],
             "x": minimization_result["x"],
             "f": minimization_result["f"],
-            "grad_f": minimization_result["grad_f"],
-            "f_values": minimization_result["f_values"],
-            "theta_values": minimization_result["theta_values"],
             "cov_theta": cov_theta,
             "marginal_variances_latent": marginal_variances_latent,
             # "marginal_variances_observations": get_host(
             #     marginal_variances_observations
             # ),
         }
+
+        # Add optimization-specific results if they exist
+        if "grad_f" in minimization_result:
+            results["grad_f"] = minimization_result["grad_f"]
+        if "f_values" in minimization_result:
+            results["f_values"] = minimization_result["f_values"]
+        if "theta_values" in minimization_result:
+            results["theta_values"] = minimization_result["theta_values"]
 
         return results
 
@@ -481,7 +488,8 @@ class DALIA:
             # Choose objective function based on gradient method
             if self.config.gradient_method == "jax_autodiff":
                 objective_func = self._objective_function_jax
-                print_msg("Using JAX automatic differentiation with JIT compilation")
+                likelihood_name = self.model.likelihood_config.type.capitalize()
+                print_msg(f"Using JAX automatic differentiation with JIT compilation ({likelihood_name} likelihood)")
             else:
                 objective_func = self._objective_function
                 print_msg(f"Using finite differences (eps={self.eps_gradient_f})")
