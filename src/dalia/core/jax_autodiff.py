@@ -382,10 +382,8 @@ def _objective_poisson_dense(theta, static_data):
 
     Q_prior = jnp.eye(n_fixed_effects) * fixed_effects_precision
 
-    # No hyperparameters for Poisson (or use them if available)
     log_prior_hyperparameters = 0.0
 
-    # Inner iteration for non-Gaussian likelihood
     grad_fn = lambda eta: _gradient_poisson_likelihood_jax(eta, y, e)
     hess_fn = lambda eta: _hessian_diag_poisson_jax(eta, e)
 
@@ -398,8 +396,9 @@ def _objective_poisson_dense(theta, static_data):
     _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
     log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * x.T @ Q_prior @ x
 
+    # For non-Gaussian, DALIA uses x=None, x_mean=None -> quadratic_form=0
     _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
-    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * x.T @ Q_conditional @ x
+    log_conditional = 0.5 * logdet_Q_conditional
 
     objective = -(
         log_prior_hyperparameters
@@ -423,10 +422,8 @@ def _objective_binomial_dense(theta, static_data):
 
     Q_prior = jnp.eye(n_fixed_effects) * fixed_effects_precision
 
-    # No hyperparameters for Binomial (or use them if available)
     log_prior_hyperparameters = 0.0
 
-    # Inner iteration for non-Gaussian likelihood
     grad_fn = lambda eta: _gradient_binomial_likelihood_jax(eta, y, n_trials)
     hess_fn = lambda eta: _hessian_diag_binomial_jax(eta, n_trials)
 
@@ -439,8 +436,9 @@ def _objective_binomial_dense(theta, static_data):
     _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
     log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * x.T @ Q_prior @ x
 
+    # For non-Gaussian, DALIA uses x=None, x_mean=None -> quadratic_form=0
     _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
-    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * x.T @ Q_conditional @ x
+    log_conditional = 0.5 * logdet_Q_conditional
 
     objective = -(
         log_prior_hyperparameters
