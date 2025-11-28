@@ -83,26 +83,27 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
     model = dalia_instance.model
     likelihood_type = model.likelihood_config.type
 
-    if len(model.submodels) > 0:
-        submodel = model.submodels[0]
-        if hasattr(submodel, 'a'):
-            a_matrix = submodel.a.toarray() if hasattr(submodel.a, 'toarray') else np.array(submodel.a)
-        else:
-            a_matrix = np.eye(model.n_observations)
-    else:
-        a_matrix = np.eye(model.n_observations)
+    a_matrix = model.a.toarray() if hasattr(model.a, 'toarray') else np.array(model.a)
 
-    if len(model.prior_hyperparameters) > 0:
-        pc_prior = model.prior_hyperparameters[0]
-        pc_prior_alpha = float(pc_prior.config.alpha) if hasattr(pc_prior.config, 'alpha') else 0.01
-        pc_prior_u = float(pc_prior.config.u) if hasattr(pc_prior.config, 'u') else 5.0
-    else:
-        pc_prior_alpha = 0.01
-        pc_prior_u = 5.0
+    prior_configs = []
+    for i, prior_hp in enumerate(model.prior_hyperparameters):
+        hp_type = getattr(prior_hp, 'hyperparameter_type', 'unknown')
+        alpha = float(prior_hp.config.alpha) if hasattr(prior_hp.config, 'alpha') else 0.01
+        u = float(prior_hp.config.u) if hasattr(prior_hp.config, 'u') else 5.0
+        lambda_theta = float(prior_hp.lambda_theta)
+        prior_configs.append({
+            'hyperparameter_type': hp_type,
+            'alpha': alpha,
+            'u': u,
+            'lambda_theta': lambda_theta,
+        })
 
     fixed_effects_precision = 0.001
-    if len(model.submodels) > 0 and hasattr(model.submodels[0].config, 'fixed_effects_prior_precision'):
-        fixed_effects_precision = float(model.submodels[0].config.fixed_effects_prior_precision)
+    for submodel in model.submodels:
+        if hasattr(submodel, 'submodel_type') and submodel.submodel_type == 'regression':
+            if hasattr(submodel.config, 'fixed_effects_prior_precision'):
+                fixed_effects_precision = float(submodel.config.fixed_effects_prior_precision)
+            break
 
     static_data = {
         'likelihood_type': likelihood_type,
@@ -110,16 +111,16 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
         'y': jnp.array(np.array(model.y), dtype=jnp.float64),
         'n_fixed_effects': int(model.n_fixed_effects),
         'fixed_effects_precision': float(fixed_effects_precision),
-        'pc_prior_alpha': float(pc_prior_alpha),
-        'pc_prior_u': float(pc_prior_u),
+        'prior_configs': prior_configs,
         'n_observations': int(model.n_observations),
+        'n_latent_parameters': int(model.n_latent_parameters),
         'inner_iter_tol': float(dalia_instance.config.eps_inner_iteration),
         'inner_iter_max': int(dalia_instance.config.inner_iteration_max_iter),
         'use_sparse_solver': False,
     }
 
     for submodel in model.submodels:
-        if hasattr(submodel, 'type') and submodel.type == 'spatio_temporal':
+        if hasattr(submodel, 'submodel_type') and submodel.submodel_type == 'spatio_temporal':
             static_data['use_sparse_solver'] = True
             static_data['nt'] = int(submodel.nt)
             static_data['ns'] = int(submodel.ns)
@@ -197,6 +198,58 @@ def _hessian_diag_poisson_jax(eta, e):
 def _hessian_diag_binomial_jax(eta, n_trials):
     linkEta = sigmoid_function(eta)
     return -n_trials * linkEta * (1.0 - linkEta)
+
+
+def _evaluate_log_prior_hyperparameters_jax(theta, prior_configs):
+    """Evaluate log prior for all hyperparameters matching DALIA's implementation.
+
+    Each hyperparameter type has a different PC prior formula:
+    - r_s (spatial range): log(lambda) - lambda * exp(-theta) - theta
+    - r_t (temporal range): log(lambda) + log(0.5) - lambda * exp(-0.5*theta) - 0.5*theta
+    - sigma_st/sigma_e: log(lambda) - lambda * exp(theta) + theta
+    - prec_o (observation precision): log(lambda) - lambda * exp(theta) + theta
+
+    inputs:
+    theta : Hyperparameters array [gamma_s, gamma_t, gamma_st, theta_likelihood]
+    prior_configs : List of dicts with 'hyperparameter_type', 'lambda_theta' for each prior
+
+    Returns:
+    log_prior : Sum of log priors for all hyperparameters
+    """
+    log_prior = 0.0
+
+    for i, config in enumerate(prior_configs):
+        hp_type = config['hyperparameter_type']
+        lambda_theta = config['lambda_theta']
+        theta_i = theta[i]
+
+        if hp_type == 'r_s':
+            log_prior = log_prior + (
+                jnp.log(lambda_theta)
+                - lambda_theta * jnp.exp(-theta_i)
+                - theta_i
+            )
+        elif hp_type == 'r_t':
+            log_prior = log_prior + (
+                jnp.log(lambda_theta)
+                - lambda_theta * jnp.exp(-0.5 * theta_i)
+                + jnp.log(0.5)
+                - 0.5 * theta_i
+            )
+        elif hp_type in ('sigma_st', 'sigma_e'):
+            log_prior = log_prior + (
+                jnp.log(lambda_theta)
+                - lambda_theta * jnp.exp(theta_i)
+                + theta_i
+            )
+        elif hp_type == 'prec_o':
+            log_prior = log_prior + (
+                jnp.log(lambda_theta)
+                - lambda_theta * jnp.exp(theta_i)
+                + theta_i
+            )
+
+    return log_prior
 
 
 def _inner_iteration_jax(a, y, Q_prior, grad_likelihood_fn, hess_diag_fn, tol, max_iter):
@@ -281,8 +334,7 @@ def _objective_gaussian_dense(theta, static_data):
     y = static_data['y']
     n_fixed_effects = static_data['n_fixed_effects']
     fixed_effects_precision = static_data['fixed_effects_precision']
-    pc_prior_alpha = static_data['pc_prior_alpha']
-    pc_prior_u = static_data['pc_prior_u']
+    prior_configs = static_data['prior_configs']
 
     theta_likelihood = theta[-1]
 
@@ -293,21 +345,17 @@ def _objective_gaussian_dense(theta, static_data):
     D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y))
     Q_conditional = Q_prior - a.T @ jnp.diag(D_diag) @ a
 
-    rhs = -a.T @ (D_diag * y)
+    gradient_likelihood = jnp.exp(theta_likelihood) * y
+    rhs = a.T @ gradient_likelihood
 
     x = jnp.linalg.solve(Q_conditional, rhs)
 
-    lambda_theta = -jnp.log(pc_prior_alpha) / pc_prior_u
-    log_prior_hyperparameters = (
-        jnp.log(lambda_theta)
-        - lambda_theta * jnp.exp(theta_likelihood)
-        + theta_likelihood
-    )
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
 
     log_likelihood = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
 
     _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
-    log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * x.T @ Q_prior @ x
+    log_prior_latent = 0.5 * logdet_Q_prior
 
     _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
     log_conditional = 0.5 * logdet_Q_conditional - 0.5 * x.T @ Q_conditional @ x
@@ -424,8 +472,8 @@ def _objective_gaussian_sparse(theta, static_data):
     temporal_matrices = static_data['temporal_matrices']
     manifold = static_data['manifold']
     y = static_data['y']
-    pc_prior_alpha = static_data['pc_prior_alpha']
-    pc_prior_u = static_data['pc_prior_u']
+    a = static_data['a']
+    prior_configs = static_data['prior_configs']
 
     theta_st = theta[:-1]
     theta_likelihood = theta[-1]
@@ -438,10 +486,10 @@ def _objective_gaussian_sparse(theta, static_data):
         Q_st, fixed_effects_precision, n_fixed_effects, nt, ns
     )
 
-    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y))
-    Q_conditional_full = Q_prior_full.copy()
-    for i in range(len(y)):
-        Q_conditional_full = Q_conditional_full.at[i, i].add(D_diag[i])
+    likelihood_precision = jnp.exp(theta_likelihood)
+    D_diag = -likelihood_precision * jnp.ones(len(y))
+    AtDA = a.T @ jnp.diag(D_diag) @ a
+    Q_conditional_full = Q_prior_full - AtDA
 
     diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip = \
         kronecker_to_bta_structure(Q_conditional_full, nt, ns, n_fixed_effects)
@@ -459,26 +507,20 @@ def _objective_gaussian_sparse(theta, static_data):
         diag_blocks, arrow_tip
     )
 
-    rhs = jnp.zeros(nt * ns + n_fixed_effects)
-    for i in range(len(y)):
-        rhs = rhs.at[i].set(-D_diag[i] * y[i])
+    gradient_likelihood = likelihood_precision * y
+    rhs = a.T @ gradient_likelihood
 
     x = solve_bta_system_jax(
         diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip, rhs
     )
 
-    lambda_theta = -jnp.log(pc_prior_alpha) / pc_prior_u
-    log_prior_hyperparameters = (
-        jnp.log(lambda_theta)
-        - lambda_theta * jnp.exp(theta_likelihood)
-        + theta_likelihood
-    )
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
 
-    eta = x[:len(y)]
+    eta = jnp.zeros_like(y)
     log_likelihood = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
 
-    _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior_full)
-    log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * x.T @ Q_prior_full @ x
+    _, logdet_Q_st = jnp.linalg.slogdet(Q_st)
+    log_prior_latent = 0.5 * logdet_Q_st
 
     log_conditional = 0.5 * logdet_Q_conditional - 0.5 * x.T @ Q_conditional_full @ x
 

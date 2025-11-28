@@ -222,11 +222,11 @@ class DALIA:
         self.jax_objective = None
         self.jax_grad_func = None
         if self.config.gradient_method == "jax_autodiff":
-            # JAX autodiff supports: Gaussian/Poisson/Binomial + dense solver + single process
+            # JAX autodiff supports: Gaussian/Poisson/Binomial + dense or sparse (serinv) solvers + single process
             supported_likelihoods = ["gaussian", "poisson", "binomial"]
             can_use_pure_jax = (
                 self.model.likelihood_config.type in supported_likelihoods
-                and self.config.solver.type == "dense"
+                and self.config.solver.type in ["dense", "serinv"]
                 and (not backend_flags["mpi_avail"] or comm_size == 1)
             )
 
@@ -239,7 +239,7 @@ class DALIA:
             else:
                 raise NotImplementedError(
                     "JAX autodiff currently only supports: "
-                    "Gaussian/Poisson/Binomial likelihoods + dense solver + single process. "
+                    "Gaussian/Poisson/Binomial likelihoods + dense/serinv solver + single process. "
                     "For other configurations, use gradient_method='finite_diff'."
                 )
 
