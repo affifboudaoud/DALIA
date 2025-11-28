@@ -15,7 +15,7 @@ from dalia.core.jax_sparse_helpers import (
     compute_logdet_from_cholesky_bta_jax,
     solve_bta_system_jax,
 )
-from serinv.algs import pobtaf
+from serinv.algs.pobtaf_jax import pobtaf_jax_optimized
 
 
 def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
@@ -451,9 +451,9 @@ def _objective_gaussian_sparse(theta, static_data):
     lower_arrow_blocks = lower_arrow_blocks.copy()
     arrow_tip = arrow_tip.copy()
 
-    result = pobtaf(diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip)
-    if result is not None:
-        diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip = result
+    diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip = pobtaf_jax_optimized(
+        diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip
+    )
 
     logdet_Q_conditional = compute_logdet_from_cholesky_bta_jax(
         diag_blocks, arrow_tip
