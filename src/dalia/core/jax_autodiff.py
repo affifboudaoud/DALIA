@@ -18,6 +18,13 @@ from dalia.core.jax_sparse_helpers import (
 from serinv.algs.pobtaf_jax import pobtaf_jax_optimized
 
 
+def _to_numpy(arr):
+    """Convert array to NumPy, handling CuPy arrays."""
+    if hasattr(arr, 'get'):
+        return arr.get()
+    return np.asarray(arr)
+
+
 def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
     """Create pure JAX objective function with automatic differentiation.
 
@@ -25,6 +32,7 @@ def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
     - Gaussian, Poisson, and Binomial likelihoods
     - Dense or sparse (serinv) solvers
     - Single-process (no MPI)
+    - Models with zero hyperparameters (Poisson/Binomial only)
 
     inputs:
     dalia_instance : DALIA instance.
@@ -36,6 +44,43 @@ def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
     static_data = _extract_static_data(dalia_instance)
     likelihood_type = static_data['likelihood_type']
     use_sparse = static_data.get('use_sparse_solver', False)
+    n_hyperparameters = dalia_instance.model.n_hyperparameters
+
+    # Handle zero hyperparameters case
+    if n_hyperparameters == 0:
+        if use_sparse:
+            raise NotImplementedError(
+                "JAX autodiff with zero hyperparameters is not supported for sparse solver. "
+                "Use gradient_method='finite_diff' instead."
+            )
+        if likelihood_type == 'gaussian':
+            raise NotImplementedError(
+                "JAX autodiff with zero hyperparameters is not supported for Gaussian likelihood "
+                "(requires at least observation precision hyperparameter). "
+                "Use gradient_method='finite_diff' instead."
+            )
+
+        # For Poisson/Binomial with no hyperparameters, create value-only functions
+        def objective_pure_jax_no_hp(theta):
+            if likelihood_type == 'poisson':
+                return _objective_poisson_dense(theta, static_data)
+            elif likelihood_type == 'binomial':
+                return _objective_binomial_dense(theta, static_data)
+            else:
+                raise ValueError(f"Unsupported likelihood type for zero hyperparameters: {likelihood_type}")
+
+        objective_pure_jax_no_hp = jax.jit(objective_pure_jax_no_hp)
+
+        # Warmup with empty array
+        theta_init = jnp.array([], dtype=jnp.float64)
+        _ = objective_pure_jax_no_hp(theta_init)
+
+        def objective_with_grad_no_hp(theta):
+            theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+            f_val = objective_pure_jax_no_hp(theta_jax)
+            return float(f_val), np.array([], dtype=np.float64)
+
+        return objective_pure_jax_no_hp, objective_with_grad_no_hp
 
     def objective_pure_jax(theta):
         """Pure JAX objective function - dispatches based on likelihood and solver type"""
@@ -60,7 +105,7 @@ def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
     value_and_grad_fn = jax.jit(value_and_grad_fn)
 
     # Warmup JIT compilation
-    theta_init = jnp.ones(dalia_instance.model.n_hyperparameters, dtype=jnp.float64)
+    theta_init = jnp.ones(n_hyperparameters, dtype=jnp.float64)
     _ = value_and_grad_fn(theta_init)
 
     def objective_with_grad(theta):
@@ -83,7 +128,7 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
     model = dalia_instance.model
     likelihood_type = model.likelihood_config.type
 
-    a_matrix = model.a.toarray() if hasattr(model.a, 'toarray') else np.array(model.a)
+    a_matrix = _to_numpy(model.a.toarray()) if hasattr(model.a, 'toarray') else _to_numpy(model.a)
 
     prior_configs = []
     for i, prior_hp in enumerate(model.prior_hyperparameters):
@@ -108,7 +153,7 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
     static_data = {
         'likelihood_type': likelihood_type,
         'a': jnp.array(a_matrix, dtype=jnp.float64),
-        'y': jnp.array(np.array(model.y), dtype=jnp.float64),
+        'y': jnp.array(_to_numpy(model.y), dtype=jnp.float64),
         'n_fixed_effects': int(model.n_fixed_effects),
         'fixed_effects_precision': float(fixed_effects_precision),
         'prior_configs': prior_configs,
@@ -127,29 +172,29 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
             static_data['manifold'] = str(submodel.manifold)
 
             static_data['spatial_matrices'] = {
-                'c0': jnp.array(submodel.c0.toarray(), dtype=jnp.float64),
-                'g1': jnp.array(submodel.g1.toarray(), dtype=jnp.float64),
-                'g2': jnp.array(submodel.g2.toarray(), dtype=jnp.float64),
-                'g3': jnp.array(submodel.g3.toarray(), dtype=jnp.float64),
+                'c0': jnp.array(_to_numpy(submodel.c0.toarray()), dtype=jnp.float64),
+                'g1': jnp.array(_to_numpy(submodel.g1.toarray()), dtype=jnp.float64),
+                'g2': jnp.array(_to_numpy(submodel.g2.toarray()), dtype=jnp.float64),
+                'g3': jnp.array(_to_numpy(submodel.g3.toarray()), dtype=jnp.float64),
             }
 
             static_data['temporal_matrices'] = {
-                'm0': jnp.array(submodel.m0.toarray(), dtype=jnp.float64),
-                'm1': jnp.array(submodel.m1.toarray(), dtype=jnp.float64),
-                'm2': jnp.array(submodel.m2.toarray(), dtype=jnp.float64),
+                'm0': jnp.array(_to_numpy(submodel.m0.toarray()), dtype=jnp.float64),
+                'm1': jnp.array(_to_numpy(submodel.m1.toarray()), dtype=jnp.float64),
+                'm2': jnp.array(_to_numpy(submodel.m2.toarray()), dtype=jnp.float64),
             }
             break
 
     if likelihood_type == 'poisson':
         if hasattr(model.likelihood, 'e'):
-            e = np.array(model.likelihood.e)
+            e = _to_numpy(model.likelihood.e)
         else:
             e = np.ones(model.n_observations)
         static_data['e'] = jnp.array(e, dtype=jnp.float64)
 
     elif likelihood_type == 'binomial':
         if hasattr(model.likelihood, 'n_trials'):
-            n_trials = np.array(model.likelihood.n_trials)
+            n_trials = _to_numpy(model.likelihood.n_trials)
         else:
             n_trials = np.ones(model.n_observations)
         static_data['n_trials'] = jnp.array(n_trials, dtype=jnp.float64)

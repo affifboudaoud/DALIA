@@ -374,9 +374,13 @@ class DALIA:
         """
 
         if len(self.model.theta) == 0:
-            # Only run the inner iteration
+            # Only run the inner iteration (no optimization needed)
             print_msg("No hyperparameters, just running inner iteration.")
-            self.f_value = self._evaluate_f(self.model.theta)
+
+            if self.config.gradient_method == "jax_autodiff" and self.jax_objective is not None:
+                self.f_value = float(self.jax_objective(self.model.theta))
+            else:
+                self.f_value = self._evaluate_f(self.model.theta)
 
             self.minimization_result: dict = {
                 "theta": self.model.theta,
@@ -658,6 +662,9 @@ class DALIA:
         self.solver.t_cholesky = 0.0
         self.solver.t_solve = 0.0
 
+        # Update model theta for early exit path and consistent state
+        self.model.theta[:] = xp.asarray(theta_i)
+
         synchronize(comm=self.comm_world)
         tic = time.perf_counter()
 
@@ -704,7 +711,7 @@ class DALIA:
         hyperparameters, log likelihood, log prior of the latent parameters,
         and log conditional of the latent parameters.
         """
-        self.model.theta[:] = theta_i
+        self.model.theta[:] = xp.asarray(theta_i)
         f_theta = xp.zeros(1, dtype=xp.float64)
 
         # --- Optimize x and evaluate the conditional of the latent parameters
@@ -837,7 +844,7 @@ class DALIA:
         cov_theta : NDArray[dim_theta, dim_theta]
             Covariance matrix of the hyperparameters theta.
         """
-        self.model.theta[:] = theta_i
+        self.model.theta[:] = xp.asarray(theta_i)
 
         hess_theta = self._evaluate_hessian_f(theta_i)
         cov_theta = xp.linalg.inv(hess_theta)
@@ -864,7 +871,7 @@ class DALIA:
         Compute finite difference approximation of the hessian of f at theta_i.
         """
 
-        self.model.theta[:] = theta_i
+        self.model.theta[:] = xp.asarray(theta_i)
         dim_theta = self.model.n_hyperparameters
 
         # pre-allocate storage for the hessian & f_values
@@ -1006,8 +1013,8 @@ class DALIA:
         marginal_latent_parameters : NDArray
             Marginal distribution of the latent parameters x.
         """
-        self.model.theta[:] = theta
-        self.model.x[:] = x_star
+        self.model.theta[:] = xp.asarray(theta)
+        self.model.x[:] = xp.asarray(x_star)
 
         eta = self.model.a @ self.model.x
         
