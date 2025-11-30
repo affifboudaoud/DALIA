@@ -64,6 +64,8 @@ try:
     backend_flags["cupy_avail"] = True
 except (ImportError, ImportWarning, ModuleNotFoundError) as e:
     warn(f"No 'CuPy' backend detected. ({e})")
+except Exception as e:
+    warn(f"CuPy is installed but not working ({type(e).__name__}: {e})")
 
 
 try:

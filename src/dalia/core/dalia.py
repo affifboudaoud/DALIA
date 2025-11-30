@@ -668,7 +668,10 @@ class DALIA:
         synchronize(comm=self.comm_world)
         tic = time.perf_counter()
 
-        f_0, grad_f = self.jax_grad_func(theta_i)
+        f_0, grad_f, x = self.jax_grad_func(theta_i)
+
+        # Store the latent parameters computed by JAX
+        self.model.x[:] = xp.asarray(x)
 
         synchronize(comm=self.comm_world)
         toc = time.perf_counter()
