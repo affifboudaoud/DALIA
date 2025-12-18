@@ -20,6 +20,7 @@ from dalia.core.jax_sparse_helpers import (
     solve_bta_system_jax,
 )
 from serinv.algs.pobtaf_jax import pobtaf_jax_optimized
+from serinv.algs.pobtf_jax import pobtf_logdet_jax
 
 
 def _to_numpy(arr):
@@ -702,37 +703,8 @@ def _objective_gaussian_sparse(theta, static_data):
     eta = jnp.zeros_like(y)
     log_likelihood = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
 
-    # Compute log(det(Q_st)) using BT Cholesky with lax.fori_loop
-    q_st_diag_copy = q_st_diag.copy()
-    q_st_lower_copy = q_st_lower.copy()
-
-    def bt_chol_body(i, carry):
-        diag_b, lower_b = carry
-        L_i = jnp.linalg.cholesky(diag_b[i])
-        diag_b = diag_b.at[i].set(L_i)
-
-        # Update lower and next diagonal (masked for last iteration)
-        lower_updated = jnp.linalg.solve(L_i, lower_b[i].T).T
-        lower_b = lower_b.at[i].set(lower_updated)
-
-        # Only update next diagonal if not at last block
-        next_diag = diag_b[i + 1] - lower_updated @ lower_updated.T
-        # Use where to conditionally update (avoid out of bounds)
-        diag_b = lax.cond(
-            i < nt - 1,
-            lambda d: d.at[i + 1].set(next_diag),
-            lambda d: d,
-            diag_b
-        )
-        return (diag_b, lower_b)
-
-    q_st_diag_copy, q_st_lower_copy = lax.fori_loop(
-        0, nt, bt_chol_body, (q_st_diag_copy, q_st_lower_copy)
-    )
-
-    # Log det from BT Cholesky (vectorized)
-    diag_vals_st = jnp.diagonal(q_st_diag_copy, axis1=1, axis2=2)
-    logdet_Q_st = 2.0 * jnp.sum(jnp.log(diag_vals_st))
+    # Compute log(det(Q_st)) using optimized BT Cholesky
+    logdet_Q_st = pobtf_logdet_jax(q_st_diag, q_st_lower)
     log_prior_latent = 0.5 * logdet_Q_st
 
     # Quadratic form x^T Q_conditional x using BTA blocks (vectorized)
