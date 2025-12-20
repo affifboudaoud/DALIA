@@ -18,6 +18,7 @@ from dalia.core.jax_sparse_helpers import (
     extract_bta_blocks_from_sparse,
     compute_logdet_from_cholesky_bta_jax,
     solve_bta_system_jax,
+    build_coregional_Q_bta_jax,
 )
 from serinv.algs.pobtaf_jax import pobtaf_jax_optimized
 from serinv.algs.pobtf_jax import pobtf_logdet_jax
@@ -97,6 +98,10 @@ def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
 
         return objective_pure_jax_no_hp, objective_with_grad_no_hp
 
+    # Check if model has spatio-temporal or spatial component
+    has_st = static_data.get('has_spatio_temporal', False)
+    has_spatial = static_data.get('has_spatial', False)
+
     def objective_pure_jax(theta):
         """Pure JAX objective function - dispatches based on likelihood and solver type
 
@@ -109,10 +114,21 @@ def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
                 raise ValueError(f"Sparse solver only supports Gaussian likelihood, got {likelihood_type}")
         else:
             if likelihood_type == 'gaussian':
+                if has_st:
+                    return _objective_gaussian_st_dense(theta, static_data)
+                elif has_spatial:
+                    return _objective_gaussian_spatial_dense(theta, static_data)
                 return _objective_gaussian_dense(theta, static_data)
             elif likelihood_type == 'poisson':
+                if has_st:
+                    return _objective_poisson_st_dense(theta, static_data)
                 return _objective_poisson_dense(theta, static_data)
             elif likelihood_type == 'binomial':
+                if has_st:
+                    raise NotImplementedError(
+                        "JAX autodiff for Binomial likelihood with spatio-temporal models is not yet implemented. "
+                        "Use gradient_method='finite_diff' instead."
+                    )
                 return _objective_binomial_dense(theta, static_data)
             else:
                 raise ValueError(f"Unsupported likelihood type: {likelihood_type}")
@@ -148,11 +164,21 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
     model = dalia_instance.model
     likelihood_type = model.likelihood_config.type
 
-    # Check if we have a spatio-temporal model (use sparse A)
+    # Check if we have a spatio-temporal model
     has_spatio_temporal = any(
         hasattr(sm, 'submodel_type') and sm.submodel_type == 'spatio_temporal'
         for sm in model.submodels
     )
+
+    # Check if we have a spatial model (but not spatio-temporal)
+    has_spatial = any(
+        hasattr(sm, 'submodel_type') and sm.submodel_type == 'spatial'
+        for sm in model.submodels
+    )
+
+    # Determine solver type from config - use sparse only for serinv solver with ST model
+    solver_type = dalia_instance.config.solver.type if hasattr(dalia_instance.config.solver, 'type') else 'dense'
+    use_sparse_path = has_spatio_temporal and solver_type == 'serinv'
 
     prior_configs = []
     for i, prior_hp in enumerate(model.prior_hyperparameters):
@@ -190,8 +216,8 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
                 fixed_effects_precision = float(submodel.config.fixed_effects_prior_precision)
             break
 
-    # For spatio-temporal models, keep A sparse and precompute AtA in BTA format
-    if has_spatio_temporal:
+    # For spatio-temporal models with serinv solver, keep A sparse and precompute AtA in BTA format
+    if use_sparse_path:
         # Get nt, ns from spatio-temporal submodel
         st_submodel = next(
             sm for sm in model.submodels
@@ -220,6 +246,7 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
 
         static_data = {
             'likelihood_type': likelihood_type,
+            'has_spatio_temporal': True,
             'a_sparse': a_sparse,
             'ata_diag_blocks': ata_diag,
             'ata_lower_blocks': ata_lower,
@@ -254,6 +281,8 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
         a_matrix = _to_numpy(model.a.toarray()) if hasattr(model.a, 'toarray') else _to_numpy(model.a)
         static_data = {
             'likelihood_type': likelihood_type,
+            'has_spatio_temporal': has_spatio_temporal,
+            'has_spatial': has_spatial,
             'a': jnp.array(a_matrix, dtype=jnp.float64),
             'y': jnp.array(_to_numpy(model.y), dtype=jnp.float64),
             'n_fixed_effects': int(model.n_fixed_effects),
@@ -265,6 +294,70 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
             'inner_iter_max': int(dalia_instance.config.inner_iteration_max_iter),
             'use_sparse_solver': False,
         }
+
+        # Add spatial matrices for dense solver with spatial model
+        if has_spatial and not has_spatio_temporal:
+            spatial_submodel = next(
+                sm for sm in model.submodels
+                if hasattr(sm, 'submodel_type') and sm.submodel_type == 'spatial'
+            )
+            static_data['ns'] = int(spatial_submodel.ns)
+            static_data['spatial_matrices'] = {
+                'c0': jnp.array(_to_numpy(spatial_submodel.c0.toarray()), dtype=jnp.float64),
+                'g1': jnp.array(_to_numpy(spatial_submodel.g1.toarray()), dtype=jnp.float64),
+                'g2': jnp.array(_to_numpy(spatial_submodel.g2.toarray()), dtype=jnp.float64),
+            }
+            # Track submodel ordering - find offsets in latent vector
+            fe_offset = 0
+            spatial_offset = 0
+            current_offset = 0
+            for sm in model.submodels:
+                if hasattr(sm, 'submodel_type'):
+                    if sm.submodel_type == 'regression':
+                        fe_offset = current_offset
+                    elif sm.submodel_type == 'spatial':
+                        spatial_offset = current_offset
+                current_offset += sm.n_latent_parameters
+            static_data['fe_offset'] = int(fe_offset)
+            static_data['spatial_offset'] = int(spatial_offset)
+
+        # Add spatio-temporal matrices for dense solver with ST model
+        if has_spatio_temporal:
+            st_submodel = next(
+                sm for sm in model.submodels
+                if hasattr(sm, 'submodel_type') and sm.submodel_type == 'spatio_temporal'
+            )
+            static_data['nt'] = int(st_submodel.nt)
+            static_data['ns'] = int(st_submodel.ns)
+            static_data['manifold'] = str(st_submodel.manifold)
+            static_data['spatial_matrices'] = {
+                'c0': jnp.array(_to_numpy(st_submodel.c0.toarray()), dtype=jnp.float64),
+                'g1': jnp.array(_to_numpy(st_submodel.g1.toarray()), dtype=jnp.float64),
+                'g2': jnp.array(_to_numpy(st_submodel.g2.toarray()), dtype=jnp.float64),
+                'g3': jnp.array(_to_numpy(st_submodel.g3.toarray()), dtype=jnp.float64),
+            }
+            static_data['temporal_matrices'] = {
+                'm0': jnp.array(_to_numpy(st_submodel.m0.toarray()), dtype=jnp.float64),
+                'm1': jnp.array(_to_numpy(st_submodel.m1.toarray()), dtype=jnp.float64),
+                'm2': jnp.array(_to_numpy(st_submodel.m2.toarray()), dtype=jnp.float64),
+            }
+            # Track submodel ordering - find offsets in latent vector
+            fe_offset = 0
+            st_offset = 0
+            current_offset = 0
+            for sm in model.submodels:
+                if hasattr(sm, 'submodel_type'):
+                    if sm.submodel_type == 'regression':
+                        fe_offset = current_offset
+                    elif sm.submodel_type == 'spatio_temporal':
+                        st_offset = current_offset
+                current_offset += sm.n_latent_parameters
+            static_data['fe_offset'] = int(fe_offset)
+            static_data['st_offset'] = int(st_offset)
+
+    # Add x_initial for inner iteration initialization (critical for Poisson/Binomial)
+    x_initial = _to_numpy(model.x)
+    static_data['x_initial'] = jnp.array(x_initial, dtype=jnp.float64)
 
     if likelihood_type == 'poisson':
         if hasattr(model.likelihood, 'e'):
@@ -281,6 +374,320 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
         static_data['n_trials'] = jnp.array(n_trials, dtype=jnp.float64)
 
     return static_data
+
+
+def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
+    """Extract static data from DALIA instance for CoregionalModel.
+
+    Inputs:
+    dalia_instance : DALIA instance with CoregionalModel.
+
+    Returns:
+    static_data : Dictionary containing model-specific data for coregional models.
+    """
+    model = dalia_instance.model
+    n_models = model.n_models
+    ns = model.n_spatial_nodes
+    nt = model.n_temporal_nodes
+    n_fixed_effects_per_model = model.n_fixed_effects_per_model
+
+    # Determine solver type
+    solver_type = dalia_instance.config.solver.type if hasattr(dalia_instance.config.solver, 'type') else 'dense'
+    use_sparse_path = solver_type == 'serinv'
+
+    # Extract prior configs for all hyperparameters
+    prior_configs = []
+    for i, prior_hp in enumerate(model.prior_hyperparameters):
+        prior_type = prior_hp.config.type if hasattr(prior_hp.config, 'type') else 'unknown'
+
+        if prior_type == 'penalized_complexity':
+            hp_type = getattr(prior_hp, 'hyperparameter_type', 'unknown')
+            alpha = float(prior_hp.config.alpha) if hasattr(prior_hp.config, 'alpha') else 0.01
+            u = float(prior_hp.config.u) if hasattr(prior_hp.config, 'u') else 5.0
+            lambda_theta = float(prior_hp.lambda_theta)
+            prior_configs.append({
+                'prior_type': 'penalized_complexity',
+                'hyperparameter_type': hp_type,
+                'alpha': alpha,
+                'u': u,
+                'lambda_theta': lambda_theta,
+            })
+        elif prior_type == 'gaussian':
+            mean = float(prior_hp.mean) if hasattr(prior_hp, 'mean') else 0.0
+            precision = float(prior_hp.precision) if hasattr(prior_hp, 'precision') else 1.0
+            prior_configs.append({
+                'prior_type': 'gaussian',
+                'mean': mean,
+                'precision': precision,
+            })
+        else:
+            prior_configs.append({
+                'prior_type': 'unknown',
+            })
+
+    # Detect coregionalization type
+    coregionalization_type = getattr(model, 'coregionalization_type', 'spatio_temporal')
+    is_spatial_only = coregionalization_type == 'spatial'
+
+    # Extract per-model data
+    models_data = []
+    fixed_effects_precision = 0.001
+
+    for i, m in enumerate(model.models):
+        submodel = m.submodels[0]
+
+        if is_spatial_only:
+            model_data = {
+                'spatial_matrices': {
+                    'c0': jnp.array(_to_numpy(submodel.c0.toarray()), dtype=jnp.float64),
+                    'g1': jnp.array(_to_numpy(submodel.g1.toarray()), dtype=jnp.float64),
+                    'g2': jnp.array(_to_numpy(submodel.g2.toarray()), dtype=jnp.float64),
+                },
+                'likelihood_type': m.likelihood_config.type,
+                'n_observations': int(m.n_observations) if hasattr(m, 'n_observations') else 0,
+            }
+        else:
+            model_data = {
+                'manifold': str(submodel.manifold),
+                'spatial_matrices': {
+                    'c0': jnp.array(_to_numpy(submodel.c0.toarray()), dtype=jnp.float64),
+                    'g1': jnp.array(_to_numpy(submodel.g1.toarray()), dtype=jnp.float64),
+                    'g2': jnp.array(_to_numpy(submodel.g2.toarray()), dtype=jnp.float64),
+                    'g3': jnp.array(_to_numpy(submodel.g3.toarray()), dtype=jnp.float64),
+                },
+                'temporal_matrices': {
+                    'm0': jnp.array(_to_numpy(submodel.m0.toarray()), dtype=jnp.float64),
+                    'm1': jnp.array(_to_numpy(submodel.m1.toarray()), dtype=jnp.float64),
+                    'm2': jnp.array(_to_numpy(submodel.m2.toarray()), dtype=jnp.float64),
+                },
+                'likelihood_type': m.likelihood_config.type,
+                'n_observations': int(m.n_observations) if hasattr(m, 'n_observations') else 0,
+            }
+
+        if len(m.submodels) > 1 and hasattr(m.submodels[1], 'submodel_type') and m.submodels[1].submodel_type == 'regression':
+            if hasattr(m.submodels[1].config, 'fixed_effects_prior_precision'):
+                fixed_effects_precision = float(m.submodels[1].config.fixed_effects_prior_precision)
+
+        models_data.append(model_data)
+
+    # Get sparse A matrix
+    if hasattr(model.a, 'get'):
+        a_scipy = scipy_sparse.csr_matrix(model.a.get())
+    elif hasattr(model.a, 'toarray'):
+        a_scipy = scipy_sparse.csr_matrix(model.a)
+    else:
+        a_scipy = scipy_sparse.csr_matrix(model.a)
+
+    # Coregional block size: n_models * ns
+    block_size = n_models * ns
+    n_blocks = nt
+    n_fixed_effects_total = n_fixed_effects_per_model * n_models
+
+    if use_sparse_path:
+        # Precompute per-model A_i^T @ A_i contributions in BTA format
+        # This allows proper handling of per-model likelihood precisions
+        n_observations_idx = [int(x) for x in model.n_observations_idx]
+
+        per_model_ata_diag = []
+        per_model_ata_lower = []
+        per_model_ata_arrow = []
+        per_model_ata_tip = []
+
+        for i in range(n_models):
+            obs_start = n_observations_idx[i]
+            obs_end = n_observations_idx[i + 1]
+            a_i = a_scipy[obs_start:obs_end, :]
+            ata_i = a_i.T @ a_i
+
+            ata_diag_i, ata_lower_i, ata_arrow_i, ata_tip_i = _extract_bta_blocks_coregional(
+                ata_i, n_blocks, block_size, n_fixed_effects_total
+            )
+            per_model_ata_diag.append(ata_diag_i)
+            per_model_ata_lower.append(ata_lower_i)
+            per_model_ata_arrow.append(ata_arrow_i)
+            per_model_ata_tip.append(ata_tip_i)
+
+        # Stack per-model contributions: shape (n_models, n_blocks, block_size, block_size)
+        ata_diag_per_model = jnp.stack(per_model_ata_diag, axis=0)
+        ata_lower_per_model = jnp.stack(per_model_ata_lower, axis=0)
+        ata_arrow_per_model = jnp.stack(per_model_ata_arrow, axis=0)
+        ata_tip_per_model = jnp.stack(per_model_ata_tip, axis=0)
+
+        a_sparse = _scipy_sparse_to_jax_bcoo(a_scipy)
+
+        static_data = {
+            'is_coregional': True,
+            'n_models': n_models,
+            'models_data': models_data,
+            'a_sparse': a_sparse,
+            'ata_diag_per_model': ata_diag_per_model,
+            'ata_lower_per_model': ata_lower_per_model,
+            'ata_arrow_per_model': ata_arrow_per_model,
+            'ata_tip_per_model': ata_tip_per_model,
+            'y': jnp.array(_to_numpy(model.y), dtype=jnp.float64),
+            'n_fixed_effects_per_model': n_fixed_effects_per_model,
+            'n_fixed_effects_total': n_fixed_effects_total,
+            'fixed_effects_precision': float(fixed_effects_precision),
+            'prior_configs': prior_configs,
+            'n_observations': int(model.n_observations),
+            'n_observations_idx': n_observations_idx,
+            'n_latent_parameters': int(model.n_latent_parameters),
+            'inner_iter_tol': float(dalia_instance.config.eps_inner_iteration),
+            'inner_iter_max': int(dalia_instance.config.inner_iteration_max_iter),
+            'use_sparse_solver': True,
+            'nt': nt,
+            'ns': ns,
+            'block_size': block_size,
+            'hyperparameters_idx': [int(x) for x in model.hyperparameters_idx],
+            'theta_keys': list(model.theta_keys),
+        }
+    else:
+        # Dense solver path - only supported for spatial-only coregional models
+        if not is_spatial_only:
+            raise NotImplementedError(
+                "Dense solver for spatio-temporal CoregionalModel JAX autodiff is not yet implemented. "
+                "Use solver type 'serinv' for spatio-temporal CoregionalModel."
+            )
+
+        # For spatial coregional models, convert A to dense matrix
+        a_dense = jnp.array(a_scipy.toarray(), dtype=jnp.float64)
+        n_observations_idx = [int(x) for x in model.n_observations_idx]
+
+        static_data = {
+            'is_coregional': True,
+            'is_spatial_only': True,
+            'n_models': n_models,
+            'models_data': models_data,
+            'a': a_dense,
+            'y': jnp.array(_to_numpy(model.y), dtype=jnp.float64),
+            'n_fixed_effects_per_model': n_fixed_effects_per_model,
+            'n_fixed_effects_total': n_fixed_effects_total,
+            'fixed_effects_precision': float(fixed_effects_precision),
+            'prior_configs': prior_configs,
+            'n_observations': int(model.n_observations),
+            'n_observations_idx': n_observations_idx,
+            'n_latent_parameters': int(model.n_latent_parameters),
+            'inner_iter_tol': float(dalia_instance.config.eps_inner_iteration),
+            'inner_iter_max': int(dalia_instance.config.inner_iteration_max_iter),
+            'use_sparse_solver': False,
+            'nt': nt,
+            'ns': ns,
+            'hyperparameters_idx': [int(x) for x in model.hyperparameters_idx],
+            'theta_keys': list(model.theta_keys),
+        }
+
+    # Add x_initial for inner iteration initialization
+    x_initial = _to_numpy(model.x)
+    static_data['x_initial'] = jnp.array(x_initial, dtype=jnp.float64)
+
+    return static_data
+
+
+def _extract_bta_blocks_coregional(
+    sparse_matrix,
+    n_blocks: int,
+    block_size: int,
+    n_fixed_effects: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Extract BTA blocks from sparse matrix for coregional model.
+
+    inputs:
+    sparse_matrix : scipy sparse matrix
+    n_blocks : Number of temporal blocks (nt)
+    block_size : Size of each block (n_models * ns)
+    n_fixed_effects : Total size of arrow tip (n_models * n_fixed_effects_per_model)
+
+    Returns:
+    diag_blocks : (n_blocks, block_size, block_size)
+    lower_diag_blocks : (n_blocks-1, block_size, block_size)
+    arrow_bottom_blocks : (n_blocks, n_fixed_effects, block_size)
+    arrow_tip : (n_fixed_effects, n_fixed_effects)
+    """
+    csc = scipy_sparse.csc_matrix(sparse_matrix)
+    total_st = n_blocks * block_size
+
+    diag_blocks = jnp.zeros((n_blocks, block_size, block_size))
+    lower_diag_blocks = jnp.zeros((n_blocks - 1, block_size, block_size))
+    arrow_bottom_blocks = jnp.zeros((n_blocks, n_fixed_effects, block_size))
+    arrow_tip = jnp.zeros((n_fixed_effects, n_fixed_effects))
+
+    for i in range(n_blocks):
+        start = i * block_size
+        end = (i + 1) * block_size
+        block = csc[start:end, start:end].toarray()
+        diag_blocks = diag_blocks.at[i].set(jnp.array(block))
+
+    for i in range(n_blocks - 1):
+        row_start = (i + 1) * block_size
+        row_end = (i + 2) * block_size
+        col_start = i * block_size
+        col_end = (i + 1) * block_size
+        block = csc[row_start:row_end, col_start:col_end].toarray()
+        lower_diag_blocks = lower_diag_blocks.at[i].set(jnp.array(block))
+
+    if n_fixed_effects > 0:
+        for i in range(n_blocks):
+            col_start = i * block_size
+            col_end = (i + 1) * block_size
+            block = csc[total_st:, col_start:col_end].toarray()
+            arrow_bottom_blocks = arrow_bottom_blocks.at[i].set(jnp.array(block))
+
+        arrow_tip = jnp.array(csc[total_st:, total_st:].toarray())
+
+    return diag_blocks, lower_diag_blocks, arrow_bottom_blocks, arrow_tip
+
+
+def bta_to_dense_jax(diag_blocks, lower_blocks, arrow_blocks, tip_block):
+    """Convert BTA (Block-Tridiagonal-Arrowhead) format to dense matrix.
+
+    inputs:
+    diag_blocks : (nt, ns, ns) diagonal blocks
+    lower_blocks : (nt-1, ns, ns) lower diagonal blocks
+    arrow_blocks : (nt, n_fe, ns) arrow blocks
+    tip_block : (n_fe, n_fe) tip block
+
+    Returns:
+    dense : (nt*ns + n_fe, nt*ns + n_fe) dense matrix
+    """
+    nt = diag_blocks.shape[0]
+    ns = diag_blocks.shape[1]
+    n_fe = tip_block.shape[0] if tip_block.ndim > 0 else 0
+
+    n_total = nt * ns + n_fe
+    dense = jnp.zeros((n_total, n_total), dtype=jnp.float64)
+
+    # Place diagonal blocks
+    for t in range(nt):
+        row_start = t * ns
+        row_end = (t + 1) * ns
+        dense = dense.at[row_start:row_end, row_start:row_end].set(diag_blocks[t])
+
+    # Place lower and upper diagonal blocks
+    for t in range(nt - 1):
+        row_start = (t + 1) * ns
+        row_end = (t + 2) * ns
+        col_start = t * ns
+        col_end = (t + 1) * ns
+        # Lower block
+        dense = dense.at[row_start:row_end, col_start:col_end].set(lower_blocks[t])
+        # Upper block (transpose)
+        dense = dense.at[col_start:col_end, row_start:row_end].set(lower_blocks[t].T)
+
+    # Place arrow blocks (last rows/columns except tip)
+    if n_fe > 0:
+        for t in range(nt):
+            col_start = t * ns
+            col_end = (t + 1) * ns
+            row_start = nt * ns
+            # Bottom arrow
+            dense = dense.at[row_start:row_start+n_fe, col_start:col_end].set(arrow_blocks[t])
+            # Right arrow (transpose)
+            dense = dense.at[col_start:col_end, row_start:row_start+n_fe].set(arrow_blocks[t].T)
+
+        # Place tip block
+        dense = dense.at[nt*ns:, nt*ns:].set(tip_block)
+
+    return dense
 
 
 def sigmoid_function(x):
@@ -393,10 +800,11 @@ def _evaluate_log_prior_hyperparameters_jax(theta, prior_configs):
     return log_prior
 
 
-def _inner_iteration_jax(a, y, Q_prior, grad_likelihood_fn, hess_diag_fn, tol, max_iter):
+def _inner_iteration_jax(a, y, Q_prior, grad_likelihood_fn, hess_diag_fn, tol, max_iter, x_initial=None):
     """JAX implementation of inner iteration for non-Gaussian likelihoods.
 
-    Uses jax.lax.while_loop for differentiable iterative optimization.
+    Uses jax.lax.fori_loop with fixed iteration count for efficient autodiff.
+    Newton-Raphson typically converges in 5-10 iterations for well-conditioned problems.
 
     inputs:
     a : Design matrix
@@ -404,8 +812,9 @@ def _inner_iteration_jax(a, y, Q_prior, grad_likelihood_fn, hess_diag_fn, tol, m
     Q_prior : Prior precision matrix
     grad_likelihood_fn : Function computing likelihood gradient
     hess_diag_fn : Function computing diagonal of likelihood Hessian
-    tol : Convergence tolerance
-    max_iter : Maximum iterations
+    tol : Convergence tolerance (not used - fixed iterations for autodiff efficiency)
+    max_iter : Maximum iterations (not used - fixed iterations for autodiff efficiency)
+    x_initial : Initial values for latent parameters (if None, uses zeros)
 
     Returns:
     Q_conditional : Conditional precision matrix
@@ -413,47 +822,52 @@ def _inner_iteration_jax(a, y, Q_prior, grad_likelihood_fn, hess_diag_fn, tol, m
     eta : Linear predictor (A @ x_star)
     """
     n_latent = Q_prior.shape[0]
+    eta_max = 20.0  # Clip eta to prevent exp overflow
 
-    def cond_fn(state):
-        _, _, counter, norm = state
-        return (norm >= tol) & (counter < max_iter)
+    # Pre-compute transpose once
+    a_T = a.T
 
-    def body_fn(state):
-        """One iteration of Newton-Raphson"""
-        x_star, x_update, counter, _ = state
+    def body_fn(i, state):
+        """One Newton-Raphson iteration."""
+        x_star, Q_conditional = state
+
+        # Compute eta = A @ x with clipping
+        eta = a @ x_star
+        eta = jnp.clip(eta, -eta_max, eta_max)
+
+        # Compute Hessian diagonal and conditional precision
+        D_diag = hess_diag_fn(eta)
+        Q_conditional = Q_prior - (a_T * D_diag) @ a
+
+        # Compute RHS and solve
+        gradient_likelihood = grad_likelihood_fn(eta)
+        rhs = a_T @ gradient_likelihood - Q_prior @ x_star
+
+        # Solve using Cholesky decomposition
+        L = jnp.linalg.cholesky(Q_conditional)
+        x_update = jax.scipy.linalg.cho_solve((L, True), rhs)
 
         x_star = x_star + x_update
-        eta = a @ x_star
 
-        D_diag = hess_diag_fn(eta)
-        Q_conditional = Q_prior - a.T @ jnp.diag(D_diag) @ a
-
-        gradient_likelihood = grad_likelihood_fn(eta)
-        rhs = -Q_prior @ x_star + a.T @ gradient_likelihood
-
-        x_update = jnp.linalg.solve(Q_conditional, rhs)
-        norm = jnp.linalg.norm(x_update)
-
-        return (x_star, x_update, counter + 1, norm)
+        return (x_star, Q_conditional)
 
     # Initialize state
-    x_star = jnp.zeros(n_latent, dtype=jnp.float64)
-    x_update = jnp.zeros(n_latent, dtype=jnp.float64)
-    counter = 0
-    norm = 1.0
+    if x_initial is None:
+        x_star = jnp.zeros(n_latent, dtype=jnp.float64)
+    else:
+        x_star = x_initial
+    Q_conditional = Q_prior.copy()
 
-    # Run iteration
-    x_star, x_update, counter, norm = lax.while_loop(
-        cond_fn,
+    # Run fixed 10 iterations - sufficient for Newton convergence, minimal backward pass cost
+    x_star, Q_conditional = lax.fori_loop(
+        0, 10,
         body_fn,
-        (x_star, x_update, counter, norm)
+        (x_star, Q_conditional)
     )
 
-    # Compute final values
-    x_star = x_star + x_update
+    # Compute final eta with clipping
     eta = a @ x_star
-    D_diag = hess_diag_fn(eta)
-    Q_conditional = Q_prior - a.T @ jnp.diag(D_diag) @ a
+    eta = jnp.clip(eta, -eta_max, eta_max)
 
     return Q_conditional, x_star, eta
 
@@ -511,6 +925,231 @@ def _objective_gaussian_dense(theta, static_data):
     return objective, x
 
 
+def _build_spatial_Q_prior_jax(theta_spatial, spatial_matrices, ns):
+    """Build spatial Q_prior matrix using JAX.
+
+    This implements the SPDE precision matrix construction for 2D spatial domain.
+
+    inputs:
+    theta_spatial : [r_s, sigma_e] hyperparameters
+    spatial_matrices : dict with 'c0', 'g1', 'g2' matrices
+    ns : number of spatial nodes
+
+    Returns:
+    Q_spatial : (ns, ns) spatial precision matrix
+    """
+    r_s = theta_spatial[0]
+    sigma_e = theta_spatial[1]
+
+    c0 = spatial_matrices['c0']
+    g1 = spatial_matrices['g1']
+    g2 = spatial_matrices['g2']
+
+    # Interpretable to compute transformation (2D spatial domain)
+    alpha = 2.0
+    dim_spatial_domain = 2.0
+    nu_s = alpha - dim_spatial_domain / 2.0  # = 1.0 for 2D
+
+    gamma_s = 0.5 * jnp.log(8.0 * nu_s) - r_s
+
+    # gamma_e computation using scipy.special.gamma values precomputed
+    # gamma(1) = 1, gamma(2) = 1, so for nu_s=1, alpha=2:
+    # log(gamma(1)) = 0, log(gamma(2)) = 0
+    log_gamma_nu_s = jax.scipy.special.gammaln(nu_s)
+    log_gamma_alpha = jax.scipy.special.gammaln(alpha)
+
+    gamma_e = 0.5 * (
+        log_gamma_nu_s
+        - (log_gamma_alpha + 0.5 * dim_spatial_domain * jnp.log(4.0 * jnp.pi) + 2.0 * nu_s * gamma_s + 2.0 * sigma_e)
+    )
+
+    exp_gamma_s = jnp.exp(gamma_s)
+    exp_gamma_e = jnp.exp(gamma_e)
+
+    # Q = exp(gamma_e)^2 * (exp(gamma_s)^4 * c0 + 2 * exp(gamma_s)^2 * g1 + g2)
+    q2s = (
+        jnp.power(exp_gamma_s, 4) * c0
+        + 2.0 * jnp.power(exp_gamma_s, 2) * g1
+        + g2
+    )
+    Q_spatial = jnp.power(exp_gamma_e, 2) * q2s
+
+    return Q_spatial
+
+
+def _objective_gaussian_spatial_dense(theta, static_data):
+    """Pure JAX objective function for Gaussian likelihood with spatial model (dense solver).
+
+    This implements the INLA objective for spatial + regression models:
+        f(theta) = -[log p(theta) + log p(y|x,theta) + log p(x|theta) - log p(x|y,theta)]
+
+    inputs:
+    theta : Hyperparameters [r_s, sigma_e, prec_o] or [r_s, prec_o] if sigma_e is fixed
+    static_data : Static data extracted from model.
+
+    Returns:
+    f : Objective function value.
+    x : Latent parameters.
+    """
+    a = static_data['a']
+    y = static_data['y']
+    n_fixed_effects = static_data['n_fixed_effects']
+    fixed_effects_precision = static_data['fixed_effects_precision']
+    prior_configs = static_data['prior_configs']
+    ns = static_data['ns']
+    spatial_matrices = static_data['spatial_matrices']
+    fe_offset = static_data.get('fe_offset', ns)
+    spatial_offset = static_data.get('spatial_offset', 0)
+    n_latent = static_data['n_latent_parameters']
+
+    # Parse hyperparameters
+    # theta layout: [spatial_params..., prec_o]
+    # For spatial: [r_s, sigma_e] or just [r_s] if sigma_e is fixed
+    n_theta = len(prior_configs)
+    theta_likelihood = theta[-1]
+
+    # Determine if sigma_e is a hyperparameter
+    n_spatial_params = n_theta - 1  # last one is prec_o
+    if n_spatial_params == 2:
+        theta_spatial = theta[:2]
+    else:
+        # sigma_e is fixed at 0
+        theta_spatial = jnp.array([theta[0], 0.0])
+
+    # Build spatial Q_prior
+    Q_spatial = _build_spatial_Q_prior_jax(theta_spatial, spatial_matrices, ns)
+
+    # Build full Q_prior (block diagonal: spatial + fixed effects)
+    Q_prior = jnp.zeros((n_latent, n_latent), dtype=jnp.float64)
+
+    # Place spatial block
+    Q_prior = Q_prior.at[spatial_offset:spatial_offset+ns, spatial_offset:spatial_offset+ns].set(Q_spatial)
+
+    # Place fixed effects block
+    if n_fixed_effects > 0:
+        Q_fe = jnp.eye(n_fixed_effects) * fixed_effects_precision
+        Q_prior = Q_prior.at[fe_offset:fe_offset+n_fixed_effects, fe_offset:fe_offset+n_fixed_effects].set(Q_fe)
+
+    # For Gaussian likelihood, use the same formulation as _objective_gaussian_dense:
+    # eta = 0 (evaluate likelihood at zero)
+    # Q_conditional = Q_prior + prec_o * A^T A
+    eta = jnp.zeros_like(y)
+
+    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y))
+    Q_conditional = Q_prior - (a.T * D_diag) @ a  # = Q_prior + prec_o * A^T A
+
+    # Solve for x
+    gradient_likelihood = jnp.exp(theta_likelihood) * y
+    rhs = a.T @ gradient_likelihood
+    x = jnp.linalg.solve(Q_conditional, rhs)
+
+    # Evaluate log prior hyperparameters
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
+
+    # Evaluate log likelihood at eta=0 (matching existing Gaussian dense formulation)
+    log_likelihood = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
+
+    # Log prior latent: 0.5 * log|Q_prior|
+    # Use slogdet which handles near-singular matrices better
+    _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
+    log_prior_latent = 0.5 * logdet_Q_prior
+
+    # Log conditional: 0.5 * log|Q_conditional| - 0.5 * x^T @ Q_conditional @ x
+    _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
+    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * x.T @ Q_conditional @ x
+
+    objective = -(
+        log_prior_hyperparameters
+        + log_likelihood
+        + log_prior_latent
+        - log_conditional
+    )
+
+    return objective, x
+
+
+def _objective_gaussian_st_dense(theta, static_data):
+    """Pure JAX objective for Gaussian likelihood with spatio-temporal model (dense solver).
+
+    This handles the case where we have a spatio-temporal submodel with Gaussian likelihood
+    using a dense solver.
+
+    inputs:
+    theta : Hyperparameters [r_s, r_t, sigma_st, prec_o]
+    static_data : Static data containing spatial/temporal matrices and model parameters
+
+    Returns:
+    objective : INLA objective value
+    x : Latent parameters
+    """
+    from dalia.core.jax_sparse_helpers import build_spatio_temporal_Q_bta_jax
+
+    a = static_data['a']
+    y = static_data['y']
+    n_fixed_effects = static_data['n_fixed_effects']
+    fixed_effects_precision = static_data['fixed_effects_precision']
+    prior_configs = static_data['prior_configs']
+    nt = static_data['nt']
+    ns = static_data['ns']
+    manifold = static_data['manifold']
+    spatial_matrices = static_data['spatial_matrices']
+    temporal_matrices = static_data['temporal_matrices']
+    fe_offset = static_data.get('fe_offset', nt * ns)
+    st_offset = static_data.get('st_offset', 0)
+    n_latent = static_data['n_latent_parameters']
+
+    # Parse hyperparameters: [r_s, r_t, sigma_st, prec_o]
+    theta_st = theta[:3]
+    theta_likelihood = theta[-1]
+
+    # Build spatio-temporal Q_prior as dense matrix
+    Q_st_bta = build_spatio_temporal_Q_bta_jax(
+        theta_st, spatial_matrices, temporal_matrices, nt, ns, manifold
+    )
+    Q_st = bta_to_dense_jax(Q_st_bta['diag'], Q_st_bta['lower'], Q_st_bta['arrow'], Q_st_bta['tip'])
+
+    # Build full Q_prior (block diagonal: spatio-temporal + fixed effects)
+    Q_prior = jnp.zeros((n_latent, n_latent), dtype=jnp.float64)
+
+    # Place ST block
+    Q_prior = Q_prior.at[st_offset:st_offset+nt*ns, st_offset:st_offset+nt*ns].set(Q_st)
+
+    # Place fixed effects block
+    if n_fixed_effects > 0:
+        Q_fe = jnp.eye(n_fixed_effects) * fixed_effects_precision
+        Q_prior = Q_prior.at[fe_offset:fe_offset+n_fixed_effects, fe_offset:fe_offset+n_fixed_effects].set(Q_fe)
+
+    # For Gaussian likelihood, use same formulation as _objective_gaussian_dense
+    eta = jnp.zeros_like(y)
+
+    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y))
+    Q_conditional = Q_prior - (a.T * D_diag) @ a  # = Q_prior + prec_o * A^T A
+
+    # Solve for x
+    gradient_likelihood = jnp.exp(theta_likelihood) * y
+    rhs = a.T @ gradient_likelihood
+    x = jnp.linalg.solve(Q_conditional, rhs)
+
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
+    log_likelihood = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
+
+    # Use slogdet for log determinants
+    _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
+    log_prior_latent = 0.5 * logdet_Q_prior
+
+    _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
+    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * x.T @ Q_conditional @ x
+
+    objective = -(
+        log_prior_hyperparameters
+        + log_likelihood
+        + log_prior_latent
+        - log_conditional
+    )
+
+    return objective, x
+
+
 def _objective_poisson_dense(theta, static_data):
     """Pure JAX objective function for Poisson likelihood with dense solver."""
     a = static_data['a']
@@ -520,6 +1159,7 @@ def _objective_poisson_dense(theta, static_data):
     fixed_effects_precision = static_data['fixed_effects_precision']
     tol = static_data['inner_iter_tol']
     max_iter = static_data['inner_iter_max']
+    x_initial = static_data.get('x_initial', None)
 
     Q_prior = jnp.eye(n_fixed_effects) * fixed_effects_precision
 
@@ -529,16 +1169,106 @@ def _objective_poisson_dense(theta, static_data):
     hess_fn = lambda eta: _hessian_diag_poisson_jax(eta, e)
 
     Q_conditional, x, eta = _inner_iteration_jax(
-        a, y, Q_prior, grad_fn, hess_fn, tol, max_iter
+        a, y, Q_prior, grad_fn, hess_fn, tol, max_iter, x_initial
     )
 
     log_likelihood = _evaluate_poisson_likelihood_jax(eta, y, e)
 
-    _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
-    log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * x.T @ Q_prior @ x
+    # Q_prior is diagonal, logdet = sum of log of diagonal elements
+    logdet_Q_prior = n_fixed_effects * jnp.log(fixed_effects_precision)
+    log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * fixed_effects_precision * jnp.dot(x, x)
 
-    # For non-Gaussian, DALIA uses x=None, x_mean=None -> quadratic_form=0
-    _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
+    # Log conditional using Cholesky (faster than slogdet)
+    L_cond = jnp.linalg.cholesky(Q_conditional)
+    logdet_Q_conditional = 2.0 * jnp.sum(jnp.log(jnp.diag(L_cond)))
+    log_conditional = 0.5 * logdet_Q_conditional
+
+    objective = -(
+        log_prior_hyperparameters
+        + log_likelihood
+        + log_prior_latent
+        - log_conditional
+    )
+
+    return objective, x
+
+
+def _objective_poisson_st_dense(theta, static_data):
+    """Pure JAX objective for Poisson likelihood with spatio-temporal model (dense solver).
+
+    This handles the case where we have a spatio-temporal submodel with Poisson likelihood
+    using a dense solver. The Q_prior is constructed from the hyperparameters theta.
+
+    inputs:
+    theta : Hyperparameters [r_s, r_t, sigma_st]
+    static_data : Static data containing spatial/temporal matrices and model parameters
+
+    Returns:
+    objective : INLA objective value
+    x : Latent parameters
+    """
+    a = static_data['a']
+    y = static_data['y']
+    e = static_data['e']
+    n_fixed_effects = static_data['n_fixed_effects']
+    fixed_effects_precision = static_data['fixed_effects_precision']
+    prior_configs = static_data['prior_configs']
+    tol = static_data['inner_iter_tol']
+    max_iter = static_data['inner_iter_max']
+    nt = static_data['nt']
+    ns = static_data['ns']
+    spatial_matrices = static_data['spatial_matrices']
+    temporal_matrices = static_data['temporal_matrices']
+    manifold = static_data['manifold']
+    fe_offset = static_data['fe_offset']
+    st_offset = static_data['st_offset']
+    x_initial = static_data['x_initial']
+
+    # Build Q_st from hyperparameters
+    Q_st = build_spatio_temporal_Q_jax(theta, spatial_matrices, temporal_matrices, manifold)
+
+    # Build full Q_prior: block diagonal matching submodel ordering
+    total_st_size = nt * ns
+    n_latent = total_st_size + n_fixed_effects
+    Q_prior = jnp.zeros((n_latent, n_latent))
+
+    # Place Q_st and Q_fe blocks at their correct offsets
+    Q_prior = Q_prior.at[st_offset:st_offset+total_st_size, st_offset:st_offset+total_st_size].set(Q_st)
+    Q_prior = Q_prior.at[fe_offset:fe_offset+n_fixed_effects, fe_offset:fe_offset+n_fixed_effects].set(
+        jnp.eye(n_fixed_effects) * fixed_effects_precision
+    )
+
+    # Evaluate prior on hyperparameters
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
+
+    # Inner iteration for Poisson likelihood
+    grad_fn = lambda eta: _gradient_poisson_likelihood_jax(eta, y, e)
+    hess_fn = lambda eta: _hessian_diag_poisson_jax(eta, e)
+
+    Q_conditional, x, eta = _inner_iteration_jax(
+        a, y, Q_prior, grad_fn, hess_fn, tol, max_iter, x_initial
+    )
+
+    # Poisson log-likelihood
+    log_likelihood = _evaluate_poisson_likelihood_jax(eta, y, e)
+
+    # Log prior for latent parameters using correct offsets
+    # Use Cholesky for logdet (faster than slogdet for positive definite matrices)
+    L_st = jnp.linalg.cholesky(Q_st)
+    logdet_Q_st = 2.0 * jnp.sum(jnp.log(jnp.diag(L_st)))
+    x_st = x[st_offset:st_offset+total_st_size]
+    log_prior_st = 0.5 * logdet_Q_st - 0.5 * jnp.dot(x_st, Q_st @ x_st)
+
+    # Fixed effects prior (Q_fe is diagonal, so logdet is simple)
+    x_fe = x[fe_offset:fe_offset+n_fixed_effects]
+    logdet_Q_fe = n_fixed_effects * jnp.log(fixed_effects_precision)
+    log_prior_fe = 0.5 * logdet_Q_fe - 0.5 * fixed_effects_precision * jnp.dot(x_fe, x_fe)
+
+    log_prior_latent = log_prior_st + log_prior_fe
+
+    # Log conditional using Cholesky
+    L_cond = jnp.linalg.cholesky(Q_conditional)
+    logdet_Q_conditional = 2.0 * jnp.sum(jnp.log(jnp.diag(L_cond)))
     log_conditional = 0.5 * logdet_Q_conditional
 
     objective = -(
@@ -560,6 +1290,7 @@ def _objective_binomial_dense(theta, static_data):
     fixed_effects_precision = static_data['fixed_effects_precision']
     tol = static_data['inner_iter_tol']
     max_iter = static_data['inner_iter_max']
+    x_initial = static_data.get('x_initial', None)
 
     Q_prior = jnp.eye(n_fixed_effects) * fixed_effects_precision
 
@@ -569,16 +1300,18 @@ def _objective_binomial_dense(theta, static_data):
     hess_fn = lambda eta: _hessian_diag_binomial_jax(eta, n_trials)
 
     Q_conditional, x, eta = _inner_iteration_jax(
-        a, y, Q_prior, grad_fn, hess_fn, tol, max_iter
+        a, y, Q_prior, grad_fn, hess_fn, tol, max_iter, x_initial
     )
 
     log_likelihood = _evaluate_binomial_likelihood_jax(eta, y, n_trials)
 
-    _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
-    log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * x.T @ Q_prior @ x
+    # Q_prior is diagonal, logdet = sum of log of diagonal elements
+    logdet_Q_prior = n_fixed_effects * jnp.log(fixed_effects_precision)
+    log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * fixed_effects_precision * jnp.dot(x, x)
 
-    # For non-Gaussian, DALIA uses x=None, x_mean=None -> quadratic_form=0
-    _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
+    # Log conditional using Cholesky (faster than slogdet)
+    L_cond = jnp.linalg.cholesky(Q_conditional)
+    logdet_Q_conditional = 2.0 * jnp.sum(jnp.log(jnp.diag(L_cond)))
     log_conditional = 0.5 * logdet_Q_conditional
 
     objective = -(
@@ -744,3 +1477,410 @@ def _objective_gaussian_sparse(theta, static_data):
     )
 
     return objective, x
+
+
+def _objective_gaussian_coregional_sparse(theta, static_data):
+    """Pure JAX objective function for Gaussian CoregionalModel with sparse serinv solver.
+
+    Uses block-tridiagonal-arrowhead structure with coregional block size (n_models * ns).
+
+    inputs:
+    theta : Hyperparameters arranged as:
+            [model_0_params..., model_1_params..., ..., sigmas..., lambdas...]
+    static_data : Static data extracted from CoregionalModel
+
+    Returns:
+    objective : INLA objective value
+    x : Latent parameters
+    """
+    n_models = static_data['n_models']
+    nt = static_data['nt']
+    ns = static_data['ns']
+    block_size = static_data['block_size']
+    n_fixed_effects_total = static_data['n_fixed_effects_total']
+    fixed_effects_precision = static_data['fixed_effects_precision']
+    models_data = static_data['models_data']
+    y = static_data['y']
+    a_sparse = static_data['a_sparse']
+    prior_configs = static_data['prior_configs']
+    hyperparameters_idx = static_data['hyperparameters_idx']
+    theta_keys = static_data['theta_keys']
+    n_observations_idx = static_data['n_observations_idx']
+
+    # Per-model AtA contributions: shape (n_models, n_blocks, block_size, block_size)
+    ata_diag_per_model = static_data['ata_diag_per_model']
+    ata_lower_per_model = static_data['ata_lower_per_model']
+    ata_arrow_per_model = static_data['ata_arrow_per_model']
+    ata_tip_per_model = static_data['ata_tip_per_model']
+
+    # Build Q_prior in BTA format using coregional structure
+    q_prior_diag, q_prior_lower = build_coregional_Q_bta_jax(
+        theta, n_models, ns, nt, models_data, hyperparameters_idx, theta_keys
+    )
+
+    # Compute likelihood precisions for each model
+    likelihood_precisions = jnp.zeros(n_models)
+    for i in range(n_models):
+        prec_idx = hyperparameters_idx[i + 1] - 1
+        likelihood_precisions = likelihood_precisions.at[i].set(jnp.exp(theta[prec_idx]))
+
+    # Compute weighted AtDA contribution: sum_i(prec_i * A_i^T @ A_i)
+    # Using einsum to weight per-model contributions by their precisions
+    # ata_diag_per_model: (n_models, n_blocks, block_size, block_size)
+    # likelihood_precisions: (n_models,)
+    weighted_ata_diag = jnp.einsum('m,mbij->bij', likelihood_precisions, ata_diag_per_model)
+    weighted_ata_lower = jnp.einsum('m,mbij->bij', likelihood_precisions, ata_lower_per_model)
+    weighted_ata_arrow = jnp.einsum('m,mbij->bij', likelihood_precisions, ata_arrow_per_model)
+    weighted_ata_tip = jnp.einsum('m,mij->ij', likelihood_precisions, ata_tip_per_model)
+
+    # Diagonal blocks: Q_prior_diag + weighted AtA_diag
+    diag_blocks = q_prior_diag + weighted_ata_diag
+    lower_diag_blocks = q_prior_lower + weighted_ata_lower
+    lower_arrow_blocks = weighted_ata_arrow
+    arrow_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total) + weighted_ata_tip
+
+    # Cholesky factorization in BTA format
+    L_diag, L_lower, L_arrow, L_tip = pobtaf_jax_optimized(
+        diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip
+    )
+
+    # Log determinant from Cholesky factors
+    logdet_Q_conditional = compute_logdet_from_cholesky_bta_jax(L_diag, L_tip)
+
+    # Solve for x using BTA system
+    # RHS = A^T @ D @ y where D is diagonal with per-model precisions
+    # Build weighted gradient: D @ y
+    gradient_likelihood = jnp.zeros_like(y)
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        gradient_likelihood = gradient_likelihood.at[obs_start:obs_end].set(
+            likelihood_precisions[i] * y[obs_start:obs_end]
+        )
+    rhs = a_sparse.T @ gradient_likelihood
+
+    x = solve_bta_system_jax(L_diag, L_lower, L_arrow, L_tip, rhs)
+
+    # Evaluate log prior on hyperparameters
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
+
+    # Evaluate likelihood (using eta=0 simplification for Gaussian at mode)
+    eta = jnp.zeros_like(y)
+    log_likelihood = 0.0
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        y_i = y[obs_start:obs_end]
+        eta_i = eta[obs_start:obs_end]
+        prec_idx = hyperparameters_idx[i + 1] - 1
+        theta_lik_i = theta[prec_idx]
+        log_likelihood += _evaluate_gaussian_likelihood_jax(eta_i, y_i, theta_lik_i)
+
+    # Log prior for latent parameters - compute logdet of Q_prior
+    logdet_Q_prior_st = pobtf_logdet_jax(q_prior_diag, q_prior_lower)
+    log_prior_latent = 0.5 * logdet_Q_prior_st
+
+    # Quadratic form using BTA blocks (with weighted AtA)
+    q_cond_diag = q_prior_diag + weighted_ata_diag
+    q_cond_lower = q_prior_lower + weighted_ata_lower
+    q_cond_arrow = weighted_ata_arrow
+    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total) + weighted_ata_tip
+
+    x_st = x[:nt * block_size].reshape(nt, block_size)
+    x_fe = x[nt * block_size:]
+
+    quad_diag = jnp.einsum('bi,bij,bj->', x_st, q_cond_diag, x_st)
+    quad_lower = 2.0 * jnp.einsum('bi,bij,bj->', x_st[1:], q_cond_lower, x_st[:-1])
+    arrow_matvec = jnp.einsum('bij,bj->i', q_cond_arrow, x_st)
+    quad_arrow = 2.0 * jnp.dot(x_fe, arrow_matvec)
+    quad_tip = x_fe @ q_cond_tip @ x_fe
+
+    quad_form = quad_diag + quad_lower + quad_arrow + quad_tip
+
+    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * quad_form
+
+    objective = -(
+        log_prior_hyperparameters
+        + log_likelihood
+        + log_prior_latent
+        - log_conditional
+    )
+
+    return objective, x
+
+
+def _build_coregional_Q_prior_spatial_dense(
+    theta: jnp.ndarray,
+    n_models: int,
+    ns: int,
+    models_data: list,
+    hyperparameters_idx: list,
+    theta_keys: list,
+) -> jnp.ndarray:
+    """Build coregional Q_prior for spatial-only models as dense matrix.
+
+    For 2-model case:
+        Q_11 = (1/sigma_0^2)*Qu_0 + (lambda_01^2/sigma_1^2)*Qu_1
+        Q_12 = -(lambda_01/sigma_1^2)*Qu_1
+        Q_21 = -(lambda_01/sigma_1^2)*Qu_1
+        Q_22 = (1/sigma_1^2)*Qu_1
+
+    For 3-model case, similar pattern with more terms.
+    """
+    block_size = n_models * ns
+
+    # Build individual Qu matrices for each model
+    Qu_list = []
+    for i in range(n_models):
+        model_data = models_data[i]
+        hp_start = hyperparameters_idx[i]
+        hp_end = hyperparameters_idx[i + 1] - 1
+
+        theta_model = theta[hp_start:hp_end]
+
+        # For spatial models, theta_model contains [r_s]
+        r_s = theta_model[0]
+        sigma_e = 0.0  # Fixed at 0 for spatial coregional
+
+        # Build spatial precision matrix
+        c0 = model_data['spatial_matrices']['c0']
+        g1 = model_data['spatial_matrices']['g1']
+        g2 = model_data['spatial_matrices']['g2']
+
+        alpha = 2.0
+        dim_spatial_domain = 2.0
+        nu_s = alpha - dim_spatial_domain / 2.0
+        gamma_s = 0.5 * jnp.log(8.0 * nu_s) - r_s
+        log_gamma_nu_s = jax.scipy.special.gammaln(nu_s)
+        log_gamma_alpha = jax.scipy.special.gammaln(alpha)
+        gamma_e = 0.5 * (log_gamma_nu_s - (
+            log_gamma_alpha + 0.5 * dim_spatial_domain * jnp.log(4.0 * jnp.pi)
+            + 2.0 * nu_s * gamma_s + 2.0 * sigma_e
+        ))
+
+        exp_gamma_s = jnp.exp(gamma_s)
+        exp_gamma_e = jnp.exp(gamma_e)
+
+        q2s = jnp.power(exp_gamma_s, 4) * c0 + 2.0 * jnp.power(exp_gamma_s, 2) * g1 + g2
+        Qu = jnp.power(exp_gamma_e, 2) * q2s
+        Qu_list.append(Qu)
+
+    # Extract sigmas and lambdas from theta
+    sigma_idx = theta_keys.index('sigma_0')
+    sigmas = []
+    for i in range(n_models):
+        sigmas.append(jnp.exp(theta[sigma_idx + i]))
+
+    lambda_01_idx = theta_keys.index('lambda_0_1')
+    lambda_01 = theta[lambda_01_idx]
+
+    if n_models == 3:
+        lambda_02_idx = theta_keys.index('lambda_0_2')
+        lambda_12_idx = theta_keys.index('lambda_1_2')
+        lambda_02 = theta[lambda_02_idx]
+        lambda_12 = theta[lambda_12_idx]
+
+    # Build coregional Q_prior matrix
+    Q_prior = jnp.zeros((block_size, block_size))
+
+    if n_models == 2:
+        sigma_0, sigma_1 = sigmas[0], sigmas[1]
+
+        coef_11_0 = 1.0 / (sigma_0 ** 2)
+        coef_11_1 = (lambda_01 ** 2) / (sigma_1 ** 2)
+        coef_12 = -lambda_01 / (sigma_1 ** 2)
+        coef_22 = 1.0 / (sigma_1 ** 2)
+
+        q11 = coef_11_0 * Qu_list[0] + coef_11_1 * Qu_list[1]
+        q12 = coef_12 * Qu_list[1]
+        q22 = coef_22 * Qu_list[1]
+
+        Q_prior = Q_prior.at[:ns, :ns].set(q11)
+        Q_prior = Q_prior.at[:ns, ns:].set(q12)
+        Q_prior = Q_prior.at[ns:, :ns].set(q12)  # Q_21 = Q_12
+        Q_prior = Q_prior.at[ns:, ns:].set(q22)
+
+    elif n_models == 3:
+        sigma_0, sigma_1, sigma_2 = sigmas[0], sigmas[1], sigmas[2]
+
+        coef_11_0 = 1.0 / (sigma_0 ** 2)
+        coef_11_1 = (lambda_01 ** 2) / (sigma_1 ** 2)
+        coef_11_2 = (lambda_12 ** 2) / (sigma_2 ** 2)
+
+        coef_21_1 = -lambda_01 / (sigma_1 ** 2)
+        coef_21_2 = (lambda_02 * lambda_12) / (sigma_2 ** 2)
+
+        coef_31 = -lambda_12 / (sigma_2 ** 2)
+
+        coef_22_1 = 1.0 / (sigma_1 ** 2)
+        coef_22_2 = (lambda_02 ** 2) / (sigma_2 ** 2)
+
+        coef_32 = -lambda_02 / (sigma_2 ** 2)
+
+        coef_33 = 1.0 / (sigma_2 ** 2)
+
+        q11 = coef_11_0 * Qu_list[0] + coef_11_1 * Qu_list[1] + coef_11_2 * Qu_list[2]
+        q21 = coef_21_1 * Qu_list[1] + coef_21_2 * Qu_list[2]
+        q31 = coef_31 * Qu_list[2]
+        q22 = coef_22_1 * Qu_list[1] + coef_22_2 * Qu_list[2]
+        q32 = coef_32 * Qu_list[2]
+        q33 = coef_33 * Qu_list[2]
+
+        Q_prior = Q_prior.at[:ns, :ns].set(q11)
+        Q_prior = Q_prior.at[ns:2*ns, :ns].set(q21)
+        Q_prior = Q_prior.at[:ns, ns:2*ns].set(q21)  # Symmetric
+        Q_prior = Q_prior.at[2*ns:, :ns].set(q31)
+        Q_prior = Q_prior.at[:ns, 2*ns:].set(q31)  # Symmetric
+        Q_prior = Q_prior.at[ns:2*ns, ns:2*ns].set(q22)
+        Q_prior = Q_prior.at[2*ns:, ns:2*ns].set(q32)
+        Q_prior = Q_prior.at[ns:2*ns, 2*ns:].set(q32)  # Symmetric
+        Q_prior = Q_prior.at[2*ns:, 2*ns:].set(q33)
+
+    return Q_prior
+
+
+def _objective_gaussian_coregional_spatial_dense(theta, static_data):
+    """Pure JAX objective for Gaussian spatial CoregionalModel with dense solver.
+
+    Uses dense matrix operations for spatial-only coregional models.
+    """
+    n_models = static_data['n_models']
+    ns = static_data['ns']
+    n_fixed_effects_total = static_data['n_fixed_effects_total']
+    fixed_effects_precision = static_data['fixed_effects_precision']
+    models_data = static_data['models_data']
+    y = static_data['y']
+    a = static_data['a']
+    prior_configs = static_data['prior_configs']
+    hyperparameters_idx = static_data['hyperparameters_idx']
+    theta_keys = static_data['theta_keys']
+    n_observations_idx = static_data['n_observations_idx']
+    n_latent = static_data['n_latent_parameters']
+
+    # Build coregional Q_prior for spatial fields
+    Q_prior_spatial = _build_coregional_Q_prior_spatial_dense(
+        theta, n_models, ns, models_data, hyperparameters_idx, theta_keys
+    )
+
+    # Build full Q_prior (coregional spatial + fixed effects)
+    Q_prior = jnp.zeros((n_latent, n_latent), dtype=jnp.float64)
+    n_spatial = n_models * ns
+    Q_prior = Q_prior.at[:n_spatial, :n_spatial].set(Q_prior_spatial)
+
+    if n_fixed_effects_total > 0:
+        Q_fe = jnp.eye(n_fixed_effects_total) * fixed_effects_precision
+        Q_prior = Q_prior.at[n_spatial:, n_spatial:].set(Q_fe)
+
+    # Compute likelihood precisions for each model
+    likelihood_precisions = []
+    for i in range(n_models):
+        prec_idx = hyperparameters_idx[i + 1] - 1
+        likelihood_precisions.append(jnp.exp(theta[prec_idx]))
+
+    # Build D diagonal (per-observation precision)
+    n_obs = len(y)
+    D_diag = jnp.zeros(n_obs)
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        D_diag = D_diag.at[obs_start:obs_end].set(-likelihood_precisions[i])
+
+    # Q_conditional = Q_prior - A^T @ D @ A
+    Q_conditional = Q_prior - (a.T * D_diag) @ a
+
+    # Compute RHS = A^T @ (prec * y)
+    gradient_likelihood = jnp.zeros_like(y)
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        gradient_likelihood = gradient_likelihood.at[obs_start:obs_end].set(
+            likelihood_precisions[i] * y[obs_start:obs_end]
+        )
+    rhs = a.T @ gradient_likelihood
+
+    # Solve for x
+    x = jnp.linalg.solve(Q_conditional, rhs)
+
+    # Evaluate log prior on hyperparameters
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
+
+    # Evaluate likelihood (using eta=0 simplification)
+    eta = jnp.zeros_like(y)
+    log_likelihood = 0.0
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        y_i = y[obs_start:obs_end]
+        eta_i = eta[obs_start:obs_end]
+        prec_idx = hyperparameters_idx[i + 1] - 1
+        theta_lik_i = theta[prec_idx]
+        log_likelihood += _evaluate_gaussian_likelihood_jax(eta_i, y_i, theta_lik_i)
+
+    # Log prior for latent parameters
+    _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
+    log_prior_latent = 0.5 * logdet_Q_prior
+
+    # Log conditional
+    _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
+    quad_form = x.T @ Q_conditional @ x
+    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * quad_form
+
+    objective = -(
+        log_prior_hyperparameters
+        + log_likelihood
+        + log_prior_latent
+        - log_conditional
+    )
+
+    return objective, x
+
+
+def create_pure_jax_objective_coregional(dalia_instance) -> Tuple[Callable, Callable]:
+    """Create pure JAX objective function for CoregionalModel with automatic differentiation.
+
+    inputs:
+    dalia_instance : DALIA instance with CoregionalModel.
+
+    Returns:
+    objective_func : Pure JAX objective function.
+    objective_with_grad : Function returning both forward value and gradient.
+    """
+    static_data = _extract_static_data_coregional(dalia_instance)
+    n_hyperparameters = dalia_instance.model.n_hyperparameters
+
+    # Verify all likelihoods are Gaussian
+    for model_data in static_data['models_data']:
+        if model_data['likelihood_type'] != 'gaussian':
+            raise NotImplementedError(
+                f"JAX autodiff for CoregionalModel only supports Gaussian likelihoods. "
+                f"Found: {model_data['likelihood_type']}"
+            )
+
+    use_sparse = static_data.get('use_sparse_solver', True)
+    is_spatial_only = static_data.get('is_spatial_only', False)
+
+    def objective_pure_jax(theta):
+        if use_sparse:
+            return _objective_gaussian_coregional_sparse(theta, static_data)
+        elif is_spatial_only:
+            return _objective_gaussian_coregional_spatial_dense(theta, static_data)
+        else:
+            raise NotImplementedError(
+                "Dense solver only supports spatial-only CoregionalModel."
+            )
+
+    value_and_grad_fn = jax.value_and_grad(objective_pure_jax, has_aux=True)
+
+    objective_pure_jax = jax.jit(objective_pure_jax)
+    value_and_grad_fn = jax.jit(value_and_grad_fn)
+
+    # Warmup JIT compilation
+    theta_init = jnp.ones(n_hyperparameters, dtype=jnp.float64)
+    _ = value_and_grad_fn(theta_init)
+
+    def objective_with_grad(theta):
+        theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+        (f_val, x_val), grad_val = value_and_grad_fn(theta_jax)
+        return float(f_val), np.asarray(grad_val, dtype=np.float64), np.asarray(x_val, dtype=np.float64)
+
+    return objective_pure_jax, objective_with_grad

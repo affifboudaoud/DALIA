@@ -1,5 +1,7 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
 
+import time
+
 from dalia import NDArray, sp, xp
 from dalia.configs.dalia_config import SolverConfig
 from dalia.core.solver import Solver
@@ -16,8 +18,12 @@ class SparseSolver(Solver):
 
         self.L: sp.sparse.spmatrix = None
 
+        self.t_cholesky = 0.0
+        self.t_solve = 0.0
+
     def cholesky(self, A: sp.sparse.spmatrix, **kwargs) -> None:
         """Compute Cholesky factor of input matrix."""
+        tic = time.perf_counter()
 
         A = sp.sparse.csc_matrix(A)
 
@@ -28,12 +34,15 @@ class SparseSolver(Solver):
         else:
             raise ValueError("The matrix is not positive definite")
 
+        self.t_cholesky = time.perf_counter() - tic
+
     def solve(
         self,
         rhs: NDArray,
         **kwargs,
     ) -> NDArray:
         """Solve linear system using Cholesky factor."""
+        tic = time.perf_counter()
 
         if self.L is None:
             raise ValueError("Cholesky factor not computed")
@@ -42,6 +51,8 @@ class SparseSolver(Solver):
         sp.sparse.linalg.spsolve_triangular(
             self.L.T, rhs, lower=False, overwrite_b=True
         )
+
+        self.t_solve = time.perf_counter() - tic
 
         return rhs
 

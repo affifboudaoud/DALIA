@@ -1,5 +1,7 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
 
+import time
+
 from dalia import NDArray, sp, xp
 from dalia.configs.dalia_config import SolverConfig
 from dalia.core.solver import Solver
@@ -32,20 +34,26 @@ class DenseSolver(Solver):
         self.L: NDArray = xp.zeros((self.n, self.n), dtype=xp.float64)
         self.A_inv = None
 
-    def cholesky(self, A: NDArray, **kwargs) -> None:
-        self.L[:] = A.todense()
+        self.t_cholesky = 0.0
+        self.t_solve = 0.0
 
+    def cholesky(self, A: NDArray, **kwargs) -> None:
+        tic = time.perf_counter()
+        self.L[:] = A.todense()
         self.L = xp.linalg.cholesky(self.L)
+        self.t_cholesky = time.perf_counter() - tic
 
     def solve(
         self,
         rhs: NDArray,
         **kwargs,
     ) -> NDArray:
+        tic = time.perf_counter()
         rhs[:] = sp.linalg.solve_triangular(self.L, rhs, lower=True, overwrite_b=True)
         rhs[:] = sp.linalg.solve_triangular(
             self.L.T, rhs, lower=False, overwrite_b=True
         )
+        self.t_solve = time.perf_counter() - tic
 
         return rhs
 

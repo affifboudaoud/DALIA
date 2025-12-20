@@ -410,3 +410,199 @@ def solve_bta_system_jax(
     )
 
     return result
+
+
+def build_coregional_Q_bta_jax(
+    theta: jnp.ndarray,
+    n_models: int,
+    ns: int,
+    nt: int,
+    models_data: list,
+    hyperparameters_idx: list,
+    theta_keys: list,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Build coregional Q_prior directly in BTA format.
+
+    The coregional Q has block structure where each "super-block"
+    contains contributions from all models according to coregionalization math.
+
+    For 2-model case:
+        Q_11 = (1/sigma_0^2)*Qu_0 + (lambda_01^2/sigma_1^2)*Qu_1
+        Q_12 = -(lambda_01/sigma_1^2)*Qu_1
+        Q_21 = -(lambda_01/sigma_1^2)*Qu_1
+        Q_22 = (1/sigma_1^2)*Qu_1
+
+    For 3-model case, similar pattern with more terms.
+
+    inputs:
+    theta : All hyperparameters
+    n_models : Number of models (2 or 3)
+    ns : Number of spatial nodes
+    nt : Number of temporal nodes
+    models_data : List of dicts with per-model matrices
+    hyperparameters_idx : List of hyperparameter index boundaries
+    theta_keys : List of hyperparameter names
+
+    Returns:
+    diag_blocks : Shape (nt, n_models*ns, n_models*ns)
+    lower_diag_blocks : Shape (nt-1, n_models*ns, n_models*ns)
+    """
+    block_size = n_models * ns
+
+    # Build individual Qu matrices for each model in BTA format
+    Qu_diag_list = []
+    Qu_lower_list = []
+
+    for i in range(n_models):
+        model_data = models_data[i]
+        hp_start = hyperparameters_idx[i]
+        hp_end = hyperparameters_idx[i + 1] - 1
+
+        theta_model = theta[hp_start:hp_end]
+
+        # Coregional models remove sigma_st from each model's params
+        # Add default sigma_st=0.0 if only r_s, r_t are present
+        if theta_model.shape[0] == 2:
+            theta_model = jnp.concatenate([theta_model, jnp.array([0.0])])
+
+        qu_diag, qu_lower = build_spatio_temporal_Q_bta_jax(
+            theta_model,
+            model_data['spatial_matrices'],
+            model_data['temporal_matrices'],
+            model_data['manifold'],
+        )
+        Qu_diag_list.append(qu_diag)
+        Qu_lower_list.append(qu_lower)
+
+    # Extract sigmas and lambdas from theta
+    sigma_idx = theta_keys.index('sigma_0')
+    sigmas = []
+    for i in range(n_models):
+        sigmas.append(jnp.exp(theta[sigma_idx + i]))
+
+    lambda_01_idx = theta_keys.index('lambda_0_1')
+    lambda_01 = theta[lambda_01_idx]
+
+    if n_models == 3:
+        lambda_02_idx = theta_keys.index('lambda_0_2')
+        lambda_12_idx = theta_keys.index('lambda_1_2')
+        lambda_02 = theta[lambda_02_idx]
+        lambda_12 = theta[lambda_12_idx]
+
+    # Build coregional super-blocks
+    diag_blocks = jnp.zeros((nt, block_size, block_size))
+    lower_diag_blocks = jnp.zeros((nt - 1, block_size, block_size))
+
+    if n_models == 2:
+        sigma_0, sigma_1 = sigmas[0], sigmas[1]
+
+        # Q_11 block: (1/sigma_0^2)*Qu_0 + (lambda_01^2/sigma_1^2)*Qu_1
+        coef_11_0 = 1.0 / (sigma_0 ** 2)
+        coef_11_1 = (lambda_01 ** 2) / (sigma_1 ** 2)
+
+        # Q_12/Q_21 block: -(lambda_01/sigma_1^2)*Qu_1
+        coef_12 = -lambda_01 / (sigma_1 ** 2)
+
+        # Q_22 block: (1/sigma_1^2)*Qu_1
+        coef_22 = 1.0 / (sigma_1 ** 2)
+
+        for t in range(nt):
+            block = jnp.zeros((block_size, block_size))
+
+            q11 = coef_11_0 * Qu_diag_list[0][t] + coef_11_1 * Qu_diag_list[1][t]
+            q12 = coef_12 * Qu_diag_list[1][t]
+            q21 = coef_12 * Qu_diag_list[1][t]
+            q22 = coef_22 * Qu_diag_list[1][t]
+
+            block = block.at[:ns, :ns].set(q11)
+            block = block.at[:ns, ns:].set(q12)
+            block = block.at[ns:, :ns].set(q21)
+            block = block.at[ns:, ns:].set(q22)
+
+            diag_blocks = diag_blocks.at[t].set(block)
+
+        for t in range(nt - 1):
+            block = jnp.zeros((block_size, block_size))
+
+            q11 = coef_11_0 * Qu_lower_list[0][t] + coef_11_1 * Qu_lower_list[1][t]
+            q12 = coef_12 * Qu_lower_list[1][t]
+            q21 = coef_12 * Qu_lower_list[1][t]
+            q22 = coef_22 * Qu_lower_list[1][t]
+
+            block = block.at[:ns, :ns].set(q11)
+            block = block.at[:ns, ns:].set(q12)
+            block = block.at[ns:, :ns].set(q21)
+            block = block.at[ns:, ns:].set(q22)
+
+            lower_diag_blocks = lower_diag_blocks.at[t].set(block)
+
+    elif n_models == 3:
+        sigma_0, sigma_1, sigma_2 = sigmas[0], sigmas[1], sigmas[2]
+
+        # Q_11: (1/sigma_0^2)*Qu_0 + (lambda_01^2/sigma_1^2)*Qu_1 + (lambda_12^2/sigma_2^2)*Qu_2
+        coef_11_0 = 1.0 / (sigma_0 ** 2)
+        coef_11_1 = (lambda_01 ** 2) / (sigma_1 ** 2)
+        coef_11_2 = (lambda_12 ** 2) / (sigma_2 ** 2)
+
+        # Q_21: -(lambda_01/sigma_1^2)*Qu_1 + (lambda_02*lambda_12/sigma_2^2)*Qu_2
+        coef_21_1 = -lambda_01 / (sigma_1 ** 2)
+        coef_21_2 = (lambda_02 * lambda_12) / (sigma_2 ** 2)
+
+        # Q_31: -(lambda_12/sigma_2^2)*Qu_2
+        coef_31 = -lambda_12 / (sigma_2 ** 2)
+
+        # Q_22: (1/sigma_1^2)*Qu_1 + (lambda_02^2/sigma_2^2)*Qu_2
+        coef_22_1 = 1.0 / (sigma_1 ** 2)
+        coef_22_2 = (lambda_02 ** 2) / (sigma_2 ** 2)
+
+        # Q_32: -(lambda_02/sigma_2^2)*Qu_2
+        coef_32 = -lambda_02 / (sigma_2 ** 2)
+
+        # Q_33: (1/sigma_2^2)*Qu_2
+        coef_33 = 1.0 / (sigma_2 ** 2)
+
+        for t in range(nt):
+            block = jnp.zeros((block_size, block_size))
+
+            q11 = coef_11_0 * Qu_diag_list[0][t] + coef_11_1 * Qu_diag_list[1][t] + coef_11_2 * Qu_diag_list[2][t]
+            q21 = coef_21_1 * Qu_diag_list[1][t] + coef_21_2 * Qu_diag_list[2][t]
+            q31 = coef_31 * Qu_diag_list[2][t]
+            q22 = coef_22_1 * Qu_diag_list[1][t] + coef_22_2 * Qu_diag_list[2][t]
+            q32 = coef_32 * Qu_diag_list[2][t]
+            q33 = coef_33 * Qu_diag_list[2][t]
+
+            block = block.at[:ns, :ns].set(q11)
+            block = block.at[:ns, ns:2*ns].set(q21.T)
+            block = block.at[:ns, 2*ns:].set(q31.T)
+            block = block.at[ns:2*ns, :ns].set(q21)
+            block = block.at[ns:2*ns, ns:2*ns].set(q22)
+            block = block.at[ns:2*ns, 2*ns:].set(q32.T)
+            block = block.at[2*ns:, :ns].set(q31)
+            block = block.at[2*ns:, ns:2*ns].set(q32)
+            block = block.at[2*ns:, 2*ns:].set(q33)
+
+            diag_blocks = diag_blocks.at[t].set(block)
+
+        for t in range(nt - 1):
+            block = jnp.zeros((block_size, block_size))
+
+            q11 = coef_11_0 * Qu_lower_list[0][t] + coef_11_1 * Qu_lower_list[1][t] + coef_11_2 * Qu_lower_list[2][t]
+            q21 = coef_21_1 * Qu_lower_list[1][t] + coef_21_2 * Qu_lower_list[2][t]
+            q31 = coef_31 * Qu_lower_list[2][t]
+            q22 = coef_22_1 * Qu_lower_list[1][t] + coef_22_2 * Qu_lower_list[2][t]
+            q32 = coef_32 * Qu_lower_list[2][t]
+            q33 = coef_33 * Qu_lower_list[2][t]
+
+            block = block.at[:ns, :ns].set(q11)
+            block = block.at[:ns, ns:2*ns].set(q21.T)
+            block = block.at[:ns, 2*ns:].set(q31.T)
+            block = block.at[ns:2*ns, :ns].set(q21)
+            block = block.at[ns:2*ns, ns:2*ns].set(q22)
+            block = block.at[ns:2*ns, 2*ns:].set(q32.T)
+            block = block.at[2*ns:, :ns].set(q31)
+            block = block.at[2*ns:, ns:2*ns].set(q32)
+            block = block.at[2*ns:, 2*ns:].set(q33)
+
+            lower_diag_blocks = lower_diag_blocks.at[t].set(block)
+
+    return diag_blocks, lower_diag_blocks

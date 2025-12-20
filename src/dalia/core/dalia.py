@@ -8,6 +8,7 @@ from scipy import optimize
 from dalia import ArrayLike, NDArray, backend_flags, comm_rank, comm_size, xp, sp
 from dalia.configs.dalia_config import DaliaConfig
 from dalia.core.model import Model
+from dalia.models.coregional_model import CoregionalModel
 from dalia.solvers import DenseSolver, DistSerinvSolver, SerinvSolver, SparseSolver
 from dalia.utils import (
     allreduce,
@@ -28,7 +29,7 @@ from dalia.utils import (
     DummyCommunicator,
 )
 
-from dalia.core.jax_autodiff import create_pure_jax_objective
+from dalia.core.jax_autodiff import create_pure_jax_objective, create_pure_jax_objective_coregional
 
 if backend_flags["mpi_avail"]:
     from mpi4py import MPI
@@ -224,24 +225,61 @@ class DALIA:
         if self.config.gradient_method == "jax_autodiff":
             # JAX autodiff supports: Gaussian/Poisson/Binomial + dense or sparse (serinv) solvers + single process
             supported_likelihoods = ["gaussian", "poisson", "binomial"]
-            can_use_pure_jax = (
-                self.model.likelihood_config.type in supported_likelihoods
-                and self.config.solver.type in ["dense", "serinv"]
-                and (not backend_flags["mpi_avail"] or comm_size == 1)
-            )
 
-            if can_use_pure_jax:
-                likelihood_name = self.model.likelihood_config.type.capitalize()
-                print_msg(f"Using JAX automatic differentiation with JIT compilation ({likelihood_name} likelihood)")
-                self.jax_objective, self.jax_grad_func = create_pure_jax_objective(
+            is_coregional = isinstance(self.model, CoregionalModel)
+
+            if is_coregional:
+                # CoregionalModel with JAX autodiff
+                # Check all models have Gaussian likelihoods
+                all_gaussian = all(
+                    m.likelihood_config.type == "gaussian"
+                    for m in self.model.models
+                )
+                if not all_gaussian:
+                    raise NotImplementedError(
+                        "JAX autodiff for CoregionalModel only supports Gaussian likelihoods for all models. "
+                        "Please use gradient_method='finite_diff' for non-Gaussian CoregionalModel."
+                    )
+                # Check solver type compatibility
+                is_spatial_only = getattr(self.model, 'coregionalization_type', 'spatio_temporal') == 'spatial'
+                if self.config.solver.type != "serinv" and not is_spatial_only:
+                    raise NotImplementedError(
+                        "JAX autodiff for spatio-temporal CoregionalModel requires solver type 'serinv'. "
+                        "Please use gradient_method='finite_diff' for other solver types."
+                    )
+                if backend_flags["mpi_avail"] and comm_size > 1:
+                    raise NotImplementedError(
+                        "JAX autodiff for CoregionalModel does not support multi-process execution. "
+                        "Please use gradient_method='finite_diff' for distributed runs."
+                    )
+
+                print_msg(f"Using JAX automatic differentiation with JIT compilation (CoregionalModel, {self.model.n_models} variates)")
+                self.jax_objective, self.jax_grad_func = create_pure_jax_objective_coregional(
                     dalia_instance=self,
                 )
             else:
-                raise NotImplementedError(
-                    "JAX autodiff currently only supports: "
-                    "Gaussian/Poisson/Binomial likelihoods + dense/serinv solver + single process. "
-                    "For other configurations, use gradient_method='finite_diff'."
+                # Regular Model
+                likelihood_type = self.model.likelihood_config.type
+                all_supported = likelihood_type in supported_likelihoods
+                likelihood_name = likelihood_type.capitalize()
+
+                can_use_pure_jax = (
+                    all_supported
+                    and self.config.solver.type in ["dense", "serinv"]
+                    and (not backend_flags["mpi_avail"] or comm_size == 1)
                 )
+
+                if can_use_pure_jax:
+                    print_msg(f"Using JAX automatic differentiation with JIT compilation ({likelihood_name} likelihood)")
+                    self.jax_objective, self.jax_grad_func = create_pure_jax_objective(
+                        dalia_instance=self,
+                    )
+                else:
+                    raise NotImplementedError(
+                        "JAX autodiff currently only supports: "
+                        "Gaussian/Poisson/Binomial likelihoods + dense/serinv solver + single process. "
+                        "For other configurations, use gradient_method='finite_diff'."
+                    )
 
         self._print_init()
 
@@ -378,7 +416,15 @@ class DALIA:
             print_msg("No hyperparameters, just running inner iteration.")
 
             if self.config.gradient_method == "jax_autodiff" and self.jax_objective is not None:
-                self.f_value = float(self.jax_objective(self.model.theta))
+                # Convert theta to numpy for JAX compatibility (handles CuPy arrays)
+                theta_np = get_host(self.model.theta)
+                result = self.jax_objective(theta_np)
+                # JAX objective returns (objective, x) tuple
+                if isinstance(result, tuple):
+                    self.f_value = float(result[0])
+                    self.model.x = xp.asarray(result[1])
+                else:
+                    self.f_value = float(result)
             else:
                 self.f_value = self._evaluate_f(self.model.theta)
 
@@ -492,7 +538,12 @@ class DALIA:
             # Choose objective function based on gradient method
             if self.config.gradient_method == "jax_autodiff":
                 objective_func = self._objective_function_jax
-                likelihood_name = self.model.likelihood_config.type.capitalize()
+                # Handle both regular Model and CoregionalModel
+                if isinstance(self.model, CoregionalModel):
+                    likelihood_types = [m.likelihood_config.type for m in self.model.models]
+                    likelihood_name = "/".join(set(lt.capitalize() for lt in likelihood_types))
+                else:
+                    likelihood_name = self.model.likelihood_config.type.capitalize()
                 print_msg(f"Using JAX automatic differentiation with JIT compilation ({likelihood_name} likelihood)")
             else:
                 objective_func = self._objective_function
@@ -681,9 +732,12 @@ class DALIA:
             self.t_construction_qprior + self.t_construction_qconditional
         )
 
+        # Store gradient for callback display
+        self.gradient_f[:] = xp.asarray(grad_f)
+
         if self.iter > 0:
             print(
-                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]} | solver_time: {self.solver_time[1:]} | construction_time: {self.construction_time[1:]}",
+                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]}",
                 flush=True,
             )
         self.iter += 1

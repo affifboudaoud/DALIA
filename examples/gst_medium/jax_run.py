@@ -6,16 +6,19 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
 import numpy as np
-import jax
-import jax.numpy as jnp
 
 from dalia import xp, backend_flags
 from dalia.configs import likelihood_config, dalia_config, submodels_config
 from dalia.core.model import Model
 from dalia.core.dalia import DALIA
 from dalia.submodels import RegressionSubModel, SpatioTemporalSubModel
-from dalia.utils import get_host, print_msg
+from dalia.utils import print_msg
 from examples_utils.parser_utils import parse_args
+from examples_utils.jax_utils import (
+    get_first_forward_and_gradient,
+    profile_jax_execution,
+    print_jax_ir,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -89,217 +92,6 @@ def run_with_method(model, gradient_method, max_iter, verbose=True):
     return dalia
 
 
-def compute_finite_diff_gradient(dalia, theta, eps=1e-3):
-    """Compute gradient using central finite differences."""
-    n = len(theta)
-    grad = np.zeros(n)
-    for i in range(n):
-        theta_plus = theta.copy()
-        theta_plus[i] += eps
-        f_plus = dalia._evaluate_f(theta_plus)
-
-        theta_minus = theta.copy()
-        theta_minus[i] -= eps
-        f_minus = dalia._evaluate_f(theta_minus)
-
-        grad[i] = (f_plus - f_minus) / (2 * eps)
-    return grad
-
-
-def get_first_forward_and_gradient(dalia):
-    """Get the first forward pass value and gradient."""
-    theta = dalia.model.theta.copy()
-
-    if dalia.config.gradient_method == "jax_autodiff":
-        f_val, grad, x = dalia.jax_grad_func(theta)
-        return float(f_val), np.array(grad)
-    else:
-        f_val = dalia._evaluate_f(theta)
-        grad = compute_finite_diff_gradient(dalia, theta, eps=dalia.eps_gradient_f)
-        return float(f_val), np.array(grad)
-
-
-def profile_jax_execution(dalia, output_dir=None, num_runs=5):
-    """Profile JAX forward and backward pass execution times."""
-    from dalia.core.jax_autodiff import create_pure_jax_objective
-
-    if output_dir is None:
-        output_dir = os.path.dirname(os.path.abspath(__file__))
-
-    theta = jnp.asarray(dalia.model.theta, dtype=jnp.float64)
-
-    objective_fn, _ = create_pure_jax_objective(dalia)
-
-    def forward_only(theta):
-        obj, x = objective_fn(theta)
-        return obj
-
-    grad_fn_pure = jax.grad(forward_only)
-    value_and_grad_fn = jax.value_and_grad(forward_only)
-
-    # JIT compile (separate from the pre-compiled versions)
-    forward_jit = jax.jit(forward_only)
-    grad_jit = jax.jit(grad_fn_pure)
-    value_and_grad_jit = jax.jit(value_and_grad_fn)
-
-    # Warmup runs
-    print_msg("Warming up JIT compilation...")
-    _ = forward_jit(theta).block_until_ready()
-    _ = grad_jit(theta).block_until_ready()
-    val, grad = value_and_grad_jit(theta)
-    val.block_until_ready()
-    grad.block_until_ready()
-
-    # Profile individual operations
-    print_msg(f"Profiling with {num_runs} runs each...")
-
-    forward_times = []
-    for _ in range(num_runs):
-        t0 = time.perf_counter()
-        result = forward_jit(theta)
-        result.block_until_ready()
-        forward_times.append(time.perf_counter() - t0)
-
-    grad_times = []
-    for _ in range(num_runs):
-        t0 = time.perf_counter()
-        result = grad_jit(theta)
-        result.block_until_ready()
-        grad_times.append(time.perf_counter() - t0)
-
-    value_and_grad_times = []
-    for _ in range(num_runs):
-        t0 = time.perf_counter()
-        val, grad = value_and_grad_jit(theta)
-        val.block_until_ready()
-        grad.block_until_ready()
-        value_and_grad_times.append(time.perf_counter() - t0)
-
-    print_msg("\n" + "-" * 70)
-    print_msg("JAX EXECUTION PROFILING RESULTS")
-    print_msg("-" * 70)
-
-    print_msg(f"\nForward pass only:")
-    print_msg(f"  Mean: {np.mean(forward_times)*1000:.2f} ms")
-    print_msg(f"  Std:  {np.std(forward_times)*1000:.2f} ms")
-
-    print_msg(f"\nBackward pass only (grad):")
-    print_msg(f"  Mean: {np.mean(grad_times)*1000:.2f} ms")
-    print_msg(f"  Std:  {np.std(grad_times)*1000:.2f} ms")
-
-    print_msg(f"\nValue and grad combined:")
-    print_msg(f"  Mean: {np.mean(value_and_grad_times)*1000:.2f} ms")
-    print_msg(f"  Std:  {np.std(value_and_grad_times)*1000:.2f} ms")
-
-    backward_only = np.mean(value_and_grad_times) - np.mean(forward_times)
-    print_msg(f"\nDerived metrics:")
-    print_msg(f"  Backward pass time (derived): {backward_only*1000:.2f} ms")
-    print_msg(f"  Backward/Forward ratio: {backward_only/np.mean(forward_times):.2f}x")
-    print_msg(f"  Grad-only/Forward ratio: {np.mean(grad_times)/np.mean(forward_times):.2f}x")
-
-    # Generate Chrome trace profile
-    trace_dir = os.path.join(output_dir, "jax_profile_trace")
-    print_msg(f"\nGenerating Chrome trace in: {trace_dir}")
-
-    with jax.profiler.trace(trace_dir):
-        for _ in range(3):
-            val, grad = value_and_grad_jit(theta)
-            val.block_until_ready()
-            grad.block_until_ready()
-
-    print_msg("View trace with: chrome://tracing (load the .json file)")
-
-    return {
-        'forward_mean_ms': np.mean(forward_times) * 1000,
-        'grad_mean_ms': np.mean(grad_times) * 1000,
-        'value_and_grad_mean_ms': np.mean(value_and_grad_times) * 1000,
-        'backward_forward_ratio': backward_only / np.mean(forward_times),
-    }
-
-
-def print_jax_ir(dalia, output_file=None):
-    """Print the JAX IR (jaxpr) for the forward and backward pass."""
-    from dalia.core.jax_autodiff import create_pure_jax_objective
-
-    theta = jnp.asarray(dalia.model.theta, dtype=jnp.float64)
-
-    objective_fn, grad_fn = create_pure_jax_objective(dalia)
-
-    def forward_only(theta):
-        obj, x = objective_fn(theta)
-        return obj
-
-    forward_jaxpr = jax.make_jaxpr(forward_only)(theta)
-
-    grad_jaxpr = jax.make_jaxpr(jax.grad(forward_only))(theta)
-
-    value_and_grad_fn = jax.value_and_grad(forward_only)
-    value_and_grad_jaxpr = jax.make_jaxpr(value_and_grad_fn)(theta)
-
-    output_lines = []
-    output_lines.append("=" * 70)
-    output_lines.append("JAX INTERMEDIATE REPRESENTATION (JAXPR)")
-    output_lines.append("=" * 70)
-
-    output_lines.append("\n" + "-" * 70)
-    output_lines.append("FORWARD PASS JAXPR")
-    output_lines.append("-" * 70)
-    output_lines.append(f"Number of equations: {len(forward_jaxpr.eqns)}")
-    output_lines.append(f"Input variables: {forward_jaxpr.in_avals}")
-    output_lines.append(f"Output variables: {forward_jaxpr.out_avals}")
-    output_lines.append("\nFull JAXPR:")
-    output_lines.append(str(forward_jaxpr))
-
-    output_lines.append("\n" + "-" * 70)
-    output_lines.append("BACKWARD PASS (GRAD) JAXPR")
-    output_lines.append("-" * 70)
-    output_lines.append(f"Number of equations: {len(grad_jaxpr.eqns)}")
-    output_lines.append(f"Input variables: {grad_jaxpr.in_avals}")
-    output_lines.append(f"Output variables: {grad_jaxpr.out_avals}")
-    output_lines.append("\nFull JAXPR:")
-    output_lines.append(str(grad_jaxpr))
-
-    output_lines.append("\n" + "-" * 70)
-    output_lines.append("VALUE_AND_GRAD JAXPR")
-    output_lines.append("-" * 70)
-    output_lines.append(f"Number of equations: {len(value_and_grad_jaxpr.eqns)}")
-    output_lines.append("\nFull JAXPR:")
-    output_lines.append(str(value_and_grad_jaxpr))
-
-    output_lines.append("\n" + "-" * 70)
-    output_lines.append("PRIMITIVE OPERATION COUNTS")
-    output_lines.append("-" * 70)
-
-    def count_primitives(jaxpr):
-        counts = {}
-        for eqn in jaxpr.eqns:
-            prim_name = eqn.primitive.name
-            counts[prim_name] = counts.get(prim_name, 0) + 1
-        return counts
-
-    forward_counts = count_primitives(forward_jaxpr)
-    grad_counts = count_primitives(grad_jaxpr)
-
-    output_lines.append("\nForward pass primitives:")
-    for prim, count in sorted(forward_counts.items(), key=lambda x: -x[1]):
-        output_lines.append(f"  {prim}: {count}")
-
-    output_lines.append("\nBackward pass primitives:")
-    for prim, count in sorted(grad_counts.items(), key=lambda x: -x[1]):
-        output_lines.append(f"  {prim}: {count}")
-
-    output_text = "\n".join(output_lines)
-
-    if output_file:
-        with open(output_file, 'w') as f:
-            f.write(output_text)
-        print_msg(f"JAX IR written to: {output_file}")
-    else:
-        print(output_text)
-
-    return forward_jaxpr, grad_jaxpr
-
-
 if __name__ == "__main__":
     print_msg("--- JAX vs Finite Differences Comparison ---")
     print_msg("--- Gaussian Spatio-Temporal Model (Medium) with Regression ---\n")
@@ -349,8 +141,9 @@ if __name__ == "__main__":
     ir_output_file = os.path.join(BASE_DIR, "jax_ir_output.txt")
     print_jax_ir(dalia_jax, output_file=ir_output_file)
 
-    # Profile JAX execution
-    profile_results = profile_jax_execution(dalia_jax, output_dir=BASE_DIR, num_runs=10)
+    # Profile JAX execution (optional)
+    if args.profile:
+        profile_results = profile_jax_execution(dalia_jax, output_dir=BASE_DIR, num_runs=10)
 
     t0 = time.perf_counter()
     f_jax, grad_jax = get_first_forward_and_gradient(dalia_jax)
@@ -424,6 +217,11 @@ if __name__ == "__main__":
     print_msg(f"  Finite Diff: {t_first_fd:.4f}s")
     print_msg(f"  JAX Autodiff: {t_first_jax:.4f}s")
     print_msg(f"  Speedup: {t_first_fd / t_first_jax:.2f}x")
+
+    print_msg(f"\nTotal wall-clock time (JIT + optimization):")
+    print_msg(f"  Finite Diff: {t_first_fd + t_total_fd:.2f}s")
+    print_msg(f"  JAX Autodiff: {t_first_jax + t_total_jax:.2f}s")
+    print_msg(f"  Speedup: {(t_first_fd + t_total_fd) / (t_first_jax + t_total_jax):.2f}x")
 
     print_msg(f"\nFinal objective values:")
     print_msg(f"  Finite Diff: {results_fd['f']:.6f}")

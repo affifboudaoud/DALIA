@@ -7,13 +7,13 @@ sys.path.append(parent_dir)
 
 import numpy as np
 
-from dalia import xp
 from dalia.configs import likelihood_config, dalia_config, submodels_config
 from dalia.core.model import Model
 from dalia.core.dalia import DALIA
 from dalia.submodels import RegressionSubModel, SpatioTemporalSubModel
-from dalia.utils import get_host, print_msg
+from dalia.utils import print_msg
 from examples_utils.parser_utils import parse_args
+from examples_utils.jax_utils import get_first_forward_and_gradient
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -86,36 +86,6 @@ def run_with_method(model, gradient_method, max_iter, verbose=True):
     )
 
     return dalia
-
-
-def compute_finite_diff_gradient(dalia, theta, eps=1e-3):
-    """Compute gradient using central finite differences."""
-    n = len(theta)
-    grad = np.zeros(n)
-    for i in range(n):
-        theta_plus = theta.copy()
-        theta_plus[i] += eps
-        f_plus = dalia._evaluate_f(theta_plus)
-
-        theta_minus = theta.copy()
-        theta_minus[i] -= eps
-        f_minus = dalia._evaluate_f(theta_minus)
-
-        grad[i] = (f_plus - f_minus) / (2 * eps)
-    return grad
-
-
-def get_first_forward_and_gradient(dalia):
-    """Get the first forward pass value and gradient."""
-    theta = dalia.model.theta.copy()
-
-    if dalia.config.gradient_method == "jax_autodiff":
-        f_val, grad, x = dalia.jax_grad_func(theta)
-        return float(f_val), np.array(grad)
-    else:
-        f_val = dalia._evaluate_f(theta)
-        grad = compute_finite_diff_gradient(dalia, theta, eps=dalia.eps_gradient_f)
-        return float(f_val), np.array(grad)
 
 
 if __name__ == "__main__":
@@ -235,6 +205,11 @@ if __name__ == "__main__":
     print_msg(f"  Finite Diff: {t_first_fd:.4f}s")
     print_msg(f"  JAX Autodiff: {t_first_jax:.4f}s")
     print_msg(f"  Speedup: {t_first_fd / t_first_jax:.2f}x")
+
+    print_msg(f"\nTotal wall-clock time (JIT + optimization):")
+    print_msg(f"  Finite Diff: {t_first_fd + t_total_fd:.2f}s")
+    print_msg(f"  JAX Autodiff: {t_first_jax + t_total_jax:.2f}s")
+    print_msg(f"  Speedup: {(t_first_fd + t_total_fd) / (t_first_jax + t_total_jax):.2f}x")
 
     print_msg(f"\nFinal objective values:")
     print_msg(f"  Finite Diff: {results_fd['f']:.6f}")

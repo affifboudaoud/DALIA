@@ -14,8 +14,14 @@ def parse_args():
         default=1,
         help="Minimum number of processes for the solver. If greater than 1 a distributed solver is used.",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable JAX execution profiling.",
+    )
     args = parser.parse_args()
     print("Parsed parameters:")
     print(f"  max_iter: {args.max_iter}")
     print(f"  solver_min_p: {args.solver_min_p}")
+    print(f"  profile: {args.profile}")
     return args
