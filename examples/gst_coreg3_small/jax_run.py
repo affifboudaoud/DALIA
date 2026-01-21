@@ -5,6 +5,13 @@ import time
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
+from examples_utils.parser_utils import parse_args
+
+args = parse_args()
+
+from dalia.core.jax_autodiff import configure_jax_precision
+configure_jax_precision(args.precision)
+
 import numpy as np
 import jax
 
@@ -24,7 +31,6 @@ from dalia.core.dalia import DALIA
 from dalia.models import CoregionalModel
 from dalia.submodels import RegressionSubModel, SpatioTemporalSubModel
 from dalia.utils import print_msg
-from examples_utils.parser_utils import parse_args
 from examples_utils.jax_utils import (
     get_first_forward_and_gradient,
     profile_jax_execution,
@@ -265,15 +271,12 @@ if __name__ == "__main__":
     print_msg("--- Coregional Model Optimization ---")
     print_msg("--- Gaussian Coregional (3 variates) Spatio-Temporal Model ---\n")
 
-    args = parse_args()
-
     model = create_model()
     print_msg(model)
 
     initial_theta = model.theta.copy()
     print_msg(f"\nInitial theta: {initial_theta}")
     print_msg(f"Number of hyperparameters: {len(initial_theta)}")
-    print_msg(f"Potential speedup from autodiff: ~{2 * len(initial_theta)}x per gradient")
 
     # --- Run with Finite Differences ---
     print_msg("\n" + "="*70)

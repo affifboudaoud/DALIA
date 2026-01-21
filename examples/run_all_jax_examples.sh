@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script to run all jax_run.py examples
-# Each example saves output to its own A100_run_output.txt
+# Each example saves output to its own GH200_run_output.txt
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -18,7 +18,10 @@ echo ""
 for dir in "$SCRIPT_DIR"/*/; do
     if [ -f "${dir}jax_run.py" ]; then
         example_name=$(basename "$dir")
-        output_file="${dir}A100_run_output.txt"
+
+        # Create outputs directory if it doesn't exist
+        mkdir -p "${dir}outputs"
+        output_file="${dir}outputs/GH200_run_output.txt"
 
         echo "Running: $example_name"
 
@@ -32,9 +35,9 @@ for dir in "$SCRIPT_DIR"/*/; do
             echo ""
         } > "$output_file"
 
-        # Run the script and capture both stdout and stderr
+        # Run the script with MPI and capture both stdout and stderr
         cd "$dir"
-        python jax_run.py 2>&1 | tee -a "$output_file"
+        srun python jax_run.py 2>&1 | tee -a "$output_file"
         exit_code=${PIPESTATUS[0]}
 
         # Append footer

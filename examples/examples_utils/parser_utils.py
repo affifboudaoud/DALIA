@@ -19,9 +19,17 @@ def parse_args():
         action="store_true",
         help="Enable JAX execution profiling.",
     )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["float32", "float64"],
+        default="float64",
+        help="JAX computation precision (float32 or float64).",
+    )
     args = parser.parse_args()
     print("Parsed parameters:")
     print(f"  max_iter: {args.max_iter}")
     print(f"  solver_min_p: {args.solver_min_p}")
     print(f"  profile: {args.profile}")
+    print(f"  precision: {args.precision}")
     return args

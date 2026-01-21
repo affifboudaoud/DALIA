@@ -5,6 +5,13 @@ import time
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
+from examples_utils.parser_utils import parse_args
+
+args = parse_args()
+
+from dalia.core.jax_autodiff import configure_jax_precision
+configure_jax_precision(args.precision)
+
 import numpy as np
 import jax
 
@@ -24,7 +31,6 @@ from dalia.core.dalia import DALIA
 from dalia.models import CoregionalModel
 from dalia.utils import print_msg
 from dalia.submodels import RegressionSubModel, SpatialSubModel
-from examples_utils.parser_utils import parse_args
 from examples_utils.jax_utils import (
     get_first_forward_and_gradient,
     profile_jax_execution,
@@ -175,8 +181,6 @@ def run_with_method(model, gradient_method, max_iter, verbose=True):
 if __name__ == "__main__":
     print_msg("--- JAX vs Finite Differences Comparison ---")
     print_msg("--- Gaussian Coregional (2 variates) Spatial Model with Regression ---\n")
-
-    args = parse_args()
 
     nv = 2
     ns = 1818

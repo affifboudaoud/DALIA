@@ -4,8 +4,42 @@ from typing import Callable, Tuple, Dict, Any
 import numpy as np
 
 import jax
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
+
+_JAX_DTYPE = None
+
+
+def configure_jax_precision(precision: str = "float64"):
+    """Configure JAX precision. Call before creating JAX objectives.
+
+    Parameters
+    ----------
+    precision : str
+        Either "float32" or "float64".
+
+    Returns
+    -------
+    dtype : jnp.dtype
+        The configured JAX dtype.
+    """
+    global _JAX_DTYPE
+    if precision == "float64":
+        jax.config.update("jax_enable_x64", True)
+        _JAX_DTYPE = jnp.float64
+    else:
+        jax.config.update("jax_enable_x64", False)
+        _JAX_DTYPE = jnp.float32
+    return _JAX_DTYPE
+
+
+def get_jax_dtype():
+    """Get the configured JAX dtype (defaults to float64 if not configured)."""
+    global _JAX_DTYPE
+    if _JAX_DTYPE is None:
+        configure_jax_precision("float64")
+    return _JAX_DTYPE
+
+
 from jax import lax
 from jax.experimental import sparse as jax_sparse
 from scipy import sparse as scipy_sparse
@@ -31,17 +65,19 @@ def _to_numpy(arr):
     return np.asarray(arr)
 
 
-def _scipy_sparse_to_jax_bcoo(sp_matrix):
+def _scipy_sparse_to_jax_bcoo(sp_matrix, dtype=None):
     """Convert scipy sparse matrix to JAX BCOO format."""
+    if dtype is None:
+        dtype = get_jax_dtype()
     if hasattr(sp_matrix, 'get'):
         sp_matrix = sp_matrix.get()
     coo = scipy_sparse.coo_matrix(sp_matrix)
     indices = jnp.array(np.column_stack([coo.row, coo.col]), dtype=jnp.int32)
-    data = jnp.array(coo.data, dtype=jnp.float64)
+    data = jnp.array(coo.data, dtype=dtype)
     return jax_sparse.BCOO((data, indices), shape=coo.shape)
 
 
-def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
+def create_pure_jax_objective(dalia_instance, dtype=None) -> Tuple[Callable, Callable]:
     """Create pure JAX objective function with automatic differentiation.
 
     Supports:
@@ -50,14 +86,24 @@ def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
     - Single-process (no MPI)
     - Models with zero hyperparameters (Poisson/Binomial only)
 
-    inputs:
-    dalia_instance : DALIA instance.
+    Parameters
+    ----------
+    dalia_instance : DALIA
+        DALIA instance.
+    dtype : jnp.dtype, optional
+        JAX dtype to use. If None, uses the configured dtype from get_jax_dtype().
 
-    Returns:
-    objective_func : Pure JAX objective function.
-    objective_with_grad : Function returning both forward value and gradient.
+    Returns
+    -------
+    objective_func : Callable
+        Pure JAX objective function.
+    objective_with_grad : Callable
+        Function returning both forward value and gradient.
     """
-    static_data = _extract_static_data(dalia_instance)
+    if dtype is None:
+        dtype = get_jax_dtype()
+    np_dtype = np.float64 if dtype == jnp.float64 else np.float32
+    static_data = _extract_static_data(dalia_instance, dtype=dtype)
     likelihood_type = static_data['likelihood_type']
     use_sparse = static_data.get('use_sparse_solver', False)
     n_hyperparameters = dalia_instance.model.n_hyperparameters
@@ -88,13 +134,13 @@ def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
         objective_pure_jax_no_hp = jax.jit(objective_pure_jax_no_hp)
 
         # Warmup with empty array
-        theta_init = jnp.array([], dtype=jnp.float64)
+        theta_init = jnp.array([], dtype=dtype)
         _ = objective_pure_jax_no_hp(theta_init)
 
         def objective_with_grad_no_hp(theta):
-            theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+            theta_jax = jnp.asarray(theta, dtype=dtype)
             f_val = objective_pure_jax_no_hp(theta_jax)
-            return float(f_val), np.array([], dtype=np.float64)
+            return float(f_val), np.array([], dtype=np_dtype)
 
         return objective_pure_jax_no_hp, objective_with_grad_no_hp
 
@@ -140,27 +186,35 @@ def create_pure_jax_objective(dalia_instance) -> Tuple[Callable, Callable]:
     value_and_grad_fn = jax.jit(value_and_grad_fn)
 
     # Warmup JIT compilation
-    theta_init = jnp.ones(n_hyperparameters, dtype=jnp.float64)
+    theta_init = jnp.ones(n_hyperparameters, dtype=dtype)
     _ = value_and_grad_fn(theta_init)
 
     def objective_with_grad(theta):
         """Returns (f_val, grad, x) where x is the latent parameters."""
-        theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+        theta_jax = jnp.asarray(theta, dtype=dtype)
         (f_val, x_val), grad_val = value_and_grad_fn(theta_jax)
-        return float(f_val), np.asarray(grad_val, dtype=np.float64), np.asarray(x_val, dtype=np.float64)
+        return float(f_val), np.asarray(grad_val, dtype=np_dtype), np.asarray(x_val, dtype=np_dtype)
 
     return objective_pure_jax, objective_with_grad
 
 
-def _extract_static_data(dalia_instance) -> Dict[str, Any]:
+def _extract_static_data(dalia_instance, dtype=None) -> Dict[str, Any]:
     """Extract static data from DALIA instance for pure JAX function.
 
-    Inputs:
-    dalia_instance : DALIA instance.
+    Parameters
+    ----------
+    dalia_instance : DALIA
+        DALIA instance.
+    dtype : jnp.dtype, optional
+        JAX dtype to use. If None, uses the configured dtype from get_jax_dtype().
 
-    Returns:
-    static_data : Dictionary containing model-specific data for all likelihood types.
+    Returns
+    -------
+    static_data : dict
+        Dictionary containing model-specific data for all likelihood types.
     """
+    if dtype is None:
+        dtype = get_jax_dtype()
     model = dalia_instance.model
     likelihood_type = model.likelihood_config.type
 
@@ -242,7 +296,7 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
         )
 
         # Store sparse A for A^T @ y operations
-        a_sparse = _scipy_sparse_to_jax_bcoo(a_scipy)
+        a_sparse = _scipy_sparse_to_jax_bcoo(a_scipy, dtype=dtype)
 
         static_data = {
             'likelihood_type': likelihood_type,
@@ -252,7 +306,7 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
             'ata_lower_blocks': ata_lower,
             'ata_arrow_blocks': ata_arrow,
             'ata_tip_block': ata_tip,
-            'y': jnp.array(_to_numpy(model.y), dtype=jnp.float64),
+            'y': jnp.array(_to_numpy(model.y), dtype=dtype),
             'n_fixed_effects': n_fixed_effects,
             'fixed_effects_precision': float(fixed_effects_precision),
             'prior_configs': prior_configs,
@@ -265,15 +319,15 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
             'ns': ns,
             'manifold': str(st_submodel.manifold),
             'spatial_matrices': {
-                'c0': jnp.array(_to_numpy(st_submodel.c0.toarray()), dtype=jnp.float64),
-                'g1': jnp.array(_to_numpy(st_submodel.g1.toarray()), dtype=jnp.float64),
-                'g2': jnp.array(_to_numpy(st_submodel.g2.toarray()), dtype=jnp.float64),
-                'g3': jnp.array(_to_numpy(st_submodel.g3.toarray()), dtype=jnp.float64),
+                'c0': jnp.array(_to_numpy(st_submodel.c0.toarray()), dtype=dtype),
+                'g1': jnp.array(_to_numpy(st_submodel.g1.toarray()), dtype=dtype),
+                'g2': jnp.array(_to_numpy(st_submodel.g2.toarray()), dtype=dtype),
+                'g3': jnp.array(_to_numpy(st_submodel.g3.toarray()), dtype=dtype),
             },
             'temporal_matrices': {
-                'm0': jnp.array(_to_numpy(st_submodel.m0.toarray()), dtype=jnp.float64),
-                'm1': jnp.array(_to_numpy(st_submodel.m1.toarray()), dtype=jnp.float64),
-                'm2': jnp.array(_to_numpy(st_submodel.m2.toarray()), dtype=jnp.float64),
+                'm0': jnp.array(_to_numpy(st_submodel.m0.toarray()), dtype=dtype),
+                'm1': jnp.array(_to_numpy(st_submodel.m1.toarray()), dtype=dtype),
+                'm2': jnp.array(_to_numpy(st_submodel.m2.toarray()), dtype=dtype),
             },
         }
     else:
@@ -283,8 +337,8 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
             'likelihood_type': likelihood_type,
             'has_spatio_temporal': has_spatio_temporal,
             'has_spatial': has_spatial,
-            'a': jnp.array(a_matrix, dtype=jnp.float64),
-            'y': jnp.array(_to_numpy(model.y), dtype=jnp.float64),
+            'a': jnp.array(a_matrix, dtype=dtype),
+            'y': jnp.array(_to_numpy(model.y), dtype=dtype),
             'n_fixed_effects': int(model.n_fixed_effects),
             'fixed_effects_precision': float(fixed_effects_precision),
             'prior_configs': prior_configs,
@@ -303,9 +357,9 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
             )
             static_data['ns'] = int(spatial_submodel.ns)
             static_data['spatial_matrices'] = {
-                'c0': jnp.array(_to_numpy(spatial_submodel.c0.toarray()), dtype=jnp.float64),
-                'g1': jnp.array(_to_numpy(spatial_submodel.g1.toarray()), dtype=jnp.float64),
-                'g2': jnp.array(_to_numpy(spatial_submodel.g2.toarray()), dtype=jnp.float64),
+                'c0': jnp.array(_to_numpy(spatial_submodel.c0.toarray()), dtype=dtype),
+                'g1': jnp.array(_to_numpy(spatial_submodel.g1.toarray()), dtype=dtype),
+                'g2': jnp.array(_to_numpy(spatial_submodel.g2.toarray()), dtype=dtype),
             }
             # Track submodel ordering - find offsets in latent vector
             fe_offset = 0
@@ -331,15 +385,15 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
             static_data['ns'] = int(st_submodel.ns)
             static_data['manifold'] = str(st_submodel.manifold)
             static_data['spatial_matrices'] = {
-                'c0': jnp.array(_to_numpy(st_submodel.c0.toarray()), dtype=jnp.float64),
-                'g1': jnp.array(_to_numpy(st_submodel.g1.toarray()), dtype=jnp.float64),
-                'g2': jnp.array(_to_numpy(st_submodel.g2.toarray()), dtype=jnp.float64),
-                'g3': jnp.array(_to_numpy(st_submodel.g3.toarray()), dtype=jnp.float64),
+                'c0': jnp.array(_to_numpy(st_submodel.c0.toarray()), dtype=dtype),
+                'g1': jnp.array(_to_numpy(st_submodel.g1.toarray()), dtype=dtype),
+                'g2': jnp.array(_to_numpy(st_submodel.g2.toarray()), dtype=dtype),
+                'g3': jnp.array(_to_numpy(st_submodel.g3.toarray()), dtype=dtype),
             }
             static_data['temporal_matrices'] = {
-                'm0': jnp.array(_to_numpy(st_submodel.m0.toarray()), dtype=jnp.float64),
-                'm1': jnp.array(_to_numpy(st_submodel.m1.toarray()), dtype=jnp.float64),
-                'm2': jnp.array(_to_numpy(st_submodel.m2.toarray()), dtype=jnp.float64),
+                'm0': jnp.array(_to_numpy(st_submodel.m0.toarray()), dtype=dtype),
+                'm1': jnp.array(_to_numpy(st_submodel.m1.toarray()), dtype=dtype),
+                'm2': jnp.array(_to_numpy(st_submodel.m2.toarray()), dtype=dtype),
             }
             # Track submodel ordering - find offsets in latent vector
             fe_offset = 0
@@ -357,34 +411,42 @@ def _extract_static_data(dalia_instance) -> Dict[str, Any]:
 
     # Add x_initial for inner iteration initialization (critical for Poisson/Binomial)
     x_initial = _to_numpy(model.x)
-    static_data['x_initial'] = jnp.array(x_initial, dtype=jnp.float64)
+    static_data['x_initial'] = jnp.array(x_initial, dtype=dtype)
 
     if likelihood_type == 'poisson':
         if hasattr(model.likelihood, 'e'):
             e = _to_numpy(model.likelihood.e)
         else:
             e = np.ones(model.n_observations)
-        static_data['e'] = jnp.array(e, dtype=jnp.float64)
+        static_data['e'] = jnp.array(e, dtype=dtype)
 
     elif likelihood_type == 'binomial':
         if hasattr(model.likelihood, 'n_trials'):
             n_trials = _to_numpy(model.likelihood.n_trials)
         else:
             n_trials = np.ones(model.n_observations)
-        static_data['n_trials'] = jnp.array(n_trials, dtype=jnp.float64)
+        static_data['n_trials'] = jnp.array(n_trials, dtype=dtype)
 
     return static_data
 
 
-def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
+def _extract_static_data_coregional(dalia_instance, dtype=None) -> Dict[str, Any]:
     """Extract static data from DALIA instance for CoregionalModel.
 
-    Inputs:
-    dalia_instance : DALIA instance with CoregionalModel.
+    Parameters
+    ----------
+    dalia_instance : DALIA
+        DALIA instance with CoregionalModel.
+    dtype : jnp.dtype, optional
+        JAX dtype to use. If None, uses the configured dtype from get_jax_dtype().
 
-    Returns:
-    static_data : Dictionary containing model-specific data for coregional models.
+    Returns
+    -------
+    static_data : dict
+        Dictionary containing model-specific data for coregional models.
     """
+    if dtype is None:
+        dtype = get_jax_dtype()
     model = dalia_instance.model
     n_models = model.n_models
     ns = model.n_spatial_nodes
@@ -439,9 +501,9 @@ def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
         if is_spatial_only:
             model_data = {
                 'spatial_matrices': {
-                    'c0': jnp.array(_to_numpy(submodel.c0.toarray()), dtype=jnp.float64),
-                    'g1': jnp.array(_to_numpy(submodel.g1.toarray()), dtype=jnp.float64),
-                    'g2': jnp.array(_to_numpy(submodel.g2.toarray()), dtype=jnp.float64),
+                    'c0': jnp.array(_to_numpy(submodel.c0.toarray()), dtype=dtype),
+                    'g1': jnp.array(_to_numpy(submodel.g1.toarray()), dtype=dtype),
+                    'g2': jnp.array(_to_numpy(submodel.g2.toarray()), dtype=dtype),
                 },
                 'likelihood_type': m.likelihood_config.type,
                 'n_observations': int(m.n_observations) if hasattr(m, 'n_observations') else 0,
@@ -450,15 +512,15 @@ def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
             model_data = {
                 'manifold': str(submodel.manifold),
                 'spatial_matrices': {
-                    'c0': jnp.array(_to_numpy(submodel.c0.toarray()), dtype=jnp.float64),
-                    'g1': jnp.array(_to_numpy(submodel.g1.toarray()), dtype=jnp.float64),
-                    'g2': jnp.array(_to_numpy(submodel.g2.toarray()), dtype=jnp.float64),
-                    'g3': jnp.array(_to_numpy(submodel.g3.toarray()), dtype=jnp.float64),
+                    'c0': jnp.array(_to_numpy(submodel.c0.toarray()), dtype=dtype),
+                    'g1': jnp.array(_to_numpy(submodel.g1.toarray()), dtype=dtype),
+                    'g2': jnp.array(_to_numpy(submodel.g2.toarray()), dtype=dtype),
+                    'g3': jnp.array(_to_numpy(submodel.g3.toarray()), dtype=dtype),
                 },
                 'temporal_matrices': {
-                    'm0': jnp.array(_to_numpy(submodel.m0.toarray()), dtype=jnp.float64),
-                    'm1': jnp.array(_to_numpy(submodel.m1.toarray()), dtype=jnp.float64),
-                    'm2': jnp.array(_to_numpy(submodel.m2.toarray()), dtype=jnp.float64),
+                    'm0': jnp.array(_to_numpy(submodel.m0.toarray()), dtype=dtype),
+                    'm1': jnp.array(_to_numpy(submodel.m1.toarray()), dtype=dtype),
+                    'm2': jnp.array(_to_numpy(submodel.m2.toarray()), dtype=dtype),
                 },
                 'likelihood_type': m.likelihood_config.type,
                 'n_observations': int(m.n_observations) if hasattr(m, 'n_observations') else 0,
@@ -513,7 +575,7 @@ def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
         ata_arrow_per_model = jnp.stack(per_model_ata_arrow, axis=0)
         ata_tip_per_model = jnp.stack(per_model_ata_tip, axis=0)
 
-        a_sparse = _scipy_sparse_to_jax_bcoo(a_scipy)
+        a_sparse = _scipy_sparse_to_jax_bcoo(a_scipy, dtype=dtype)
 
         static_data = {
             'is_coregional': True,
@@ -524,7 +586,7 @@ def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
             'ata_lower_per_model': ata_lower_per_model,
             'ata_arrow_per_model': ata_arrow_per_model,
             'ata_tip_per_model': ata_tip_per_model,
-            'y': jnp.array(_to_numpy(model.y), dtype=jnp.float64),
+            'y': jnp.array(_to_numpy(model.y), dtype=dtype),
             'n_fixed_effects_per_model': n_fixed_effects_per_model,
             'n_fixed_effects_total': n_fixed_effects_total,
             'fixed_effects_precision': float(fixed_effects_precision),
@@ -550,7 +612,7 @@ def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
             )
 
         # For spatial coregional models, convert A to dense matrix
-        a_dense = jnp.array(a_scipy.toarray(), dtype=jnp.float64)
+        a_dense = jnp.array(a_scipy.toarray(), dtype=dtype)
         n_observations_idx = [int(x) for x in model.n_observations_idx]
 
         static_data = {
@@ -559,7 +621,7 @@ def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
             'n_models': n_models,
             'models_data': models_data,
             'a': a_dense,
-            'y': jnp.array(_to_numpy(model.y), dtype=jnp.float64),
+            'y': jnp.array(_to_numpy(model.y), dtype=dtype),
             'n_fixed_effects_per_model': n_fixed_effects_per_model,
             'n_fixed_effects_total': n_fixed_effects_total,
             'fixed_effects_precision': float(fixed_effects_precision),
@@ -578,7 +640,7 @@ def _extract_static_data_coregional(dalia_instance) -> Dict[str, Any]:
 
     # Add x_initial for inner iteration initialization
     x_initial = _to_numpy(model.x)
-    static_data['x_initial'] = jnp.array(x_initial, dtype=jnp.float64)
+    static_data['x_initial'] = jnp.array(x_initial, dtype=dtype)
 
     return static_data
 
@@ -654,7 +716,7 @@ def bta_to_dense_jax(diag_blocks, lower_blocks, arrow_blocks, tip_block):
     n_fe = tip_block.shape[0] if tip_block.ndim > 0 else 0
 
     n_total = nt * ns + n_fe
-    dense = jnp.zeros((n_total, n_total), dtype=jnp.float64)
+    dense = jnp.zeros((n_total, n_total), dtype=diag_blocks.dtype)
 
     # Place diagonal blocks
     for t in range(nt):
@@ -853,7 +915,7 @@ def _inner_iteration_jax(a, y, Q_prior, grad_likelihood_fn, hess_diag_fn, tol, m
 
     # Initialize state
     if x_initial is None:
-        x_star = jnp.zeros(n_latent, dtype=jnp.float64)
+        x_star = jnp.zeros(n_latent, dtype=Q_prior.dtype)
     else:
         x_star = x_initial
     Q_conditional = Q_prior.copy()
@@ -892,12 +954,13 @@ def _objective_gaussian_dense(theta, static_data):
     prior_configs = static_data['prior_configs']
 
     theta_likelihood = theta[-1]
+    dtype = a.dtype
 
-    Q_prior = jnp.eye(n_fixed_effects) * fixed_effects_precision
-
+    Q_prior = jnp.eye(n_fixed_effects, dtype=dtype) * fixed_effects_precision
+    
     eta = jnp.zeros_like(y)
-
-    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y))
+    
+    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y), dtype=dtype)
     Q_conditional = Q_prior - a.T @ jnp.diag(D_diag) @ a
 
     gradient_likelihood = jnp.exp(theta_likelihood) * y
@@ -1020,7 +1083,7 @@ def _objective_gaussian_spatial_dense(theta, static_data):
     Q_spatial = _build_spatial_Q_prior_jax(theta_spatial, spatial_matrices, ns)
 
     # Build full Q_prior (block diagonal: spatial + fixed effects)
-    Q_prior = jnp.zeros((n_latent, n_latent), dtype=jnp.float64)
+    Q_prior = jnp.zeros((n_latent, n_latent), dtype=y.dtype)
 
     # Place spatial block
     Q_prior = Q_prior.at[spatial_offset:spatial_offset+ns, spatial_offset:spatial_offset+ns].set(Q_spatial)
@@ -1109,7 +1172,7 @@ def _objective_gaussian_st_dense(theta, static_data):
     Q_st = bta_to_dense_jax(Q_st_bta['diag'], Q_st_bta['lower'], Q_st_bta['arrow'], Q_st_bta['tip'])
 
     # Build full Q_prior (block diagonal: spatio-temporal + fixed effects)
-    Q_prior = jnp.zeros((n_latent, n_latent), dtype=jnp.float64)
+    Q_prior = jnp.zeros((n_latent, n_latent), dtype=y.dtype)
 
     # Place ST block
     Q_prior = Q_prior.at[st_offset:st_offset+nt*ns, st_offset:st_offset+nt*ns].set(Q_st)
@@ -1763,7 +1826,7 @@ def _objective_gaussian_coregional_spatial_dense(theta, static_data):
     )
 
     # Build full Q_prior (coregional spatial + fixed effects)
-    Q_prior = jnp.zeros((n_latent, n_latent), dtype=jnp.float64)
+    Q_prior = jnp.zeros((n_latent, n_latent), dtype=y.dtype)
     n_spatial = n_models * ns
     Q_prior = Q_prior.at[:n_spatial, :n_spatial].set(Q_prior_spatial)
 
@@ -1835,17 +1898,27 @@ def _objective_gaussian_coregional_spatial_dense(theta, static_data):
     return objective, x
 
 
-def create_pure_jax_objective_coregional(dalia_instance) -> Tuple[Callable, Callable]:
+def create_pure_jax_objective_coregional(dalia_instance, dtype=None) -> Tuple[Callable, Callable]:
     """Create pure JAX objective function for CoregionalModel with automatic differentiation.
 
-    inputs:
-    dalia_instance : DALIA instance with CoregionalModel.
+    Parameters
+    ----------
+    dalia_instance : DALIA
+        DALIA instance with CoregionalModel.
+    dtype : jnp.dtype, optional
+        JAX dtype to use. If None, uses the configured dtype from get_jax_dtype().
 
-    Returns:
-    objective_func : Pure JAX objective function.
-    objective_with_grad : Function returning both forward value and gradient.
+    Returns
+    -------
+    objective_func : Callable
+        Pure JAX objective function.
+    objective_with_grad : Callable
+        Function returning both forward value and gradient.
     """
-    static_data = _extract_static_data_coregional(dalia_instance)
+    if dtype is None:
+        dtype = get_jax_dtype()
+    np_dtype = np.float64 if dtype == jnp.float64 else np.float32
+    static_data = _extract_static_data_coregional(dalia_instance, dtype=dtype)
     n_hyperparameters = dalia_instance.model.n_hyperparameters
 
     # Verify all likelihoods are Gaussian
@@ -1875,12 +1948,12 @@ def create_pure_jax_objective_coregional(dalia_instance) -> Tuple[Callable, Call
     value_and_grad_fn = jax.jit(value_and_grad_fn)
 
     # Warmup JIT compilation
-    theta_init = jnp.ones(n_hyperparameters, dtype=jnp.float64)
+    theta_init = jnp.ones(n_hyperparameters, dtype=dtype)
     _ = value_and_grad_fn(theta_init)
 
     def objective_with_grad(theta):
-        theta_jax = jnp.asarray(theta, dtype=jnp.float64)
+        theta_jax = jnp.asarray(theta, dtype=dtype)
         (f_val, x_val), grad_val = value_and_grad_fn(theta_jax)
-        return float(f_val), np.asarray(grad_val, dtype=np.float64), np.asarray(x_val, dtype=np.float64)
+        return float(f_val), np.asarray(grad_val, dtype=np_dtype), np.asarray(x_val, dtype=np_dtype)
 
     return objective_pure_jax, objective_with_grad

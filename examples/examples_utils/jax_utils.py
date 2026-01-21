@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 
 from dalia.utils import print_msg
+from dalia.core.jax_autodiff import get_jax_dtype
 
 
 def compute_finite_diff_gradient(dalia, theta, eps=1e-3):
@@ -68,7 +69,7 @@ def profile_jax_execution(dalia, output_dir=None, num_runs=5):
         output_dir = os.path.dirname(os.path.abspath(__file__))
 
     n_hyperparameters = dalia.model.n_hyperparameters
-    theta = jnp.asarray(dalia.model.theta, dtype=jnp.float64)
+    theta = jnp.asarray(dalia.model.theta, dtype=get_jax_dtype())
 
     objective_fn, _ = _get_jax_objective_fn(dalia)
 
@@ -190,7 +191,7 @@ def print_jax_ir(dalia, output_file=None):
     Handles regular models, CoregionalModel, and zero-hyperparameter models.
     """
     n_hyperparameters = dalia.model.n_hyperparameters
-    theta = jnp.asarray(dalia.model.theta, dtype=jnp.float64)
+    theta = jnp.asarray(dalia.model.theta, dtype=get_jax_dtype())
 
     objective_fn, _ = _get_jax_objective_fn(dalia)
 
