@@ -26,9 +26,10 @@ def kronecker_to_bta_structure(
     arrow_tip_block :   Shape (n_fixed_effects, n_fixed_effects) if n_fixed_effects > 0, else zeros
     """
     total_st_size = nt * ns
+    dtype = kron_result.dtype
 
-    diagonal_blocks = jnp.zeros((nt, ns, ns))
-    lower_diagonal_blocks = jnp.zeros((nt - 1, ns, ns))
+    diagonal_blocks = jnp.zeros((nt, ns, ns), dtype=dtype)
+    lower_diagonal_blocks = jnp.zeros((nt - 1, ns, ns), dtype=dtype)
 
     for i in range(nt):
         start_i = i * ns
@@ -45,7 +46,7 @@ def kronecker_to_bta_structure(
             )
 
     if n_fixed_effects > 0:
-        lower_arrow_blocks = jnp.zeros((nt, n_fixed_effects, ns))
+        lower_arrow_blocks = jnp.zeros((nt, n_fixed_effects, ns), dtype=dtype)
         for i in range(nt):
             start_i = i * ns
             end_i = (i + 1) * ns
@@ -55,8 +56,8 @@ def kronecker_to_bta_structure(
 
         arrow_tip_block = kron_result[total_st_size:, total_st_size:]
     else:
-        lower_arrow_blocks = jnp.zeros((nt, 1, ns))
-        arrow_tip_block = jnp.zeros((1, 1))
+        lower_arrow_blocks = jnp.zeros((nt, 1, ns), dtype=dtype)
+        arrow_tip_block = jnp.zeros((1, 1), dtype=dtype)
 
     return diagonal_blocks, lower_diagonal_blocks, lower_arrow_blocks, arrow_tip_block
 
@@ -75,8 +76,7 @@ def _interpretable_to_compute_jax(r_s, r_t, sigma_st, manifold="plane"):
     Returns:
     gamma_s, gamma_t, gamma_st : Computational parameters
     """
-    import math
-    from scipy import special as sp_special
+    import jax.scipy.special as jax_special
 
     alpha_s = 2
     alpha_t = 1
@@ -91,21 +91,23 @@ def _interpretable_to_compute_jax(r_s, r_t, sigma_st, manifold="plane"):
     gamma_t = r_t - 0.5 * jnp.log(8 * nu_t) + alpha_s * gamma_s
 
     if manifold == "sphere":
-        cR_t = sp_special.gamma(nu_t) / (sp_special.gamma(alpha_t) * pow(4 * math.pi, 0.5))
+        # Use JAX's gammaln for precision consistency: gamma(x) = exp(gammaln(x))
+        log_cR_t = jax_special.gammaln(nu_t) - jax_special.gammaln(alpha_t) - 0.5 * jnp.log(4.0 * jnp.pi)
         # Vectorized sum: k = 0, 1, ..., 49
         k_vals = jnp.arange(50)
         exp_gamma_s_sq = jnp.exp(gamma_s) ** 2
         c_s = jnp.sum(
-            (2.0 * k_vals + 1.0) / (4.0 * math.pi * jnp.power(exp_gamma_s_sq + k_vals * (k_vals + 1), alpha))
+            (2.0 * k_vals + 1.0) / (4.0 * jnp.pi * jnp.power(exp_gamma_s_sq + k_vals * (k_vals + 1), alpha))
         )
-        gamma_st = 0.5 * jnp.log(cR_t) + 0.5 * jnp.log(c_s) - 0.5 * gamma_t - sigma_st
+        gamma_st = 0.5 * log_cR_t + 0.5 * jnp.log(c_s) - 0.5 * gamma_t - sigma_st
     elif manifold == "plane":
-        c1_scaling_constant = pow(4 * math.pi, 1.5)
-        c1 = (
-            sp_special.gamma(nu_t) * sp_special.gamma(nu_s)
-            / (sp_special.gamma(alpha_t) * sp_special.gamma(alpha) * c1_scaling_constant)
+        # Use JAX's gammaln: log(c1) = gammaln(nu_t) + gammaln(nu_s) - gammaln(alpha_t) - gammaln(alpha) - 1.5*log(4*pi)
+        log_c1 = (
+            jax_special.gammaln(nu_t) + jax_special.gammaln(nu_s)
+            - jax_special.gammaln(alpha_t) - jax_special.gammaln(alpha)
+            - 1.5 * jnp.log(4.0 * jnp.pi)
         )
-        gamma_st = 0.5 * jnp.log(c1) - 0.5 * gamma_t - nu_s * gamma_s - sigma_st
+        gamma_st = 0.5 * log_c1 - 0.5 * gamma_t - nu_s * gamma_s - sigma_st
     else:
         raise ValueError(f"Manifold not supported: {manifold}")
 
@@ -250,6 +252,7 @@ def extract_bta_blocks_from_sparse(
     nt: int,
     ns: int,
     n_fixed_effects: int,
+    dtype=None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Extract BTA blocks from a scipy sparse matrix.
 
@@ -258,6 +261,7 @@ def extract_bta_blocks_from_sparse(
     nt : Number of temporal blocks
     ns : Size of each spatial block
     n_fixed_effects : Size of arrow tip
+    dtype : JAX dtype for output arrays (default: infer from sparse_matrix)
 
     Returns:
     diag_blocks : (nt, ns, ns)
@@ -266,21 +270,25 @@ def extract_bta_blocks_from_sparse(
     arrow_tip : (n_fixed_effects, n_fixed_effects)
     """
     from scipy import sparse as sp_sparse
+    from dalia.core.jax_autodiff import get_jax_dtype
     csc = sp_sparse.csc_matrix(sparse_matrix)
+
+    if dtype is None:
+        dtype = get_jax_dtype()
 
     total_st = nt * ns
 
-    diag_blocks = jnp.zeros((nt, ns, ns))
-    lower_diag_blocks = jnp.zeros((nt - 1, ns, ns))
-    arrow_bottom_blocks = jnp.zeros((nt, n_fixed_effects, ns))
-    arrow_tip = jnp.zeros((n_fixed_effects, n_fixed_effects))
+    diag_blocks = jnp.zeros((nt, ns, ns), dtype=dtype)
+    lower_diag_blocks = jnp.zeros((nt - 1, ns, ns), dtype=dtype)
+    arrow_bottom_blocks = jnp.zeros((nt, n_fixed_effects, ns), dtype=dtype)
+    arrow_tip = jnp.zeros((n_fixed_effects, n_fixed_effects), dtype=dtype)
 
     # Extract diagonal blocks
     for i in range(nt):
         start = i * ns
         end = (i + 1) * ns
         block = csc[start:end, start:end].toarray()
-        diag_blocks = diag_blocks.at[i].set(jnp.array(block))
+        diag_blocks = diag_blocks.at[i].set(jnp.array(block, dtype=dtype))
 
     # Extract lower diagonal blocks
     for i in range(nt - 1):
@@ -289,7 +297,7 @@ def extract_bta_blocks_from_sparse(
         col_start = i * ns
         col_end = (i + 1) * ns
         block = csc[row_start:row_end, col_start:col_end].toarray()
-        lower_diag_blocks = lower_diag_blocks.at[i].set(jnp.array(block))
+        lower_diag_blocks = lower_diag_blocks.at[i].set(jnp.array(block, dtype=dtype))
 
     # Extract arrow bottom blocks
     if n_fixed_effects > 0:
@@ -297,10 +305,10 @@ def extract_bta_blocks_from_sparse(
             col_start = i * ns
             col_end = (i + 1) * ns
             block = csc[total_st:, col_start:col_end].toarray()
-            arrow_bottom_blocks = arrow_bottom_blocks.at[i].set(jnp.array(block))
+            arrow_bottom_blocks = arrow_bottom_blocks.at[i].set(jnp.array(block, dtype=dtype))
 
         # Extract arrow tip
-        arrow_tip = jnp.array(csc[total_st:, total_st:].toarray())
+        arrow_tip = jnp.array(csc[total_st:, total_st:].toarray(), dtype=dtype)
 
     return diag_blocks, lower_diag_blocks, arrow_bottom_blocks, arrow_tip
 
@@ -326,12 +334,13 @@ def build_Q_conditional_jax(
     """
     total_st_size = nt * ns
     total_size = total_st_size + n_fixed_effects
+    dtype = Q_st.dtype
 
-    Q_conditional = jnp.zeros((total_size, total_size))
+    Q_conditional = jnp.zeros((total_size, total_size), dtype=dtype)
 
     Q_conditional = Q_conditional.at[:total_st_size, :total_st_size].set(Q_st)
 
-    Q_fe = jnp.eye(n_fixed_effects) * fixed_effects_precision
+    Q_fe = jnp.eye(n_fixed_effects, dtype=dtype) * fixed_effects_precision
     Q_conditional = Q_conditional.at[total_st_size:, total_st_size:].set(Q_fe)
 
     return Q_conditional
@@ -345,6 +354,10 @@ def compute_logdet_from_cholesky_bta_jax(
 
     log(det(Q)) = 2 * sum(log(diag(L)))
 
+    Uses safe log computation to prevent NaN when Cholesky diagonal elements
+    become non-positive due to FP32 precision loss. Non-positive values are
+    clamped to a small epsilon, which effectively returns a large penalty.
+
     inputs:
         diagonal_blocks : Diagonal blocks of Cholesky factor, shape (n_blocks, block_size, block_size)
         arrow_tip_block : Arrow tip block of Cholesky factor, shape (arrow_size, arrow_size)
@@ -355,11 +368,17 @@ def compute_logdet_from_cholesky_bta_jax(
     # diagonal_blocks has shape (n_blocks, block_size, block_size)
     # We want the diagonal of each block
     diag_vals = jnp.diagonal(diagonal_blocks, axis1=1, axis2=2)  # (n_blocks, block_size)
-    logdet = 2.0 * jnp.sum(jnp.log(diag_vals))
+
+    # Safe log: clamp to small positive value to prevent NaN from non-positive values
+    # This can happen in FP32 when Cholesky factorization loses precision
+    eps = jnp.finfo(diag_vals.dtype).eps
+    safe_diag_vals = jnp.maximum(diag_vals, eps)
+    logdet = 2.0 * jnp.sum(jnp.log(safe_diag_vals))
 
     # Add arrow tip contribution if present
     arrow_diag = jnp.diag(arrow_tip_block)
-    logdet = logdet + 2.0 * jnp.sum(jnp.log(arrow_diag))
+    safe_arrow_diag = jnp.maximum(arrow_diag, eps)
+    logdet = logdet + 2.0 * jnp.sum(jnp.log(safe_arrow_diag))
 
     return logdet
 
@@ -489,9 +508,10 @@ def build_coregional_Q_bta_jax(
         lambda_02 = theta[lambda_02_idx]
         lambda_12 = theta[lambda_12_idx]
 
-    # Build coregional super-blocks
-    diag_blocks = jnp.zeros((nt, block_size, block_size))
-    lower_diag_blocks = jnp.zeros((nt - 1, block_size, block_size))
+    # Build coregional super-blocks - infer dtype from input theta
+    dtype = theta.dtype
+    diag_blocks = jnp.zeros((nt, block_size, block_size), dtype=dtype)
+    lower_diag_blocks = jnp.zeros((nt - 1, block_size, block_size), dtype=dtype)
 
     if n_models == 2:
         sigma_0, sigma_1 = sigmas[0], sigmas[1]
@@ -507,7 +527,7 @@ def build_coregional_Q_bta_jax(
         coef_22 = 1.0 / (sigma_1 ** 2)
 
         for t in range(nt):
-            block = jnp.zeros((block_size, block_size))
+            block = jnp.zeros((block_size, block_size), dtype=dtype)
 
             q11 = coef_11_0 * Qu_diag_list[0][t] + coef_11_1 * Qu_diag_list[1][t]
             q12 = coef_12 * Qu_diag_list[1][t]
@@ -522,7 +542,7 @@ def build_coregional_Q_bta_jax(
             diag_blocks = diag_blocks.at[t].set(block)
 
         for t in range(nt - 1):
-            block = jnp.zeros((block_size, block_size))
+            block = jnp.zeros((block_size, block_size), dtype=dtype)
 
             q11 = coef_11_0 * Qu_lower_list[0][t] + coef_11_1 * Qu_lower_list[1][t]
             q12 = coef_12 * Qu_lower_list[1][t]
@@ -562,7 +582,7 @@ def build_coregional_Q_bta_jax(
         coef_33 = 1.0 / (sigma_2 ** 2)
 
         for t in range(nt):
-            block = jnp.zeros((block_size, block_size))
+            block = jnp.zeros((block_size, block_size), dtype=dtype)
 
             q11 = coef_11_0 * Qu_diag_list[0][t] + coef_11_1 * Qu_diag_list[1][t] + coef_11_2 * Qu_diag_list[2][t]
             q21 = coef_21_1 * Qu_diag_list[1][t] + coef_21_2 * Qu_diag_list[2][t]
@@ -584,7 +604,7 @@ def build_coregional_Q_bta_jax(
             diag_blocks = diag_blocks.at[t].set(block)
 
         for t in range(nt - 1):
-            block = jnp.zeros((block_size, block_size))
+            block = jnp.zeros((block_size, block_size), dtype=dtype)
 
             q11 = coef_11_0 * Qu_lower_list[0][t] + coef_11_1 * Qu_lower_list[1][t] + coef_11_2 * Qu_lower_list[2][t]
             q21 = coef_21_1 * Qu_lower_list[1][t] + coef_21_2 * Qu_lower_list[2][t]

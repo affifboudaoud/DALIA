@@ -292,7 +292,7 @@ def _extract_static_data(dalia_instance, dtype=None) -> Dict[str, Any]:
         # Precompute A^T @ A as sparse and extract BTA blocks
         ata_scipy = a_scipy.T @ a_scipy
         ata_diag, ata_lower, ata_arrow, ata_tip = extract_bta_blocks_from_sparse(
-            ata_scipy, nt, ns, n_fixed_effects
+            ata_scipy, nt, ns, n_fixed_effects, dtype=dtype
         )
 
         # Store sparse A for A^T @ y operations
@@ -562,7 +562,7 @@ def _extract_static_data_coregional(dalia_instance, dtype=None) -> Dict[str, Any
             ata_i = a_i.T @ a_i
 
             ata_diag_i, ata_lower_i, ata_arrow_i, ata_tip_i = _extract_bta_blocks_coregional(
-                ata_i, n_blocks, block_size, n_fixed_effects_total
+                ata_i, n_blocks, block_size, n_fixed_effects_total, dtype=dtype
             )
             per_model_ata_diag.append(ata_diag_i)
             per_model_ata_lower.append(ata_lower_i)
@@ -650,6 +650,7 @@ def _extract_bta_blocks_coregional(
     n_blocks: int,
     block_size: int,
     n_fixed_effects: int,
+    dtype=None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Extract BTA blocks from sparse matrix for coregional model.
 
@@ -658,6 +659,7 @@ def _extract_bta_blocks_coregional(
     n_blocks : Number of temporal blocks (nt)
     block_size : Size of each block (n_models * ns)
     n_fixed_effects : Total size of arrow tip (n_models * n_fixed_effects_per_model)
+    dtype : JAX dtype for output arrays
 
     Returns:
     diag_blocks : (n_blocks, block_size, block_size)
@@ -665,19 +667,21 @@ def _extract_bta_blocks_coregional(
     arrow_bottom_blocks : (n_blocks, n_fixed_effects, block_size)
     arrow_tip : (n_fixed_effects, n_fixed_effects)
     """
+    if dtype is None:
+        dtype = get_jax_dtype()
     csc = scipy_sparse.csc_matrix(sparse_matrix)
     total_st = n_blocks * block_size
 
-    diag_blocks = jnp.zeros((n_blocks, block_size, block_size))
-    lower_diag_blocks = jnp.zeros((n_blocks - 1, block_size, block_size))
-    arrow_bottom_blocks = jnp.zeros((n_blocks, n_fixed_effects, block_size))
-    arrow_tip = jnp.zeros((n_fixed_effects, n_fixed_effects))
+    diag_blocks = jnp.zeros((n_blocks, block_size, block_size), dtype=dtype)
+    lower_diag_blocks = jnp.zeros((n_blocks - 1, block_size, block_size), dtype=dtype)
+    arrow_bottom_blocks = jnp.zeros((n_blocks, n_fixed_effects, block_size), dtype=dtype)
+    arrow_tip = jnp.zeros((n_fixed_effects, n_fixed_effects), dtype=dtype)
 
     for i in range(n_blocks):
         start = i * block_size
         end = (i + 1) * block_size
         block = csc[start:end, start:end].toarray()
-        diag_blocks = diag_blocks.at[i].set(jnp.array(block))
+        diag_blocks = diag_blocks.at[i].set(jnp.array(block, dtype=dtype))
 
     for i in range(n_blocks - 1):
         row_start = (i + 1) * block_size
@@ -685,16 +689,16 @@ def _extract_bta_blocks_coregional(
         col_start = i * block_size
         col_end = (i + 1) * block_size
         block = csc[row_start:row_end, col_start:col_end].toarray()
-        lower_diag_blocks = lower_diag_blocks.at[i].set(jnp.array(block))
+        lower_diag_blocks = lower_diag_blocks.at[i].set(jnp.array(block, dtype=dtype))
 
     if n_fixed_effects > 0:
         for i in range(n_blocks):
             col_start = i * block_size
             col_end = (i + 1) * block_size
             block = csc[total_st:, col_start:col_end].toarray()
-            arrow_bottom_blocks = arrow_bottom_blocks.at[i].set(jnp.array(block))
+            arrow_bottom_blocks = arrow_bottom_blocks.at[i].set(jnp.array(block, dtype=dtype))
 
-        arrow_tip = jnp.array(csc[total_st:, total_st:].toarray())
+        arrow_tip = jnp.array(csc[total_st:, total_st:].toarray(), dtype=dtype)
 
     return diag_blocks, lower_diag_blocks, arrow_bottom_blocks, arrow_tip
 
@@ -889,6 +893,10 @@ def _inner_iteration_jax(a, y, Q_prior, grad_likelihood_fn, hess_diag_fn, tol, m
     # Pre-compute transpose once
     a_T = a.T
 
+    # Determine if we need FP32 regularization
+    is_fp32 = Q_prior.dtype == jnp.float32
+    eps_reg = 1e-4 if is_fp32 else 0.0
+
     def body_fn(i, state):
         """One Newton-Raphson iteration."""
         x_star, Q_conditional = state
@@ -900,6 +908,9 @@ def _inner_iteration_jax(a, y, Q_prior, grad_likelihood_fn, hess_diag_fn, tol, m
         # Compute Hessian diagonal and conditional precision
         D_diag = hess_diag_fn(eta)
         Q_conditional = Q_prior - (a_T * D_diag) @ a
+
+        # Add diagonal regularization for FP32 to stabilize Cholesky
+        Q_conditional = Q_conditional + eps_reg * jnp.eye(n_latent, dtype=Q_prior.dtype)
 
         # Compute RHS and solve
         gradient_likelihood = grad_likelihood_fn(eta)
@@ -1090,7 +1101,7 @@ def _objective_gaussian_spatial_dense(theta, static_data):
 
     # Place fixed effects block
     if n_fixed_effects > 0:
-        Q_fe = jnp.eye(n_fixed_effects) * fixed_effects_precision
+        Q_fe = jnp.eye(n_fixed_effects, dtype=y.dtype) * fixed_effects_precision
         Q_prior = Q_prior.at[fe_offset:fe_offset+n_fixed_effects, fe_offset:fe_offset+n_fixed_effects].set(Q_fe)
 
     # For Gaussian likelihood, use the same formulation as _objective_gaussian_dense:
@@ -1098,7 +1109,7 @@ def _objective_gaussian_spatial_dense(theta, static_data):
     # Q_conditional = Q_prior + prec_o * A^T A
     eta = jnp.zeros_like(y)
 
-    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y))
+    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y), dtype=y.dtype)
     Q_conditional = Q_prior - (a.T * D_diag) @ a  # = Q_prior + prec_o * A^T A
 
     # Solve for x
@@ -1179,13 +1190,13 @@ def _objective_gaussian_st_dense(theta, static_data):
 
     # Place fixed effects block
     if n_fixed_effects > 0:
-        Q_fe = jnp.eye(n_fixed_effects) * fixed_effects_precision
+        Q_fe = jnp.eye(n_fixed_effects, dtype=y.dtype) * fixed_effects_precision
         Q_prior = Q_prior.at[fe_offset:fe_offset+n_fixed_effects, fe_offset:fe_offset+n_fixed_effects].set(Q_fe)
 
     # For Gaussian likelihood, use same formulation as _objective_gaussian_dense
     eta = jnp.zeros_like(y)
 
-    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y))
+    D_diag = -jnp.exp(theta_likelihood) * jnp.ones(len(y), dtype=y.dtype)
     Q_conditional = Q_prior - (a.T * D_diag) @ a  # = Q_prior + prec_o * A^T A
 
     # Solve for x
@@ -1224,7 +1235,12 @@ def _objective_poisson_dense(theta, static_data):
     max_iter = static_data['inner_iter_max']
     x_initial = static_data.get('x_initial', None)
 
-    Q_prior = jnp.eye(n_fixed_effects) * fixed_effects_precision
+    dtype = y.dtype
+    Q_prior = jnp.eye(n_fixed_effects, dtype=dtype) * fixed_effects_precision
+
+    # Add diagonal regularization for FP32
+    if dtype == jnp.float32:
+        Q_prior = Q_prior + 1e-6 * jnp.eye(n_fixed_effects, dtype=dtype)
 
     log_prior_hyperparameters = 0.0
 
@@ -1241,9 +1257,10 @@ def _objective_poisson_dense(theta, static_data):
     logdet_Q_prior = n_fixed_effects * jnp.log(fixed_effects_precision)
     log_prior_latent = 0.5 * logdet_Q_prior - 0.5 * fixed_effects_precision * jnp.dot(x, x)
 
-    # Log conditional using Cholesky (faster than slogdet)
+    # Log conditional using Cholesky with safe log (faster than slogdet)
     L_cond = jnp.linalg.cholesky(Q_conditional)
-    logdet_Q_conditional = 2.0 * jnp.sum(jnp.log(jnp.diag(L_cond)))
+    eps = jnp.finfo(L_cond.dtype).eps
+    logdet_Q_conditional = 2.0 * jnp.sum(jnp.log(jnp.maximum(jnp.diag(L_cond), eps)))
     log_conditional = 0.5 * logdet_Q_conditional
 
     objective = -(
@@ -1293,12 +1310,13 @@ def _objective_poisson_st_dense(theta, static_data):
     # Build full Q_prior: block diagonal matching submodel ordering
     total_st_size = nt * ns
     n_latent = total_st_size + n_fixed_effects
-    Q_prior = jnp.zeros((n_latent, n_latent))
+    dtype = y.dtype
+    Q_prior = jnp.zeros((n_latent, n_latent), dtype=dtype)
 
     # Place Q_st and Q_fe blocks at their correct offsets
     Q_prior = Q_prior.at[st_offset:st_offset+total_st_size, st_offset:st_offset+total_st_size].set(Q_st)
     Q_prior = Q_prior.at[fe_offset:fe_offset+n_fixed_effects, fe_offset:fe_offset+n_fixed_effects].set(
-        jnp.eye(n_fixed_effects) * fixed_effects_precision
+        jnp.eye(n_fixed_effects, dtype=dtype) * fixed_effects_precision
     )
 
     # Evaluate prior on hyperparameters
@@ -1307,6 +1325,11 @@ def _objective_poisson_st_dense(theta, static_data):
     # Inner iteration for Poisson likelihood
     grad_fn = lambda eta: _gradient_poisson_likelihood_jax(eta, y, e)
     hess_fn = lambda eta: _hessian_diag_poisson_jax(eta, e)
+
+    # Add diagonal regularization for FP32 to improve numerical stability
+    if Q_prior.dtype == jnp.float32:
+        eps_reg = 1e-4
+        Q_prior = Q_prior + eps_reg * jnp.eye(Q_prior.shape[0], dtype=Q_prior.dtype)
 
     Q_conditional, x, eta = _inner_iteration_jax(
         a, y, Q_prior, grad_fn, hess_fn, tol, max_iter, x_initial
@@ -1317,8 +1340,13 @@ def _objective_poisson_st_dense(theta, static_data):
 
     # Log prior for latent parameters using correct offsets
     # Use Cholesky for logdet (faster than slogdet for positive definite matrices)
-    L_st = jnp.linalg.cholesky(Q_st)
-    logdet_Q_st = 2.0 * jnp.sum(jnp.log(jnp.diag(L_st)))
+    # Add regularization for FP32 and use safe log
+    Q_st_reg = Q_st
+    if Q_st.dtype == jnp.float32:
+        Q_st_reg = Q_st + 1e-6 * jnp.eye(Q_st.shape[0], dtype=Q_st.dtype)
+    L_st = jnp.linalg.cholesky(Q_st_reg)
+    eps = jnp.finfo(L_st.dtype).eps
+    logdet_Q_st = 2.0 * jnp.sum(jnp.log(jnp.maximum(jnp.diag(L_st), eps)))
     x_st = x[st_offset:st_offset+total_st_size]
     log_prior_st = 0.5 * logdet_Q_st - 0.5 * jnp.dot(x_st, Q_st @ x_st)
 
@@ -1329,9 +1357,9 @@ def _objective_poisson_st_dense(theta, static_data):
 
     log_prior_latent = log_prior_st + log_prior_fe
 
-    # Log conditional using Cholesky
+    # Log conditional using Cholesky with safe log
     L_cond = jnp.linalg.cholesky(Q_conditional)
-    logdet_Q_conditional = 2.0 * jnp.sum(jnp.log(jnp.diag(L_cond)))
+    logdet_Q_conditional = 2.0 * jnp.sum(jnp.log(jnp.maximum(jnp.diag(L_cond), eps)))
     log_conditional = 0.5 * logdet_Q_conditional
 
     objective = -(
@@ -1355,7 +1383,7 @@ def _objective_binomial_dense(theta, static_data):
     max_iter = static_data['inner_iter_max']
     x_initial = static_data.get('x_initial', None)
 
-    Q_prior = jnp.eye(n_fixed_effects) * fixed_effects_precision
+    Q_prior = jnp.eye(n_fixed_effects, dtype=y.dtype) * fixed_effects_precision
 
     log_prior_hyperparameters = 0.0
 
@@ -1474,7 +1502,15 @@ def _objective_gaussian_sparse(theta, static_data):
     lower_arrow_blocks = likelihood_precision * ata_arrow
 
     # Arrow tip: fixed_effects_precision * I + prec * AtA_tip
-    arrow_tip = fixed_effects_precision * jnp.eye(n_fixed_effects) + likelihood_precision * ata_tip
+    arrow_tip = fixed_effects_precision * jnp.eye(n_fixed_effects, dtype=y.dtype) + likelihood_precision * ata_tip
+
+    # Add small diagonal regularization for FP32 to improve numerical stability
+    # This prevents ill-conditioning that can cause Cholesky to fail
+    if diag_blocks.dtype == jnp.float32:
+        eps_reg = 1e-4
+        identity_block = jnp.eye(diag_blocks.shape[-1], dtype=diag_blocks.dtype)
+        diag_blocks = diag_blocks + eps_reg * identity_block[None, :, :]
+        arrow_tip = arrow_tip + eps_reg * jnp.eye(n_fixed_effects, dtype=arrow_tip.dtype)
 
     # Cholesky factorization in BTA format
     diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip = pobtaf_jax_optimized(
@@ -1507,7 +1543,7 @@ def _objective_gaussian_sparse(theta, static_data):
     q_cond_diag = q_st_diag + likelihood_precision * ata_diag
     q_cond_lower = q_st_lower + likelihood_precision * ata_lower
     q_cond_arrow = likelihood_precision * ata_arrow
-    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects) + likelihood_precision * ata_tip
+    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects, dtype=y.dtype) + likelihood_precision * ata_tip
 
     x_st = x[:nt * ns].reshape(nt, ns)
     x_fe = x[nt * ns:]
@@ -1582,7 +1618,7 @@ def _objective_gaussian_coregional_sparse(theta, static_data):
     )
 
     # Compute likelihood precisions for each model
-    likelihood_precisions = jnp.zeros(n_models)
+    likelihood_precisions = jnp.zeros(n_models, dtype=y.dtype)
     for i in range(n_models):
         prec_idx = hyperparameters_idx[i + 1] - 1
         likelihood_precisions = likelihood_precisions.at[i].set(jnp.exp(theta[prec_idx]))
@@ -1600,7 +1636,14 @@ def _objective_gaussian_coregional_sparse(theta, static_data):
     diag_blocks = q_prior_diag + weighted_ata_diag
     lower_diag_blocks = q_prior_lower + weighted_ata_lower
     lower_arrow_blocks = weighted_ata_arrow
-    arrow_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total) + weighted_ata_tip
+    arrow_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total, dtype=y.dtype) + weighted_ata_tip
+
+    # Add small diagonal regularization for FP32 to improve numerical stability
+    if diag_blocks.dtype == jnp.float32:
+        eps_reg = 1e-4
+        identity_block = jnp.eye(diag_blocks.shape[-1], dtype=diag_blocks.dtype)
+        diag_blocks = diag_blocks + eps_reg * identity_block[None, :, :]
+        arrow_tip = arrow_tip + eps_reg * jnp.eye(n_fixed_effects_total, dtype=arrow_tip.dtype)
 
     # Cholesky factorization in BTA format
     L_diag, L_lower, L_arrow, L_tip = pobtaf_jax_optimized(
@@ -1647,7 +1690,7 @@ def _objective_gaussian_coregional_sparse(theta, static_data):
     q_cond_diag = q_prior_diag + weighted_ata_diag
     q_cond_lower = q_prior_lower + weighted_ata_lower
     q_cond_arrow = weighted_ata_arrow
-    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total) + weighted_ata_tip
+    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total, dtype=y.dtype) + weighted_ata_tip
 
     x_st = x[:nt * block_size].reshape(nt, block_size)
     x_fe = x[nt * block_size:]
@@ -1744,7 +1787,7 @@ def _build_coregional_Q_prior_spatial_dense(
         lambda_12 = theta[lambda_12_idx]
 
     # Build coregional Q_prior matrix
-    Q_prior = jnp.zeros((block_size, block_size))
+    Q_prior = jnp.zeros((block_size, block_size), dtype=theta.dtype)
 
     if n_models == 2:
         sigma_0, sigma_1 = sigmas[0], sigmas[1]
@@ -1831,7 +1874,7 @@ def _objective_gaussian_coregional_spatial_dense(theta, static_data):
     Q_prior = Q_prior.at[:n_spatial, :n_spatial].set(Q_prior_spatial)
 
     if n_fixed_effects_total > 0:
-        Q_fe = jnp.eye(n_fixed_effects_total) * fixed_effects_precision
+        Q_fe = jnp.eye(n_fixed_effects_total, dtype=y.dtype) * fixed_effects_precision
         Q_prior = Q_prior.at[n_spatial:, n_spatial:].set(Q_fe)
 
     # Compute likelihood precisions for each model
@@ -1842,7 +1885,7 @@ def _objective_gaussian_coregional_spatial_dense(theta, static_data):
 
     # Build D diagonal (per-observation precision)
     n_obs = len(y)
-    D_diag = jnp.zeros(n_obs)
+    D_diag = jnp.zeros(n_obs, dtype=y.dtype)
     for i in range(n_models):
         obs_start = n_observations_idx[i]
         obs_end = n_observations_idx[i + 1]
