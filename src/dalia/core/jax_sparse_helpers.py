@@ -431,6 +431,92 @@ def solve_bta_system_jax(
     return result
 
 
+def quadratic_form_bta_jax(
+    L_diag: jnp.ndarray,
+    L_lower: jnp.ndarray,
+    L_arrow: jnp.ndarray,
+    L_tip: jnp.ndarray,
+    x: jnp.ndarray,
+    nt: int,
+    ns: int,
+) -> float:
+    """Compute x^T @ Q @ x using Cholesky factors L where Q = L @ L^T.
+
+    This exploits the identity: x^T @ Q @ x = x^T @ L @ L^T @ x = ||L^T @ x||^2
+
+    This is more memory-efficient than computing the quadratic form directly
+    with Q, because we can reuse the Cholesky factors L that were already
+    computed for the solve step, avoiding the need to keep Q in memory.
+
+    For the BTA (Block-Tridiagonal-Arrowhead) structure:
+        L = [L_00                              ]
+            [L_10  L_11                        ]
+            [      L_21  L_22                  ]
+            [            ...                   ]
+            [                  L_{n-1,n-1}     ]
+            [L_a0  L_a1  ...  L_{a,n-1}  L_aa  ]
+
+    The transpose L^T is upper triangular, and z = L^T @ x gives:
+        z_i = L_ii^T @ x_i + L_{i+1,i}^T @ x_{i+1} + L_ai^T @ x_fe  (for i < n-1)
+        z_{n-1} = L_{n-1,n-1}^T @ x_{n-1} + L_{a,n-1}^T @ x_fe
+        z_fe = L_aa^T @ x_fe
+
+    Then: x^T @ Q @ x = ||z||^2 = sum_i ||z_i||^2 + ||z_fe||^2
+
+    Memory savings: This avoids keeping the full Q_conditional blocks (~60 GB
+    for gst_large) in memory after Cholesky factorization.
+
+    Parameters
+    ----------
+    L_diag : (nt, ns, ns) Cholesky diagonal blocks
+    L_lower : (nt-1, ns, ns) Cholesky lower diagonal blocks
+    L_arrow : (nt, n_fe, ns) Cholesky arrow blocks
+    L_tip : (n_fe, n_fe) Cholesky arrow tip block
+    x : (nt*ns + n_fe,) Solution vector
+    nt : Number of temporal blocks
+    ns : Size of each spatial block
+
+    Returns
+    -------
+    quad_form : Scalar value of x^T @ Q @ x
+    """
+    n_fe = L_tip.shape[0]
+
+    # Reshape x into temporal blocks and fixed effects
+    x_st = x[:nt * ns].reshape(nt, ns)  # (nt, ns)
+    x_fe = x[nt * ns:]  # (n_fe,)
+
+    # Compute z = L^T @ x block by block
+    # z_i = L_diag[i]^T @ x_st[i] + L_lower[i]^T @ x_st[i+1] + L_arrow[i]^T @ x_fe
+
+    # Diagonal contribution: L_diag[i]^T @ x_st[i] for all i
+    # Using einsum: 'bji,bj->bi' (transpose via swapped indices)
+    z_diag = jnp.einsum('bji,bj->bi', L_diag, x_st)  # (nt, ns)
+
+    # Lower diagonal contribution: L_lower[i]^T @ x_st[i+1] for i=0..nt-2
+    # This contributes to z_0..z_{nt-2}
+    z_lower_contrib = jnp.einsum('bji,bj->bi', L_lower, x_st[1:])  # (nt-1, ns)
+
+    # Arrow contribution: L_arrow[i]^T @ x_fe for all i
+    # L_arrow is (nt, n_fe, ns), x_fe is (n_fe,)
+    # L_arrow[i]^T is (ns, n_fe), so L_arrow[i]^T @ x_fe is (ns,)
+    z_arrow_contrib = jnp.einsum('bji,j->bi', L_arrow, x_fe)  # (nt, ns)
+
+    # Combine contributions for z_st
+    # z[i] = z_diag[i] + (z_lower_contrib[i] if i < nt-1 else 0) + z_arrow_contrib[i]
+    z_st = z_diag + z_arrow_contrib  # (nt, ns)
+    # Add lower diagonal contribution to first nt-1 blocks
+    z_st = z_st.at[:-1].add(z_lower_contrib)
+
+    # Arrow tip contribution: z_fe = L_tip^T @ x_fe
+    z_fe = L_tip.T @ x_fe  # (n_fe,)
+
+    # Compute ||z||^2 = sum_i ||z_st[i]||^2 + ||z_fe||^2
+    quad_form = jnp.sum(z_st ** 2) + jnp.sum(z_fe ** 2)
+
+    return quad_form
+
+
 def build_coregional_Q_bta_jax(
     theta: jnp.ndarray,
     n_models: int,

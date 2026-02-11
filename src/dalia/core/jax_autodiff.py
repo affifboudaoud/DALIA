@@ -53,6 +53,7 @@ from dalia.core.jax_sparse_helpers import (
     compute_logdet_from_cholesky_bta_jax,
     solve_bta_system_jax,
     build_coregional_Q_bta_jax,
+    quadratic_form_bta_jax,
 )
 from serinv.algs.pobtaf_jax import pobtaf_jax_optimized
 from serinv.algs.pobtf_jax import pobtf_logdet_jax
@@ -1493,16 +1494,22 @@ def _objective_gaussian_sparse(theta, static_data):
     likelihood_precision = jnp.exp(theta_likelihood)
 
     # Diagonal blocks: Q_st_diag - (-prec * AtA_diag) = Q_st_diag + prec * AtA_diag
-    diag_blocks = q_st_diag + likelihood_precision * ata_diag
+    q_cond_diag = q_st_diag + likelihood_precision * ata_diag
 
     # Lower diagonal blocks
-    lower_diag_blocks = q_st_lower + likelihood_precision * ata_lower
+    q_cond_lower = q_st_lower + likelihood_precision * ata_lower
 
     # Arrow blocks (Q_prior has zeros here, only AtA contributes)
-    lower_arrow_blocks = likelihood_precision * ata_arrow
+    q_cond_arrow = likelihood_precision * ata_arrow
 
     # Arrow tip: fixed_effects_precision * I + prec * AtA_tip
-    arrow_tip = fixed_effects_precision * jnp.eye(n_fixed_effects, dtype=y.dtype) + likelihood_precision * ata_tip
+    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects, dtype=y.dtype) + likelihood_precision * ata_tip
+
+    # Prepare blocks for Cholesky (will be overwritten with L factors)
+    diag_blocks = q_cond_diag
+    lower_diag_blocks = q_cond_lower
+    lower_arrow_blocks = q_cond_arrow
+    arrow_tip = q_cond_tip
 
     # Add small diagonal regularization for FP32 to improve numerical stability
     # This prevents ill-conditioning that can cause Cholesky to fail
@@ -1512,14 +1519,14 @@ def _objective_gaussian_sparse(theta, static_data):
         diag_blocks = diag_blocks + eps_reg * identity_block[None, :, :]
         arrow_tip = arrow_tip + eps_reg * jnp.eye(n_fixed_effects, dtype=arrow_tip.dtype)
 
-    # Cholesky factorization in BTA format
-    diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip = pobtaf_jax_optimized(
+    # Cholesky factorization in BTA format (overwrites input with L factors)
+    L_diag, L_lower_diag, L_arrow, L_tip = pobtaf_jax_optimized(
         diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip
     )
 
     # Log determinant from Cholesky factors (vectorized)
     logdet_Q_conditional = compute_logdet_from_cholesky_bta_jax(
-        diag_blocks, arrow_tip
+        L_diag, L_tip
     )
 
     # Solve for x using BTA system
@@ -1527,7 +1534,7 @@ def _objective_gaussian_sparse(theta, static_data):
     rhs = a_sparse.T @ gradient_likelihood
 
     x = solve_bta_system_jax(
-        diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip, rhs
+        L_diag, L_lower_diag, L_arrow, L_tip, rhs
     )
 
     log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
@@ -1539,32 +1546,25 @@ def _objective_gaussian_sparse(theta, static_data):
     logdet_Q_st = pobtf_logdet_jax(q_st_diag, q_st_lower)
     log_prior_latent = 0.5 * logdet_Q_st
 
-    # Quadratic form x^T Q_conditional x using BTA blocks (vectorized)
-    q_cond_diag = q_st_diag + likelihood_precision * ata_diag
-    q_cond_lower = q_st_lower + likelihood_precision * ata_lower
-    q_cond_arrow = likelihood_precision * ata_arrow
-    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects, dtype=y.dtype) + likelihood_precision * ata_tip
-
-    x_st = x[:nt * ns].reshape(nt, ns)
-    x_fe = x[nt * ns:]
-
-    # Diagonal contribution: sum_i x_st[i] @ q_cond_diag[i] @ x_st[i]
-    # Using einsum: 'bi,bij,bj->b' then sum
-    quad_diag = jnp.einsum('bi,bij,bj->', x_st, q_cond_diag, x_st)
-
-    # Lower diagonal contribution: 2 * sum_i x_st[i+1] @ q_cond_lower[i] @ x_st[i]
-    # x_st[1:] @ q_cond_lower @ x_st[:-1]
-    quad_lower = 2.0 * jnp.einsum('bi,bij,bj->', x_st[1:], q_cond_lower, x_st[:-1])
-
-    # Arrow contribution: 2 * sum_i x_fe @ q_cond_arrow[i] @ x_st[i]
-    # = 2 * x_fe @ (sum_i q_cond_arrow[i] @ x_st[i])
-    arrow_matvec = jnp.einsum('bij,bj->i', q_cond_arrow, x_st)
-    quad_arrow = 2.0 * jnp.dot(x_fe, arrow_matvec)
-
-    # Arrow tip contribution
-    quad_tip = x_fe @ q_cond_tip @ x_fe
-
-    quad_form = quad_diag + quad_lower + quad_arrow + quad_tip
+    # Quadratic form x^T Q_conditional x using Cholesky factors L
+    #
+    # MEMORY OPTIMIZATION: Instead of computing x^T @ Q @ x directly (which requires
+    # keeping the Q_conditional blocks q_cond_diag, q_cond_lower, q_cond_arrow, q_cond_tip
+    # in memory), we use the identity:
+    #
+    #     x^T @ Q @ x = x^T @ L @ L^T @ x = ||L^T @ x||^2
+    #
+    # where L is the Cholesky factor we already computed (L_diag, L_lower_diag, L_arrow, L_tip).
+    #
+    # This saves ~60 GB for gst_large by allowing the Q_conditional blocks to be freed
+    # after the Cholesky factorization, since we only need the L factors for both
+    # the solve and the quadratic form computation.
+    #
+    # The quadratic_form_bta_jax function computes ||L^T @ x||^2 efficiently using
+    # the block-tridiagonal-arrowhead structure of L.
+    quad_form = quadratic_form_bta_jax(
+        L_diag, L_lower_diag, L_arrow, L_tip, x, nt, ns
+    )
 
     log_conditional = 0.5 * logdet_Q_conditional - 0.5 * quad_form
 
@@ -1632,11 +1632,17 @@ def _objective_gaussian_coregional_sparse(theta, static_data):
     weighted_ata_arrow = jnp.einsum('m,mbij->bij', likelihood_precisions, ata_arrow_per_model)
     weighted_ata_tip = jnp.einsum('m,mij->ij', likelihood_precisions, ata_tip_per_model)
 
-    # Diagonal blocks: Q_prior_diag + weighted AtA_diag
-    diag_blocks = q_prior_diag + weighted_ata_diag
-    lower_diag_blocks = q_prior_lower + weighted_ata_lower
-    lower_arrow_blocks = weighted_ata_arrow
-    arrow_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total, dtype=y.dtype) + weighted_ata_tip
+    # Build Q_conditional blocks (save for quadratic form computation later)
+    q_cond_diag = q_prior_diag + weighted_ata_diag
+    q_cond_lower = q_prior_lower + weighted_ata_lower
+    q_cond_arrow = weighted_ata_arrow
+    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total, dtype=y.dtype) + weighted_ata_tip
+
+    # Prepare blocks for Cholesky
+    diag_blocks = q_cond_diag
+    lower_diag_blocks = q_cond_lower
+    lower_arrow_blocks = q_cond_arrow
+    arrow_tip = q_cond_tip
 
     # Add small diagonal regularization for FP32 to improve numerical stability
     if diag_blocks.dtype == jnp.float32:
@@ -1686,22 +1692,23 @@ def _objective_gaussian_coregional_sparse(theta, static_data):
     logdet_Q_prior_st = pobtf_logdet_jax(q_prior_diag, q_prior_lower)
     log_prior_latent = 0.5 * logdet_Q_prior_st
 
-    # Quadratic form using BTA blocks (with weighted AtA)
-    q_cond_diag = q_prior_diag + weighted_ata_diag
-    q_cond_lower = q_prior_lower + weighted_ata_lower
-    q_cond_arrow = weighted_ata_arrow
-    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total, dtype=y.dtype) + weighted_ata_tip
-
-    x_st = x[:nt * block_size].reshape(nt, block_size)
-    x_fe = x[nt * block_size:]
-
-    quad_diag = jnp.einsum('bi,bij,bj->', x_st, q_cond_diag, x_st)
-    quad_lower = 2.0 * jnp.einsum('bi,bij,bj->', x_st[1:], q_cond_lower, x_st[:-1])
-    arrow_matvec = jnp.einsum('bij,bj->i', q_cond_arrow, x_st)
-    quad_arrow = 2.0 * jnp.dot(x_fe, arrow_matvec)
-    quad_tip = x_fe @ q_cond_tip @ x_fe
-
-    quad_form = quad_diag + quad_lower + quad_arrow + quad_tip
+    # Quadratic form x^T Q_conditional x using Cholesky factors L
+    #
+    # MEMORY OPTIMIZATION: Instead of computing x^T @ Q @ x directly (which requires
+    # keeping the Q_conditional blocks q_cond_diag, q_cond_lower, q_cond_arrow, q_cond_tip
+    # in memory), we use the identity:
+    #
+    #     x^T @ Q @ x = x^T @ L @ L^T @ x = ||L^T @ x||^2
+    #
+    # where L is the Cholesky factor we already computed (L_diag, L_lower, L_arrow, L_tip).
+    #
+    # This saves ~60 GB for gst_large scale problems by allowing the Q_conditional blocks
+    # to be freed after the Cholesky factorization.
+    #
+    # Note: For coregional models, block_size = n_models * ns (spatial nodes per model).
+    quad_form = quadratic_form_bta_jax(
+        L_diag, L_lower, L_arrow, L_tip, x, nt, block_size
+    )
 
     log_conditional = 0.5 * logdet_Q_conditional - 0.5 * quad_form
 
