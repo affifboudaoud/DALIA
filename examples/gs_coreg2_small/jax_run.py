@@ -36,6 +36,7 @@ from examples_utils.jax_utils import (
     profile_jax_execution,
     print_jax_ir,
 )
+from examples_utils.benchmark_utils import run_benchmark
 
 SEED = 63
 np.random.seed(SEED)
@@ -193,6 +194,20 @@ if __name__ == "__main__":
     initial_theta = model.theta.copy()
     print_msg(f"\nInitial theta: {initial_theta}")
     print_msg(f"Number of hyperparameters: {len(initial_theta)}")
+
+    if args.benchmark_mode:
+        dalia_fd = None
+        dalia_jax = None
+        if args.benchmark_method in ["finite_diff", "both"]:
+            np.random.seed(SEED)
+            model_fd = create_model()
+            dalia_fd = run_with_method(model_fd, "finite_diff", args.max_iter, verbose=False)
+        if args.benchmark_method in ["jax_autodiff", "both"]:
+            np.random.seed(SEED)
+            model_jax = create_model()
+            dalia_jax = run_with_method(model_jax, "jax_autodiff", args.max_iter, verbose=False)
+        run_benchmark(dalia_fd, dalia_jax, args, "gs_coreg2_small")
+        exit(0)
 
     # --- Run with Finite Differences ---
     print_msg("\n" + "="*70)

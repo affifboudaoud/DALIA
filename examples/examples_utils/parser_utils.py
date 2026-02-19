@@ -26,10 +26,44 @@ def parse_args():
         default="float64",
         help="JAX computation precision (float32 or float64).",
     )
+    parser.add_argument(
+        "--benchmark_mode",
+        action="store_true",
+        help="Run gradient benchmark instead of full optimization.",
+    )
+    parser.add_argument(
+        "--n_benchmark_runs",
+        type=int,
+        default=10,
+        help="Number of runs for timing in benchmark mode.",
+    )
+    parser.add_argument(
+        "--benchmark_method",
+        type=str,
+        choices=["finite_diff", "jax_autodiff", "both"],
+        default="both",
+        help="Which gradient method to benchmark.",
+    )
+    parser.add_argument(
+        "--output_csv",
+        type=str,
+        default=None,
+        help="Path to output CSV file for benchmark results.",
+    )
+    parser.add_argument(
+        "--measure_power",
+        action="store_true",
+        help="Measure GPU power draw during benchmark using nvidia-smi.",
+    )
     args = parser.parse_args()
     print("Parsed parameters:")
     print(f"  max_iter: {args.max_iter}")
     print(f"  solver_min_p: {args.solver_min_p}")
     print(f"  profile: {args.profile}")
     print(f"  precision: {args.precision}")
+    if args.benchmark_mode:
+        print(f"  benchmark_mode: {args.benchmark_mode}")
+        print(f"  n_benchmark_runs: {args.n_benchmark_runs}")
+        print(f"  benchmark_method: {args.benchmark_method}")
+        print(f"  output_csv: {args.output_csv}")
     return args

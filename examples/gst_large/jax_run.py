@@ -20,6 +20,7 @@ from dalia.core.dalia import DALIA
 from dalia.submodels import RegressionSubModel, SpatioTemporalSubModel
 from dalia.utils import print_msg
 from examples_utils.jax_utils import get_first_forward_and_gradient
+from examples_utils.benchmark_utils import run_benchmark
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -103,6 +104,18 @@ if __name__ == "__main__":
 
     initial_theta = model.theta.copy()
     print_msg(f"\nInitial theta: {initial_theta}")
+
+    if args.benchmark_mode:
+        dalia_fd = None
+        dalia_jax = None
+        if args.benchmark_method in ["finite_diff", "both"]:
+            model_fd = create_model()
+            dalia_fd = run_with_method(model_fd, "finite_diff", args.max_iter, verbose=False)
+        if args.benchmark_method in ["jax_autodiff", "both"]:
+            model_jax = create_model()
+            dalia_jax = run_with_method(model_jax, "jax_autodiff", args.max_iter, verbose=False)
+        run_benchmark(dalia_fd, dalia_jax, args, "gst_large")
+        exit(0)
 
     # --- Run with Finite Differences ---
     print_msg("\n" + "="*70)
