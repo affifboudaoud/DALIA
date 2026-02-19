@@ -1,5 +1,6 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
 
+import gc
 import logging
 from tabulate import tabulate
 
@@ -40,6 +41,25 @@ if backend_flags["cupy_avail"]:
 import time
 
 xp.set_printoptions(precision=8, suppress=True, linewidth=150)
+
+
+class _SolverStub:
+    """Lightweight stand-in for SerinvSolver used during JAX optimization.
+
+    When gradient_method='jax_autodiff' with solver.type='serinv', the
+    SerinvSolver's dense block arrays (~60 GB for gst_large) are never
+    used by the JAX forward/backward pass. This stub provides the
+    attributes that the JAX code path reads (timing accumulators and
+    memory reporting) while deferring the real allocation until
+    post-optimization methods need it.
+    """
+
+    def __init__(self):
+        self.t_cholesky = 0.0
+        self.t_solve = 0.0
+
+    def get_solver_memory(self) -> int:
+        return 0
 
 
 class DALIA:
@@ -123,6 +143,8 @@ class DALIA:
         free_unused_gpu_memory()
 
         # --- Initialize solver
+        self._deferred_solver_params = None
+
         if self.config.solver.type == "dense":
             self.solver = DenseSolver(
                 config=self.config.solver,
@@ -147,12 +169,24 @@ class DALIA:
 
             n_processes_solver = self.comm_qeval.size
             if n_processes_solver == 1:
-                self.solver = SerinvSolver(
-                    config=self.config.solver,
-                    diagonal_blocksize=diagonal_blocksize,
-                    arrowhead_blocksize=arrowhead_blocksize,
-                    n_diag_blocks=n_diag_blocks,
-                )
+                # Defer allocation when JAX autodiff will handle the
+                # forward/backward pass — the SerinvSolver's dense block
+                # arrays are only needed post-optimization.
+                if self.config.gradient_method == "jax_autodiff":
+                    self._deferred_solver_params = {
+                        "config": self.config.solver,
+                        "diagonal_blocksize": diagonal_blocksize,
+                        "arrowhead_blocksize": arrowhead_blocksize,
+                        "n_diag_blocks": n_diag_blocks,
+                    }
+                    self.solver = _SolverStub()
+                else:
+                    self.solver = SerinvSolver(
+                        config=self.config.solver,
+                        diagonal_blocksize=diagonal_blocksize,
+                        arrowhead_blocksize=arrowhead_blocksize,
+                        n_diag_blocks=n_diag_blocks,
+                    )
             else:
                 # Distributed solver checks
                 if not backend_flags["mpi_avail"]:
@@ -163,7 +197,7 @@ class DALIA:
                     raise ValueError(
                         f"Not enough diagonal blocks ({n_diag_blocks}) to use the distributed solver with {n_processes_solver} processes."
                     )
-                
+
                 self.nccl_comm = None
                 if backend_flags["nccl_avail"]:
                     # --- Initialize NCCL communicator
@@ -350,8 +384,57 @@ class DALIA:
         str_representation += "\n" + boxify(memory_usage_table)
 
         print_msg(str_representation, flush=True)
-        
 
+    def _release_jax_gpu_memory(self):
+        """Release JAX/XLA GPU memory after optimization.
+
+        After JAX-based optimization the XLA allocator may still hold GPU
+        memory that is no longer referenced by live arrays. This method
+        drops the JAX closures, clears the JIT cache, and deletes any
+        remaining XLA buffers so the memory is returned to CUDA for
+        subsequent CuPy allocations (e.g. SerinvSolver).
+        """
+        self.jax_objective = None
+        self.jax_grad_func = None
+
+        try:
+            import jax
+            jax.clear_caches()
+        except Exception:
+            pass
+
+        gc.collect()
+
+        try:
+            import jax
+            for buf in jax.live_arrays():
+                buf.delete()
+        except Exception:
+            pass
+
+        gc.collect()
+        free_unused_gpu_memory()
+
+    def _ensure_solver(self):
+        """Materialise the real SerinvSolver if it was deferred at init.
+
+        When using JAX autodiff the solver allocation is deferred to
+        avoid a ~60 GB GPU allocation that would compete with JAX's own
+        BTA block arrays during optimisation. This method creates the
+        solver on demand for post-optimisation tasks (evaluate_f,
+        selected inversion, etc.).
+        """
+        if self._deferred_solver_params is None:
+            return
+        params = self._deferred_solver_params
+        free_unused_gpu_memory()
+        self.solver = SerinvSolver(
+            config=params["config"],
+            diagonal_blocksize=params["diagonal_blocksize"],
+            arrowhead_blocksize=params["arrowhead_blocksize"],
+            n_diag_blocks=params["n_diag_blocks"],
+        )
+        self._deferred_solver_params = None
 
     def run(self) -> dict:
         """Run the DALIA"""
@@ -361,6 +444,10 @@ class DALIA:
 
         theta_star = get_device(minimization_result["theta"])
         x_star = get_device(minimization_result["x"])
+
+        # Release JAX GPU memory before CuPy-based post-processing
+        if self.config.gradient_method == "jax_autodiff":
+            self._release_jax_gpu_memory()
 
         # compute covariance of the hyperparameters theta at the mode
         cov_theta = self.compute_covariance_hp(theta_star)
@@ -768,6 +855,7 @@ class DALIA:
         hyperparameters, log likelihood, log prior of the latent parameters,
         and log conditional of the latent parameters.
         """
+        self._ensure_solver()
         self.model.theta[:] = xp.asarray(theta_i)
         f_theta = xp.zeros(1, dtype=xp.float64)
 
@@ -1070,6 +1158,7 @@ class DALIA:
         marginal_latent_parameters : NDArray
             Marginal distribution of the latent parameters x.
         """
+        self._ensure_solver()
         self.model.theta[:] = xp.asarray(theta)
         self.model.x[:] = xp.asarray(x_star)
 
@@ -1241,6 +1330,7 @@ class DALIA:
         Log normal:
         .. math:: 0.5*log(1/(2*pi)^n * |Q_prior|)) - 0.5 * x.T Q_prior x
         """
+        self._ensure_solver()
         self.solver.cholesky(self.model.Q_prior, sparsity="bt")
         logdet_Q_prior: float = self.solver.logdet(sparsity="bt")
 

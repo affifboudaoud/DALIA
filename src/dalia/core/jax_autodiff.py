@@ -50,10 +50,24 @@ from dalia.core.jax_sparse_helpers import (
     build_Q_conditional_jax,
     kronecker_to_bta_structure,
     extract_bta_blocks_from_sparse,
+    extract_bta_blocks_sparse_coo,
+    scatter_sparse_ata_into_blocks,
     compute_logdet_from_cholesky_bta_jax,
     solve_bta_system_jax,
     build_coregional_Q_bta_jax,
     quadratic_form_bta_jax,
+    precompute_spatial_components,
+    lazy_bta_cholesky,
+    lazy_bta_cholesky_carries,
+    fused_cholesky_fwd_sub,
+    backward_sub_from_carries,
+    pobtasi_jax,
+    logdet_Q_st_scan,
+    bt_logdet_grad,
+    _compute_grad_logdet_cond,
+    _compute_grad_quad,
+    selected_inversion_grads_jax,
+    selected_inversion_grads_from_carries_jax,
 )
 from serinv.algs.pobtaf_jax import pobtaf_jax_optimized
 from serinv.algs.pobtf_jax import pobtf_logdet_jax
@@ -290,9 +304,11 @@ def _extract_static_data(dalia_instance, dtype=None) -> Dict[str, Any]:
         else:
             a_scipy = scipy_sparse.csr_matrix(model.a)
 
-        # Precompute A^T @ A as sparse and extract BTA blocks
+        # Precompute A^T @ A as sparse and extract BTA blocks in COO format.
+        # Storing COO triplets instead of dense (nt, ns, ns) blocks saves
+        # ~60 GB for gst_large where each block has O(ns) nonzeros.
         ata_scipy = a_scipy.T @ a_scipy
-        ata_diag, ata_lower, ata_arrow, ata_tip = extract_bta_blocks_from_sparse(
+        ata_sparse_coo = extract_bta_blocks_sparse_coo(
             ata_scipy, nt, ns, n_fixed_effects, dtype=dtype
         )
 
@@ -303,10 +319,7 @@ def _extract_static_data(dalia_instance, dtype=None) -> Dict[str, Any]:
             'likelihood_type': likelihood_type,
             'has_spatio_temporal': True,
             'a_sparse': a_sparse,
-            'ata_diag_blocks': ata_diag,
-            'ata_lower_blocks': ata_lower,
-            'ata_arrow_blocks': ata_arrow,
-            'ata_tip_block': ata_tip,
+            **ata_sparse_coo,
             'y': jnp.array(_to_numpy(model.y), dtype=dtype),
             'n_fixed_effects': n_fixed_effects,
             'fixed_effects_precision': float(fixed_effects_precision),
@@ -1451,21 +1464,31 @@ def _bt_cholesky_step(carry, i):
 
 
 def _objective_gaussian_sparse(theta, static_data):
-    """Pure JAX objective function for Gaussian likelihood with sparse serinv solver.
+    """Pure JAX objective for Gaussian likelihood with sparse serinv solver.
 
-    Uses block-tridiagonal-arrowhead structure directly, avoiding dense matrices.
+    Uses a ``custom_vjp`` (``fused_core``) that computes analytical
+    gradients via selected inversion, avoiding JAX AD through the
+    expensive BTA Cholesky scan.  Peak memory in the backward pass is
+    ~60 GiB (one copy of L/Sigma factors) instead of ~418 GiB.
 
-    inputs:
-    theta : Hyperparameters [gamma_s, gamma_t, gamma_st, theta_likelihood]
-    static_data : Static data containing spatial/temporal matrices and model parameters
+    Parameters
+    ----------
+    theta : jnp.ndarray
+        Hyperparameters ``[r_s, r_t, sigma_st, theta_likelihood]``.
+    static_data : dict
+        Static data from :func:`_extract_static_data`.
 
-    Returns:
-    objective : INLA objective value
+    Returns
+    -------
+    objective : float
+        INLA objective value.
+    x : jnp.ndarray
+        Latent parameters.
     """
     nt = static_data['nt']
     ns = static_data['ns']
-    n_fixed_effects = static_data['n_fixed_effects']
-    fixed_effects_precision = static_data['fixed_effects_precision']
+    n_fe = static_data['n_fixed_effects']
+    fe_prec = static_data['fixed_effects_precision']
     spatial_matrices = static_data['spatial_matrices']
     temporal_matrices = static_data['temporal_matrices']
     manifold = static_data['manifold']
@@ -1473,106 +1496,166 @@ def _objective_gaussian_sparse(theta, static_data):
     a_sparse = static_data['a_sparse']
     prior_configs = static_data['prior_configs']
 
-    # Precomputed AtA BTA blocks
-    ata_diag = static_data['ata_diag_blocks']
-    ata_lower = static_data['ata_lower_blocks']
-    ata_arrow = static_data['ata_arrow_blocks']
-    ata_tip = static_data['ata_tip_block']
+    ata_diag_rows = static_data['ata_diag_rows']
+    ata_diag_cols = static_data['ata_diag_cols']
+    ata_diag_vals = static_data['ata_diag_vals']
+    ata_lower_rows = static_data['ata_lower_rows']
+    ata_lower_cols = static_data['ata_lower_cols']
+    ata_lower_vals = static_data['ata_lower_vals']
+    ata_arrow_rows = static_data['ata_arrow_rows']
+    ata_arrow_cols = static_data['ata_arrow_cols']
+    ata_arrow_vals = static_data['ata_arrow_vals']
+    ata_tip = static_data['ata_tip']
 
+    dtype = y.dtype
+    n_theta_st = 3
+
+    # ---- fused_core: custom_vjp function ----
+    # Returns (logdet_st, logdet_cond, quad, x).
+    # Forward: factorize, solve, compute logdets + quadratic form.
+    # Backward: analytical gradients via selected inversion.
+
+    @jax.custom_vjp
+    def fused_core(theta_st, theta_lik):
+        lik_prec = jnp.exp(theta_lik)
+        sc = precompute_spatial_components(theta_st, spatial_matrices, temporal_matrices, manifold)
+
+        rhs = lik_prec * (a_sparse.T @ y)
+        rhs_st = rhs[:nt * ns].reshape(nt, ns)
+        rhs_fe = rhs[nt * ns:]
+
+        stored_cs, stored_as, y_st, L_tip, arrow_rhs_acc, logdet_cond = \
+            fused_cholesky_fwd_sub(
+                sc, nt, ns, n_fe, fe_prec, lik_prec,
+                rhs_st, rhs_fe,
+                ata_diag_rows, ata_diag_cols, ata_diag_vals,
+                ata_lower_rows, ata_lower_cols, ata_lower_vals,
+                ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+                ata_tip, dtype,
+            )
+
+        x, quad = backward_sub_from_carries(
+            stored_cs, stored_as, L_tip,
+            y_st, arrow_rhs_acc,
+            sc, lik_prec,
+            ata_diag_rows, ata_diag_cols, ata_diag_vals,
+            ata_lower_rows, ata_lower_cols, ata_lower_vals,
+            ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+            nt, ns, n_fe, dtype,
+        )
+
+        logdet_st = logdet_Q_st_scan(theta_st, spatial_matrices, temporal_matrices, manifold, nt, ns, dtype)
+
+        return logdet_st, logdet_cond, quad, x
+
+    def fused_core_fwd(theta_st, theta_lik):
+        lik_prec = jnp.exp(theta_lik)
+        sc = precompute_spatial_components(theta_st, spatial_matrices, temporal_matrices, manifold)
+
+        rhs = lik_prec * (a_sparse.T @ y)
+        rhs_st = rhs[:nt * ns].reshape(nt, ns)
+        rhs_fe = rhs[nt * ns:]
+
+        stored_cs, stored_as, y_st, L_tip, arrow_rhs_acc, logdet_cond = \
+            fused_cholesky_fwd_sub(
+                sc, nt, ns, n_fe, fe_prec, lik_prec,
+                rhs_st, rhs_fe,
+                ata_diag_rows, ata_diag_cols, ata_diag_vals,
+                ata_lower_rows, ata_lower_cols, ata_lower_vals,
+                ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+                ata_tip, dtype,
+            )
+
+        x, quad = backward_sub_from_carries(
+            stored_cs, stored_as, L_tip,
+            y_st, arrow_rhs_acc,
+            sc, lik_prec,
+            ata_diag_rows, ata_diag_cols, ata_diag_vals,
+            ata_lower_rows, ata_lower_cols, ata_lower_vals,
+            ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+            nt, ns, n_fe, dtype,
+        )
+
+        logdet_st = logdet_Q_st_scan(theta_st, spatial_matrices, temporal_matrices, manifold, nt, ns, dtype)
+
+        # Residuals: theta + x (~8 MB) + carries (~32 GiB) + L_tip (tiny).
+        # Carries are reused in backward for selected inversion (no recomputation).
+        residuals = (theta_st, theta_lik, x, stored_cs, stored_as, L_tip)
+        return (logdet_st, logdet_cond, quad, x), residuals
+
+    def fused_core_bwd(residuals, g):
+        bar_logdet_st, bar_logdet_cond, bar_quad, _bar_x = g
+        theta_st_r, theta_lik_r, x_r, stored_cs_r, stored_as_r, L_tip_r = residuals
+
+        lik_prec = jnp.exp(theta_lik_r)
+
+        # --- Phase A: selected inversion using residual carries (no recomputation) ---
+        sc = precompute_spatial_components(theta_st_r, spatial_matrices, temporal_matrices, manifold)
+
+        jac_sc = jax.jacfwd(precompute_spatial_components)(
+            theta_st_r, spatial_matrices, temporal_matrices, manifold
+        )
+
+        grad_cond_st, grad_cond_lik = selected_inversion_grads_from_carries_jax(
+            stored_cs_r, stored_as_r, L_tip_r,
+            sc, jac_sc,
+            nt, ns, n_fe, n_theta_st,
+            lik_prec,
+            ata_diag_rows, ata_diag_cols, ata_diag_vals,
+            ata_lower_rows, ata_lower_cols, ata_lower_vals,
+            ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+            ata_tip, dtype,
+        )
+
+        rhs = lik_prec * (a_sparse.T @ y)
+
+        grad_quad_st, grad_quad_lik = _compute_grad_quad(
+            x_r, sc, jac_sc,
+            nt, ns, n_fe, n_theta_st,
+            rhs, lik_prec,
+            ata_diag_rows, ata_diag_cols, ata_diag_vals,
+            ata_lower_rows, ata_lower_cols, ata_lower_vals,
+            ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+            ata_tip,
+        )
+
+        # --- Phase B: logdet_Q_st gradient via analytical BT inversion ---
+        grad_logdet_st = bt_logdet_grad(
+            theta_st_r, spatial_matrices, temporal_matrices,
+            manifold, nt, ns, n_theta_st, dtype,
+        )
+
+        # --- Combine ---
+        bar_theta_st = (
+            bar_logdet_st * grad_logdet_st
+            + bar_logdet_cond * grad_cond_st
+            + bar_quad * grad_quad_st
+        )
+        bar_theta_lik = (
+            bar_logdet_cond * grad_cond_lik
+            + bar_quad * grad_quad_lik
+        )
+
+        return bar_theta_st, bar_theta_lik
+
+    fused_core.defvjp(fused_core_fwd, fused_core_bwd)
+
+    # ---- Assemble objective ----
     theta_st = theta[:-1]
     theta_likelihood = theta[-1]
 
-    # Build Q_st directly in BTA block format (memory efficient)
-    q_st_diag, q_st_lower = build_spatio_temporal_Q_bta_jax(
-        theta_st, spatial_matrices, temporal_matrices, manifold
-    )
+    logdet_Q_st_val, logdet_Q_cond_val, quad_form, x = fused_core(theta_st, theta_likelihood)
 
-    # Build Q_conditional blocks:
-    # Q_conditional = Q_prior - A^T @ D @ A
-    # where Q_prior has Q_st in spatio-temporal part and fixed_effects_precision on diagonal
-    # and D = -exp(theta_likelihood) * I
-    likelihood_precision = jnp.exp(theta_likelihood)
-
-    # Diagonal blocks: Q_st_diag - (-prec * AtA_diag) = Q_st_diag + prec * AtA_diag
-    q_cond_diag = q_st_diag + likelihood_precision * ata_diag
-
-    # Lower diagonal blocks
-    q_cond_lower = q_st_lower + likelihood_precision * ata_lower
-
-    # Arrow blocks (Q_prior has zeros here, only AtA contributes)
-    q_cond_arrow = likelihood_precision * ata_arrow
-
-    # Arrow tip: fixed_effects_precision * I + prec * AtA_tip
-    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects, dtype=y.dtype) + likelihood_precision * ata_tip
-
-    # Prepare blocks for Cholesky (will be overwritten with L factors)
-    diag_blocks = q_cond_diag
-    lower_diag_blocks = q_cond_lower
-    lower_arrow_blocks = q_cond_arrow
-    arrow_tip = q_cond_tip
-
-    # Add small diagonal regularization for FP32 to improve numerical stability
-    # This prevents ill-conditioning that can cause Cholesky to fail
-    if diag_blocks.dtype == jnp.float32:
-        eps_reg = 1e-4
-        identity_block = jnp.eye(diag_blocks.shape[-1], dtype=diag_blocks.dtype)
-        diag_blocks = diag_blocks + eps_reg * identity_block[None, :, :]
-        arrow_tip = arrow_tip + eps_reg * jnp.eye(n_fixed_effects, dtype=arrow_tip.dtype)
-
-    # Cholesky factorization in BTA format (overwrites input with L factors)
-    L_diag, L_lower_diag, L_arrow, L_tip = pobtaf_jax_optimized(
-        diag_blocks, lower_diag_blocks, lower_arrow_blocks, arrow_tip
-    )
-
-    # Log determinant from Cholesky factors (vectorized)
-    logdet_Q_conditional = compute_logdet_from_cholesky_bta_jax(
-        L_diag, L_tip
-    )
-
-    # Solve for x using BTA system
-    gradient_likelihood = likelihood_precision * y
-    rhs = a_sparse.T @ gradient_likelihood
-
-    x = solve_bta_system_jax(
-        L_diag, L_lower_diag, L_arrow, L_tip, rhs
-    )
-
-    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
-
+    log_prior_hp = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
     eta = jnp.zeros_like(y)
-    log_likelihood = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
-
-    # Compute log(det(Q_st)) using optimized BT Cholesky
-    logdet_Q_st = pobtf_logdet_jax(q_st_diag, q_st_lower)
-    log_prior_latent = 0.5 * logdet_Q_st
-
-    # Quadratic form x^T Q_conditional x using Cholesky factors L
-    #
-    # MEMORY OPTIMIZATION: Instead of computing x^T @ Q @ x directly (which requires
-    # keeping the Q_conditional blocks q_cond_diag, q_cond_lower, q_cond_arrow, q_cond_tip
-    # in memory), we use the identity:
-    #
-    #     x^T @ Q @ x = x^T @ L @ L^T @ x = ||L^T @ x||^2
-    #
-    # where L is the Cholesky factor we already computed (L_diag, L_lower_diag, L_arrow, L_tip).
-    #
-    # This saves ~60 GB for gst_large by allowing the Q_conditional blocks to be freed
-    # after the Cholesky factorization, since we only need the L factors for both
-    # the solve and the quadratic form computation.
-    #
-    # The quadratic_form_bta_jax function computes ||L^T @ x||^2 efficiently using
-    # the block-tridiagonal-arrowhead structure of L.
-    quad_form = quadratic_form_bta_jax(
-        L_diag, L_lower_diag, L_arrow, L_tip, x, nt, ns
-    )
-
-    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * quad_form
+    log_lik = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
 
     objective = -(
-        log_prior_hyperparameters
-        + log_likelihood
-        + log_prior_latent
-        - log_conditional
+        log_prior_hp
+        + log_lik
+        + 0.5 * logdet_Q_st_val
+        - 0.5 * logdet_Q_cond_val
+        + 0.5 * quad_form
     )
 
     return objective, x

@@ -1,7 +1,11 @@
 
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+import jax
 import jax.numpy as jnp
+import jax.scipy.linalg
+from jax import lax
 from typing import Tuple
+from functools import partial
 
 
 def kronecker_to_bta_structure(
@@ -712,3 +716,1819 @@ def build_coregional_Q_bta_jax(
             lower_diag_blocks = lower_diag_blocks.at[t].set(block)
 
     return diag_blocks, lower_diag_blocks
+
+
+def extract_bta_blocks_sparse_coo(
+    sparse_matrix,
+    nt: int,
+    ns: int,
+    n_fixed_effects: int,
+    dtype=None,
+) -> dict:
+    """Extract BTA blocks from a scipy sparse matrix in padded COO format.
+
+    Instead of storing each block as a dense (ns, ns) array, this
+    returns per-block COO triplets (rows, cols, vals) padded to a
+    common ``max_nnz`` for each block type.  For typical observation
+    matrices, each diagonal block of A^T A has O(ns) nonzeros rather
+    than O(ns^2), saving ~99.9 % of memory for large ns.
+
+    Parameters
+    ----------
+    sparse_matrix : scipy sparse matrix
+        The matrix to decompose (typically A^T @ A).
+    nt : int
+        Number of temporal blocks.
+    ns : int
+        Spatial block size.
+    n_fixed_effects : int
+        Arrow-tip size.
+    dtype : jnp.dtype, optional
+        JAX dtype for value arrays.
+
+    Returns
+    -------
+    dict
+        Keys: ``ata_diag_{rows,cols,vals}``, ``ata_lower_{rows,cols,vals}``,
+        ``ata_arrow_{rows,cols,vals}``, ``ata_tip``.
+        Row/col arrays are int32; val arrays use *dtype*.
+    """
+    from scipy import sparse as sp_sparse
+    from dalia.core.jax_autodiff import get_jax_dtype
+    import numpy as np
+
+    if dtype is None:
+        dtype = get_jax_dtype()
+    np_dtype = np.float64 if dtype == jnp.float64 else np.float32
+
+    csc = sp_sparse.csc_matrix(sparse_matrix)
+    total_st = nt * ns
+
+    # --- Diagonal blocks ---------------------------------------------------
+    diag_coo_list = []
+    for i in range(nt):
+        s = i * ns
+        e = s + ns
+        blk = csc[s:e, s:e].tocoo()
+        diag_coo_list.append((blk.row.astype(np.int32),
+                              blk.col.astype(np.int32),
+                              blk.data.astype(np_dtype)))
+    max_nnz_diag = max(len(v) for _, _, v in diag_coo_list) if diag_coo_list else 0
+    if max_nnz_diag == 0:
+        max_nnz_diag = 1  # avoid zero-length arrays
+
+    def _pad(arr, length, fill=0):
+        out = np.full(length, fill, dtype=arr.dtype)
+        out[:len(arr)] = arr
+        return out
+
+    ata_diag_rows = np.zeros((nt, max_nnz_diag), dtype=np.int32)
+    ata_diag_cols = np.zeros((nt, max_nnz_diag), dtype=np.int32)
+    ata_diag_vals = np.zeros((nt, max_nnz_diag), dtype=np_dtype)
+    for i, (r, c, v) in enumerate(diag_coo_list):
+        ata_diag_rows[i] = _pad(r, max_nnz_diag)
+        ata_diag_cols[i] = _pad(c, max_nnz_diag)
+        ata_diag_vals[i] = _pad(v, max_nnz_diag)
+
+    # --- Lower-diagonal blocks ---------------------------------------------
+    lower_coo_list = []
+    for i in range(nt - 1):
+        rs = (i + 1) * ns
+        re = rs + ns
+        cs = i * ns
+        ce = cs + ns
+        blk = csc[rs:re, cs:ce].tocoo()
+        lower_coo_list.append((blk.row.astype(np.int32),
+                               blk.col.astype(np.int32),
+                               blk.data.astype(np_dtype)))
+    max_nnz_lower = max(len(v) for _, _, v in lower_coo_list) if lower_coo_list else 0
+    if max_nnz_lower == 0:
+        max_nnz_lower = 1
+
+    ata_lower_rows = np.zeros((nt - 1, max_nnz_lower), dtype=np.int32)
+    ata_lower_cols = np.zeros((nt - 1, max_nnz_lower), dtype=np.int32)
+    ata_lower_vals = np.zeros((nt - 1, max_nnz_lower), dtype=np_dtype)
+    for i, (r, c, v) in enumerate(lower_coo_list):
+        ata_lower_rows[i] = _pad(r, max_nnz_lower)
+        ata_lower_cols[i] = _pad(c, max_nnz_lower)
+        ata_lower_vals[i] = _pad(v, max_nnz_lower)
+
+    # --- Arrow-bottom blocks -----------------------------------------------
+    if n_fixed_effects > 0:
+        arrow_coo_list = []
+        for i in range(nt):
+            cs = i * ns
+            ce = cs + ns
+            blk = csc[total_st:, cs:ce].tocoo()
+            arrow_coo_list.append((blk.row.astype(np.int32),
+                                   blk.col.astype(np.int32),
+                                   blk.data.astype(np_dtype)))
+        max_nnz_arrow = max(len(v) for _, _, v in arrow_coo_list) if arrow_coo_list else 0
+        if max_nnz_arrow == 0:
+            max_nnz_arrow = 1
+
+        ata_arrow_rows = np.zeros((nt, max_nnz_arrow), dtype=np.int32)
+        ata_arrow_cols = np.zeros((nt, max_nnz_arrow), dtype=np.int32)
+        ata_arrow_vals = np.zeros((nt, max_nnz_arrow), dtype=np_dtype)
+        for i, (r, c, v) in enumerate(arrow_coo_list):
+            ata_arrow_rows[i] = _pad(r, max_nnz_arrow)
+            ata_arrow_cols[i] = _pad(c, max_nnz_arrow)
+            ata_arrow_vals[i] = _pad(v, max_nnz_arrow)
+
+        ata_tip = jnp.array(csc[total_st:, total_st:].toarray(), dtype=dtype)
+    else:
+        max_nnz_arrow = 1
+        ata_arrow_rows = np.zeros((nt, 1), dtype=np.int32)
+        ata_arrow_cols = np.zeros((nt, 1), dtype=np.int32)
+        ata_arrow_vals = np.zeros((nt, 1), dtype=np_dtype)
+        ata_tip = jnp.zeros((n_fixed_effects, n_fixed_effects), dtype=dtype)
+
+    return {
+        'ata_diag_rows': jnp.array(ata_diag_rows),
+        'ata_diag_cols': jnp.array(ata_diag_cols),
+        'ata_diag_vals': jnp.array(ata_diag_vals, dtype=dtype),
+        'ata_lower_rows': jnp.array(ata_lower_rows),
+        'ata_lower_cols': jnp.array(ata_lower_cols),
+        'ata_lower_vals': jnp.array(ata_lower_vals, dtype=dtype),
+        'ata_arrow_rows': jnp.array(ata_arrow_rows),
+        'ata_arrow_cols': jnp.array(ata_arrow_cols),
+        'ata_arrow_vals': jnp.array(ata_arrow_vals, dtype=dtype),
+        'ata_tip': ata_tip,
+    }
+
+
+def scatter_sparse_ata_into_blocks(
+    blocks: jnp.ndarray,
+    prec: float,
+    rows: jnp.ndarray,
+    cols: jnp.ndarray,
+    vals: jnp.ndarray,
+) -> jnp.ndarray:
+    """Add scaled sparse COO values into dense BTA blocks.
+
+    Computes ``blocks[i, rows[i], cols[i]] += prec * vals[i]`` for every
+    temporal block *i*, using a single vectorised scatter.
+
+    Parameters
+    ----------
+    blocks : jnp.ndarray
+        Dense blocks to update, shape ``(n_blocks, block_size, block_size)``
+        or ``(n_blocks, n_fe, block_size)`` depending on the block type.
+    prec : float
+        Scalar multiplier (likelihood precision).
+    rows, cols : jnp.ndarray
+        Int32 index arrays, shape ``(n_blocks, max_nnz)``.
+    vals : jnp.ndarray
+        Value arrays, shape ``(n_blocks, max_nnz)``.
+
+    Returns
+    -------
+    jnp.ndarray
+        Updated blocks with sparse contributions added.
+    """
+    n_blocks = blocks.shape[0]
+    block_idx = jnp.arange(n_blocks)[:, None]  # (n_blocks, 1)
+    return blocks.at[block_idx, rows, cols].add(prec * vals)
+
+
+_jax_cholesky = partial(jax.scipy.linalg.cholesky, lower=True)
+
+
+def precompute_spatial_components(theta_st, spatial_matrices, temporal_matrices, manifold):
+    """Precompute spatial/temporal components for lazy block reconstruction.
+
+    Instead of materializing the full (nt, ns, ns) Q_st arrays, we store
+    three (ns, ns) spatial matrices and short temporal coefficient vectors
+    from which each block can be reconstructed on the fly.
+
+    Parameters
+    ----------
+    theta_st : jnp.ndarray
+        Spatio-temporal hyperparameters [r_s, r_t, sigma_st].
+    spatial_matrices : dict
+        Dict with keys 'c0', 'g1', 'g2', 'g3'.
+    temporal_matrices : dict
+        Dict with keys 'm0', 'm1', 'm2'.
+    manifold : str
+        Either "sphere" or "plane".
+
+    Returns
+    -------
+    dict
+        Keys: q1s, q2s, q3s (ns, ns), scale, exp_gt (scalars),
+        m0_diag, m1_diag, m2_diag (nt,),
+        m0_subdiag, m1_subdiag, m2_subdiag (nt-1,).
+    """
+    r_s = theta_st[0]
+    r_t = theta_st[1]
+    sigma_st = theta_st[2]
+
+    gamma_s, gamma_t, gamma_st = _interpretable_to_compute_jax(r_s, r_t, sigma_st, manifold)
+
+    c0 = spatial_matrices['c0']
+    g1 = spatial_matrices['g1']
+    g2 = spatial_matrices['g2']
+    g3 = spatial_matrices['g3']
+
+    m0 = temporal_matrices['m0']
+    m1 = temporal_matrices['m1']
+    m2 = temporal_matrices['m2']
+
+    exp_gamma_s = jnp.exp(gamma_s)
+    exp_gamma_t = jnp.exp(gamma_t)
+    exp_gamma_st = jnp.exp(gamma_st)
+
+    q1s = exp_gamma_s**2 * c0 + g1
+    q2s = exp_gamma_s**4 * c0 + 2 * exp_gamma_s**2 * g1 + g2
+    q3s = exp_gamma_s**6 * c0 + 3 * exp_gamma_s**4 * g1 + 3 * exp_gamma_s**2 * g2 + g3
+
+    scale = exp_gamma_st**2
+
+    m0_diag = jnp.diag(m0)
+    m1_diag = jnp.diag(m1)
+    m2_diag = jnp.diag(m2)
+
+    m0_subdiag = jnp.diag(m0, k=-1)
+    m1_subdiag = jnp.diag(m1, k=-1)
+    m2_subdiag = jnp.diag(m2, k=-1)
+
+    return {
+        'q1s': q1s,
+        'q2s': q2s,
+        'q3s': q3s,
+        'scale': scale,
+        'exp_gt': exp_gamma_t,
+        'm0_diag': m0_diag,
+        'm1_diag': m1_diag,
+        'm2_diag': m2_diag,
+        'm0_subdiag': m0_subdiag,
+        'm1_subdiag': m1_subdiag,
+        'm2_subdiag': m2_subdiag,
+    }
+
+
+def _reconstruct_diag_block(sc, i):
+    """Reconstruct diagonal block i of Q_st from spatial components."""
+    return sc['scale'] * (
+        sc['m0_diag'][i] * sc['q3s']
+        + sc['exp_gt'] * sc['m1_diag'][i] * sc['q2s']
+        + sc['exp_gt']**2 * sc['m2_diag'][i] * sc['q1s']
+    )
+
+
+def _reconstruct_lower_block(sc, i):
+    """Reconstruct lower-diagonal block i of Q_st from spatial components."""
+    return sc['scale'] * (
+        sc['m0_subdiag'][i] * sc['q3s']
+        + sc['exp_gt'] * sc['m1_subdiag'][i] * sc['q2s']
+        + sc['exp_gt']**2 * sc['m2_subdiag'][i] * sc['q1s']
+    )
+
+
+def lazy_bta_cholesky(
+    spatial_comp, nt, ns, n_fe, fe_prec, likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip, dtype,
+):
+    """Q_cond BTA Cholesky via ``lax.scan`` with lazy block reconstruction.
+
+    Each Q_cond block is reconstructed on the fly from three (ns, ns)
+    spatial matrices, avoiding the full (nt, ns, ns) materialization.
+
+    Parameters
+    ----------
+    spatial_comp : dict
+        Output of :func:`precompute_spatial_components`.
+    nt, ns, n_fe : int
+        Number of temporal blocks, spatial block size, fixed-effects size.
+    fe_prec : float
+        Fixed-effects prior precision.
+    likelihood_prec : scalar
+        Likelihood precision (exp(theta_likelihood)).
+    ata_diag_rows, ata_diag_cols, ata_diag_vals : jnp.ndarray
+        Sparse COO for diagonal AtA blocks, shape (nt, max_nnz).
+    ata_lower_rows, ata_lower_cols, ata_lower_vals : jnp.ndarray
+        Sparse COO for lower-diagonal AtA blocks, shape (nt-1, max_nnz).
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals : jnp.ndarray
+        Sparse COO for arrow AtA blocks, shape (nt, max_nnz).
+    ata_tip : jnp.ndarray
+        Arrow tip AtA block, shape (n_fe, n_fe).
+    dtype : jnp.dtype
+        Working dtype.
+
+    Returns
+    -------
+    L_diag : (nt, ns, ns)
+    L_lower : (nt-1, ns, ns)
+    L_arrow : (nt, n_fe, ns)
+    L_tip : (n_fe, n_fe)
+    logdet_Q_cond : scalar
+    """
+    eps = jnp.finfo(dtype).eps
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+
+    # Pad subdiagonal vectors to length nt
+    m0_sub_pad = jnp.concatenate([spatial_comp['m0_subdiag'], jnp.zeros(1, dtype=dtype)])
+    m1_sub_pad = jnp.concatenate([spatial_comp['m1_subdiag'], jnp.zeros(1, dtype=dtype)])
+    m2_sub_pad = jnp.concatenate([spatial_comp['m2_subdiag'], jnp.zeros(1, dtype=dtype)])
+
+    # Pad lower AtA to length nt (extra zero row at end)
+    ata_lower_rows_pad = jnp.concatenate([
+        ata_lower_rows, jnp.zeros((1, ata_lower_rows.shape[1]), dtype=jnp.int32)
+    ], axis=0)
+    ata_lower_cols_pad = jnp.concatenate([
+        ata_lower_cols, jnp.zeros((1, ata_lower_cols.shape[1]), dtype=jnp.int32)
+    ], axis=0)
+    ata_lower_vals_pad = jnp.concatenate([
+        ata_lower_vals, jnp.zeros((1, ata_lower_vals.shape[1]), dtype=dtype)
+    ], axis=0)
+
+    sc_padded = {**spatial_comp,
+                 'm0_subdiag': m0_sub_pad,
+                 'm1_subdiag': m1_sub_pad,
+                 'm2_subdiag': m2_sub_pad}
+
+    def scan_body(carry, inputs):
+        (cond_schur, arrow_tip_acc, arrow_schur, logdet_cond) = carry
+        i, d_rows, d_cols, d_vals, l_rows, l_cols, l_vals, a_rows, a_cols, a_vals = inputs
+
+        # --- Q_cond BTA Cholesky step ---
+        q_cond_diag_i = _reconstruct_diag_block(sc_padded, i)
+        q_cond_diag_i = q_cond_diag_i.at[d_rows, d_cols].add(likelihood_prec * d_vals)
+        q_cond_diag_i = q_cond_diag_i + eps_reg * eye_ns - cond_schur
+
+        L_i = _jax_cholesky(q_cond_diag_i)
+        cond_diag_vals = jnp.diag(L_i)
+        safe_cond = jnp.maximum(cond_diag_vals, eps)
+        logdet_cond = logdet_cond + 2.0 * jnp.sum(jnp.log(safe_cond))
+
+        # Lower block
+        q_cond_lower_i = _reconstruct_lower_block(sc_padded, i)
+        q_cond_lower_i = q_cond_lower_i.at[l_rows, l_cols].add(likelihood_prec * l_vals)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_cond_lower_i.T, lower=True
+        ).T
+
+        # Arrow block
+        q_arrow_i = jnp.zeros((n_fe, ns), dtype=dtype)
+        q_arrow_i = q_arrow_i.at[a_rows, a_cols].add(likelihood_prec * a_vals)
+        q_arrow_i = q_arrow_i - arrow_schur
+        L_arrow_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_arrow_i.T, lower=True
+        ).T
+
+        # Schur updates for Q_cond
+        new_cond_schur = L_lower_i @ L_lower_i.T
+        new_arrow_schur = L_arrow_i @ L_lower_i.T
+        new_arrow_tip_acc = arrow_tip_acc - L_arrow_i @ L_arrow_i.T
+
+        new_cond_schur = jnp.where(i < nt - 1, new_cond_schur, jnp.zeros_like(new_cond_schur))
+        new_arrow_schur = jnp.where(i < nt - 1, new_arrow_schur, jnp.zeros_like(new_arrow_schur))
+
+        new_carry = (new_cond_schur, new_arrow_tip_acc, new_arrow_schur, logdet_cond)
+        return new_carry, (L_i, L_lower_i, L_arrow_i)
+
+    init_carry = (
+        jnp.zeros((ns, ns), dtype=dtype),     # cond_schur
+        fe_prec * eye_nfe + likelihood_prec * ata_tip + eps_reg * eye_nfe,  # arrow_tip_acc
+        jnp.zeros((n_fe, ns), dtype=dtype),    # arrow_schur
+        jnp.array(0.0, dtype=dtype),           # logdet_cond
+    )
+
+    scan_inputs = (
+        jnp.arange(nt),
+        ata_diag_rows,
+        ata_diag_cols,
+        ata_diag_vals,
+        ata_lower_rows_pad,
+        ata_lower_cols_pad,
+        ata_lower_vals_pad,
+        ata_arrow_rows,
+        ata_arrow_cols,
+        ata_arrow_vals,
+    )
+
+    (_, arrow_tip_final, _, logdet_cond), \
+        (L_diag_all, L_lower_all, L_arrow_all) = lax.scan(
+            scan_body, init_carry, scan_inputs
+        )
+
+    L_lower = L_lower_all[:nt - 1]
+
+    # Factorize arrow tip and add its logdet contribution
+    L_tip = _jax_cholesky(arrow_tip_final)
+    tip_diag = jnp.diag(L_tip)
+    safe_tip_diag = jnp.maximum(tip_diag, eps)
+    logdet_Q_cond = logdet_cond + 2.0 * jnp.sum(jnp.log(safe_tip_diag))
+
+    return L_diag_all, L_lower, L_arrow_all, L_tip, logdet_Q_cond
+
+
+def pobtasi_jax(L_diag, L_lower, L_arrow, L_tip):
+    """Selected inversion of a BTA matrix from its Cholesky factors.
+
+    Computes the selected elements of the inverse (diagonal, lower-diagonal,
+    arrow-bottom and arrow-tip blocks) of a symmetric positive-definite
+    block-tridiagonal-arrowhead matrix given its lower Cholesky factor.
+
+    This is a pure-JAX port of :func:`serinv.algs.pobtasi._pobtasi`.
+    Arrays are **not** modified in-place; new arrays are returned.
+
+    Parameters
+    ----------
+    L_diag : (nt, ns, ns)
+        Diagonal blocks of the Cholesky factor.
+    L_lower : (nt-1, ns, ns)
+        Lower-diagonal blocks of the Cholesky factor.
+    L_arrow : (nt, n_fe, ns)
+        Arrow-bottom blocks of the Cholesky factor.
+    L_tip : (n_fe, n_fe)
+        Arrow-tip block of the Cholesky factor.
+
+    Returns
+    -------
+    S_diag : (nt, ns, ns)
+    S_lower : (nt-1, ns, ns)
+    S_arrow : (nt, n_fe, ns)
+    S_tip : (n_fe, n_fe)
+    """
+    nt = L_diag.shape[0]
+    ns = L_diag.shape[1]
+    n_fe = L_tip.shape[0]
+    eye_ns = jnp.eye(ns, dtype=L_diag.dtype)
+
+    # Invert tip: S_tip = L_tip^{-T} @ L_tip^{-1}
+    L_tip_inv = jax.scipy.linalg.solve_triangular(
+        L_tip, jnp.eye(n_fe, dtype=L_tip.dtype), lower=True
+    )
+    S_tip = L_tip_inv.T @ L_tip_inv
+
+    # Last block
+    L_blk_inv = jax.scipy.linalg.solve_triangular(
+        L_diag[nt - 1], eye_ns, lower=True
+    )
+
+    S_arrow_last = -S_tip @ L_arrow[nt - 1] @ L_blk_inv
+    S_diag_last = (
+        L_blk_inv.T - S_arrow_last.T @ L_arrow[nt - 1]
+    ) @ L_blk_inv
+
+    S_diag = L_diag.at[nt - 1].set(S_diag_last)
+    S_arrow = L_arrow.at[nt - 1].set(S_arrow_last)
+
+    # Backward loop: i = nt-2 down to 0
+    # Carry: (S_diag, S_lower, S_arrow)
+    # S_tip is constant throughout the loop (captured via closure).
+    S_lower = jnp.zeros_like(L_lower)
+
+    def body_fn(i_rev, carry):
+        sd, sl, sa = carry
+        i = nt - 2 - i_rev
+
+        Li = L_diag[i]
+        L_blk_inv_i = jax.scipy.linalg.solve_triangular(Li, eye_ns, lower=True)
+
+        # Off-diagonal: S_lower[i] = (-S_diag[i+1] @ L_lower[i] - S_arrow[i+1]^T @ L_arrow[i]) @ L_diag[i]^{-1}
+        sl_i = (
+            -sd[i + 1] @ L_lower[i]
+            - sa[i + 1].T @ L_arrow[i]
+        ) @ L_blk_inv_i
+
+        # Arrow: S_arrow[i] = (-S_arrow[i+1] @ L_lower[i] - S_tip @ L_arrow[i]) @ L_diag[i]^{-1}
+        sa_i = (
+            -sa[i + 1] @ L_lower[i]
+            - S_tip @ L_arrow[i]
+        ) @ L_blk_inv_i
+
+        # Diagonal: S_diag[i] = (L_diag[i]^{-T} - S_lower[i]^T @ L_lower[i] - S_arrow[i]^T @ L_arrow[i]) @ L_diag[i]^{-1}
+        sd_i = (
+            L_blk_inv_i.T
+            - sl_i.T @ L_lower[i]
+            - sa_i.T @ L_arrow[i]
+        ) @ L_blk_inv_i
+
+        sd = sd.at[i].set(sd_i)
+        sl = sl.at[i].set(sl_i)
+        sa = sa.at[i].set(sa_i)
+
+        return (sd, sl, sa)
+
+    S_diag, S_lower, S_arrow = lax.fori_loop(
+        0, nt - 1, body_fn, (S_diag, S_lower, S_arrow)
+    )
+
+    return S_diag, S_lower, S_arrow, S_tip
+
+
+def logdet_Q_st_scan(theta_st, spatial_matrices, temporal_matrices, manifold, nt, ns, dtype):
+    """Compute logdet(Q_st) via a checkpointed BT Cholesky scan.
+
+    This is a standalone differentiable function whose gradient w.r.t.
+    ``theta_st`` is computed by JAX AD (``jax.grad``).  The scan body is
+    wrapped with ``jax.checkpoint(prevent_cse=True)`` so that per-step
+    intermediates are recomputed during the backward pass instead of
+    stored (memory: ~32 GiB carry trajectory for gst_large).
+
+    Parameters
+    ----------
+    theta_st : jnp.ndarray
+        Spatio-temporal hyperparameters ``[r_s, r_t, sigma_st]``.
+    spatial_matrices, temporal_matrices : dict
+        FEM matrices.
+    manifold : str
+        ``"sphere"`` or ``"plane"``.
+    nt, ns : int
+        Number of temporal blocks and spatial block size.
+    dtype : jnp.dtype
+        Working precision.
+
+    Returns
+    -------
+    logdet : scalar
+        ``log|Q_st|``.
+    """
+    sc = precompute_spatial_components(theta_st, spatial_matrices, temporal_matrices, manifold)
+    eps = jnp.finfo(dtype).eps
+
+    @partial(jax.checkpoint, prevent_cse=True)
+    def scan_body(carry, i):
+        schur, logdet = carry
+        q_diag_i = _reconstruct_diag_block(sc, i) - schur
+        L_i = _jax_cholesky(q_diag_i)
+        diag_vals = jnp.diag(L_i)
+        safe_vals = jnp.maximum(diag_vals, eps)
+        logdet = logdet + 2.0 * jnp.sum(jnp.log(safe_vals))
+
+        q_lower_i = _reconstruct_lower_block(sc, i)
+        L_inv_lower = jax.scipy.linalg.solve_triangular(
+            L_i, q_lower_i.T, lower=True
+        )
+        new_schur = L_inv_lower.T @ L_inv_lower
+        new_schur = jnp.where(i < nt - 1, new_schur, jnp.zeros_like(new_schur))
+        return (new_schur, logdet), None
+
+    # Pad subdiagonal vectors to length nt (last entry unused)
+    sc_padded = {
+        **sc,
+        'm0_subdiag': jnp.concatenate([sc['m0_subdiag'], jnp.zeros(1, dtype=dtype)]),
+        'm1_subdiag': jnp.concatenate([sc['m1_subdiag'], jnp.zeros(1, dtype=dtype)]),
+        'm2_subdiag': jnp.concatenate([sc['m2_subdiag'], jnp.zeros(1, dtype=dtype)]),
+    }
+    # Override sc reference in closure
+    sc.update(sc_padded)
+
+    init_carry = (jnp.zeros((ns, ns), dtype=dtype), jnp.array(0.0, dtype=dtype))
+    (_, logdet), _ = lax.scan(scan_body, init_carry, jnp.arange(nt))
+    return logdet
+
+
+def bt_logdet_grad(
+    theta_st, spatial_matrices, temporal_matrices, manifold, nt, ns, n_theta_st, dtype
+):
+    """Analytical gradient of logdet(Q_st) via BT selected inversion.
+
+    Replaces ``jax.grad(logdet_Q_st_scan)`` with an analytical computation
+    that avoids the 32 GiB scan carry trajectory from AD.
+
+    Algorithm:
+      1. Forward BT Cholesky scan storing Schur carries (``nt`` blocks of
+         ``(ns, ns)``).
+      2. Backward BT selected inversion sweep, reconstructing L blocks from
+         stored carries and accumulating ``tr(Σ_block @ ∂Q_st/∂θ)``
+         block-by-block.  Only one S block is live at a time.
+
+    Parameters
+    ----------
+    theta_st : (n_theta_st,)
+    spatial_matrices, temporal_matrices : dict
+    manifold : str
+    nt, ns, n_theta_st : int
+    dtype : jnp.dtype
+
+    Returns
+    -------
+    grad_logdet_st : (n_theta_st,)
+        d(logdet Q_st) / d(theta_st)
+    """
+    sc = precompute_spatial_components(theta_st, spatial_matrices, temporal_matrices, manifold)
+    jac_sc = jax.jacfwd(precompute_spatial_components)(
+        theta_st, spatial_matrices, temporal_matrices, manifold
+    )
+
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    scale = sc['scale']
+    exp_gt = sc['exp_gt']
+    m0_d = sc['m0_diag']
+    m1_d = sc['m1_diag']
+    m2_d = sc['m2_diag']
+    m0_s = sc['m0_subdiag']
+    m1_s = sc['m1_subdiag']
+    m2_s = sc['m2_subdiag']
+
+    # Pad subdiagonal to length nt
+    m0_s_pad = jnp.concatenate([m0_s, jnp.zeros(1, dtype=dtype)])
+    m1_s_pad = jnp.concatenate([m1_s, jnp.zeros(1, dtype=dtype)])
+    m2_s_pad = jnp.concatenate([m2_s, jnp.zeros(1, dtype=dtype)])
+
+    sc_pad = {**sc,
+              'm0_subdiag': m0_s_pad,
+              'm1_subdiag': m1_s_pad,
+              'm2_subdiag': m2_s_pad}
+
+    # --- 1. Forward BT Cholesky scan, store incoming Schur as outputs ---
+    def fwd_body(schur, i):
+        q_diag = _reconstruct_diag_block(sc_pad, i) - schur
+        L_i = _jax_cholesky(q_diag)
+        q_lower = _reconstruct_lower_block(sc_pad, i)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_lower.T, lower=True).T
+        new_schur = L_lower_i @ L_lower_i.T
+        new_schur = jnp.where(i < nt - 1, new_schur, jnp.zeros_like(new_schur))
+        return new_schur, schur  # output = incoming Schur for reconstruction
+
+    init_schur = jnp.zeros((ns, ns), dtype=dtype)
+    _, stored_schurs = lax.scan(fwd_body, init_schur, jnp.arange(nt))
+    # stored_schurs[i] = Schur complement subtracted from Q_st_diag[i]
+
+    # --- Helper: reconstruct L_diag[i] and L_lower[i] from stored carry ---
+    def _reconstruct_L(i):
+        q_diag = _reconstruct_diag_block(sc_pad, i) - stored_schurs[i]
+        L_i = _jax_cholesky(q_diag)
+        q_lower = _reconstruct_lower_block(sc_pad, i)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_lower.T, lower=True).T
+        return L_i, L_lower_i
+
+    # --- Trace target matrices ---
+    base_mats = [sc['q3s'], sc['q2s'], sc['q1s']]
+    jac_mats = []
+    for k in range(n_theta_st):
+        jac_mats.extend([
+            jac_sc['q3s'][..., k], jac_sc['q2s'][..., k], jac_sc['q1s'][..., k],
+        ])
+    all_mats = jnp.stack(base_mats + jac_mats, axis=0)
+    n_mats = all_mats.shape[0]
+
+    # --- 2. Last block (i = nt-1) ---
+    L_last, _ = _reconstruct_L(nt - 1)
+    L_inv_last = jax.scipy.linalg.solve_triangular(L_last, eye_ns, lower=True)
+    sd_last = L_inv_last.T @ L_inv_last
+
+    tr_d_last = jnp.einsum('ij,sji->s', sd_last, all_mats)
+    mw_last = jnp.tile(
+        jnp.array([m0_d[nt - 1], m1_d[nt - 1], m2_d[nt - 1]], dtype=dtype),
+        1 + n_theta_st)
+    acc_d = mw_last * tr_d_last
+    acc_l = jnp.zeros(n_mats, dtype=dtype)
+
+    # --- 3. Backward BT selected inversion + trace accumulation ---
+    def bwd_body(i_rev, carry):
+        sd_prev, acc_d_, acc_l_ = carry
+        i = nt - 2 - i_rev
+
+        L_i, L_lower_i = _reconstruct_L(i)
+        L_inv_i = jax.scipy.linalg.solve_triangular(L_i, eye_ns, lower=True)
+
+        sl_i = -sd_prev @ L_lower_i @ L_inv_i
+        sd_i = (L_inv_i.T - sl_i.T @ L_lower_i) @ L_inv_i
+
+        tr_d = jnp.einsum('ij,sji->s', sd_i, all_mats)
+        mw_d = jnp.tile(
+            jnp.array([m0_d[i], m1_d[i], m2_d[i]], dtype=dtype), 1 + n_theta_st)
+        acc_d_ = acc_d_ + mw_d * tr_d
+
+        tr_l = jnp.einsum('ij,sji->s', sl_i, all_mats)
+        mw_l = jnp.tile(
+            jnp.array([m0_s[i], m1_s[i], m2_s[i]], dtype=dtype), 1 + n_theta_st)
+        acc_l_ = acc_l_ + mw_l * tr_l
+
+        return (sd_i, acc_d_, acc_l_)
+
+    _, acc_d, acc_l = lax.fori_loop(
+        0, nt - 1, bwd_body, (sd_last, acc_d, acc_l))
+
+    # --- 4. Assemble gradient ---
+    jac_scale = jac_sc['scale']
+    jac_exp_gt = jac_sc['exp_gt']
+
+    weighted_diag = acc_d[0] + exp_gt * acc_d[1] + exp_gt**2 * acc_d[2]
+    weighted_lower = acc_l[0] + exp_gt * acc_l[1] + exp_gt**2 * acc_l[2]
+
+    grad_st = jnp.zeros(n_theta_st, dtype=dtype)
+    for k in range(n_theta_st):
+        term_scale = jac_scale[k] * (weighted_diag + weighted_lower)
+
+        off = 3 + 3 * k
+        term_spatial_diag = scale * (
+            acc_d[off] + exp_gt * acc_d[off + 1] + exp_gt**2 * acc_d[off + 2])
+        term_spatial_lower = scale * (
+            acc_l[off] + exp_gt * acc_l[off + 1] + exp_gt**2 * acc_l[off + 2])
+
+        term_exp_gt_diag = scale * jac_exp_gt[k] * (
+            acc_d[1] + 2.0 * exp_gt * acc_d[2])
+        term_exp_gt_lower = scale * jac_exp_gt[k] * (
+            acc_l[1] + 2.0 * exp_gt * acc_l[2])
+
+        grad_st = grad_st.at[k].set(
+            term_scale + term_spatial_diag + term_spatial_lower
+            + term_exp_gt_diag + term_exp_gt_lower
+        )
+
+    return grad_st
+
+
+def _spatial_traces(S_diag, S_lower, sc, nt):
+    """Compute traces tr(Sigma_block @ spatial_matrix) for all blocks.
+
+    For diagonal blocks:
+        tr_diag[i, j] = tr(S_diag[i] @ Sj)  for Sj in {q3s, q2s, q1s}
+
+    For lower-diagonal blocks:
+        tr_lower[i, j] = tr(S_lower[i] @ Sj)
+
+    Parameters
+    ----------
+    S_diag : (nt, ns, ns)
+    S_lower : (nt-1, ns, ns)
+    sc : dict from precompute_spatial_components
+    nt : int
+
+    Returns
+    -------
+    tr_diag : (nt, 3)  traces with [q3s, q2s, q1s]
+    tr_lower : (nt-1, 3)
+    """
+    spatial_mats = jnp.stack([sc['q3s'], sc['q2s'], sc['q1s']], axis=0)  # (3, ns, ns)
+
+    # tr(A @ B) = sum(A * B^T) = einsum('ij,ji->')
+    # Vectorized over blocks and spatial matrices:
+    # S_diag: (nt, ns, ns), spatial_mats: (3, ns, ns)
+    tr_diag = jnp.einsum('bij,sji->bs', S_diag, spatial_mats)  # (nt, 3)
+    tr_lower = jnp.einsum('bij,sji->bs', S_lower, spatial_mats)  # (nt-1, 3)
+
+    return tr_diag, tr_lower
+
+
+def _compute_grad_logdet_cond(
+    S_diag, S_lower, S_arrow, S_tip,
+    sc, jac_sc,
+    nt, ns, n_fe, n_theta_st,
+    likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip,
+):
+    """Compute ∂(logdet Q_cond)/∂θ_st and ∂(logdet Q_cond)/∂θ_lik analytically.
+
+    Uses the identity: ∂(logdet Q)/∂θ = tr(Q^{-1} ∂Q/∂θ) = tr(Σ ∂Q/∂θ).
+
+    For θ_st: ∂Q_cond/∂θ_st = ∂Q_st/∂θ_st (likelihood term doesn't depend on θ_st).
+    For θ_lik: ∂Q_cond/∂θ_lik = lik_prec * AtA.
+
+    Parameters
+    ----------
+    S_diag, S_lower, S_arrow, S_tip : Sigma factors from selected inversion.
+    sc : dict from precompute_spatial_components.
+    jac_sc : dict of Jacobians of sc w.r.t. theta_st (each value has leading dim n_theta_st).
+    nt, ns, n_fe, n_theta_st : int
+    likelihood_prec : scalar
+    ata_* : sparse COO data for AtA blocks.
+    ata_tip : (n_fe, n_fe) dense AtA tip.
+
+    Returns
+    -------
+    grad_st : (n_theta_st,) gradient w.r.t. theta_st
+    grad_lik : scalar gradient w.r.t. theta_lik
+    """
+    # --- Gradient w.r.t. theta_st ---
+    # Q_st_diag[i] = scale * (m0_d[i]*q3s + exp_gt*m1_d[i]*q2s + exp_gt^2*m2_d[i]*q1s)
+    # ∂Q_st_diag[i]/∂θ_k = d_scale_k * (...) + scale * (m0_d[i]*d_q3s_k + d_exp_gt_k*m1_d[i]*q2s + ...)
+    # tr(Σ_diag[i] @ ∂Q_st_diag[i]/∂θ_k) can be reduced to sums of precomputed spatial traces.
+
+    tr_diag, tr_lower = _spatial_traces(S_diag, S_lower, sc, nt)
+    # tr_diag[:, 0] = tr(S_diag[i] @ q3s), [:, 1] = ... @ q2s, [:, 2] = ... @ q1s
+
+    scale = sc['scale']
+    exp_gt = sc['exp_gt']
+    m0_d = sc['m0_diag']
+    m1_d = sc['m1_diag']
+    m2_d = sc['m2_diag']
+    m0_s = sc['m0_subdiag']
+    m1_s = sc['m1_subdiag']
+    m2_s = sc['m2_subdiag']
+
+    # Temporal coefficients for diagonal blocks (nt,)
+    coeff_q3s_diag = m0_d                          # coefficient of q3s in diag block
+    coeff_q2s_diag = exp_gt * m1_d                  # coefficient of q2s
+    coeff_q1s_diag = exp_gt**2 * m2_d               # coefficient of q1s
+
+    # For lower blocks (nt-1,)
+    coeff_q3s_lower = m0_s
+    coeff_q2s_lower = exp_gt * m1_s
+    coeff_q1s_lower = exp_gt**2 * m2_s
+
+    # Weighted spatial traces: sum over blocks of temporal_coeff[i] * tr_spatial[i, j]
+    # This gives tr(Σ @ scale * temporal_term_j) for each spatial matrix j
+    # diag_contrib[j] = sum_i coeff_j_diag[i] * tr_diag[i, j]
+    weighted_diag = (
+        jnp.sum(coeff_q3s_diag * tr_diag[:, 0])
+        + jnp.sum(coeff_q2s_diag * tr_diag[:, 1])
+        + jnp.sum(coeff_q1s_diag * tr_diag[:, 2])
+    )
+    weighted_lower = (
+        jnp.sum(coeff_q3s_lower * tr_lower[:, 0])
+        + jnp.sum(coeff_q2s_lower * tr_lower[:, 1])
+        + jnp.sum(coeff_q1s_lower * tr_lower[:, 2])
+    )
+
+    # Jacobians of spatial components w.r.t. theta_st.
+    # jacfwd puts the input dimension last: q3s has shape (ns, ns, n_theta_st), etc.
+    jac_q3s = jac_sc['q3s']   # (ns, ns, n_theta_st)
+    jac_q2s = jac_sc['q2s']
+    jac_q1s = jac_sc['q1s']
+    jac_scale = jac_sc['scale']   # (n_theta_st,)
+    jac_exp_gt = jac_sc['exp_gt']  # (n_theta_st,)
+
+    grad_st = jnp.zeros(n_theta_st, dtype=S_diag.dtype)
+
+    for k in range(n_theta_st):
+        dq3s_k = jac_q3s[..., k]  # (ns, ns)
+        dq2s_k = jac_q2s[..., k]
+        dq1s_k = jac_q1s[..., k]
+
+        # Term 1: d_scale[k] * (original sum of traces)
+        term_scale = jac_scale[k] * (weighted_diag + weighted_lower)
+
+        # Term 2: scale * traces with Jacobian spatial matrices
+        tr_S_dq3s = jnp.einsum('bij,ji->b', S_diag, dq3s_k)  # (nt,)
+        tr_S_dq2s = jnp.einsum('bij,ji->b', S_diag, dq2s_k)
+        tr_S_dq1s = jnp.einsum('bij,ji->b', S_diag, dq1s_k)
+
+        tr_Sl_dq3s = jnp.einsum('bij,ji->b', S_lower, dq3s_k)  # (nt-1,)
+        tr_Sl_dq2s = jnp.einsum('bij,ji->b', S_lower, dq2s_k)
+        tr_Sl_dq1s = jnp.einsum('bij,ji->b', S_lower, dq1s_k)
+
+        term_spatial_diag = scale * (
+            jnp.sum(m0_d * tr_S_dq3s)
+            + exp_gt * jnp.sum(m1_d * tr_S_dq2s)
+            + exp_gt**2 * jnp.sum(m2_d * tr_S_dq1s)
+        )
+        term_spatial_lower = scale * (
+            jnp.sum(m0_s * tr_Sl_dq3s)
+            + exp_gt * jnp.sum(m1_s * tr_Sl_dq2s)
+            + exp_gt**2 * jnp.sum(m2_s * tr_Sl_dq1s)
+        )
+
+        # Term 3: exp_gt derivative contributions
+        term_exp_gt_diag = scale * jac_exp_gt[k] * (
+            jnp.sum(m1_d * tr_diag[:, 1])
+            + 2.0 * exp_gt * jnp.sum(m2_d * tr_diag[:, 2])
+        )
+        term_exp_gt_lower = scale * jac_exp_gt[k] * (
+            jnp.sum(m1_s * tr_lower[:, 1])
+            + 2.0 * exp_gt * jnp.sum(m2_s * tr_lower[:, 2])
+        )
+
+        grad_st = grad_st.at[k].set(
+            term_scale + term_spatial_diag + term_spatial_lower
+            + term_exp_gt_diag + term_exp_gt_lower
+        )
+
+    # --- Gradient w.r.t. theta_lik ---
+    # ∂Q_cond/∂θ_lik = lik_prec * AtA (since Q_cond = Q_st + lik_prec * AtA)
+    # tr(Σ @ lik_prec * AtA) = lik_prec * tr(Σ @ AtA)
+    # Compute sparse trace using COO data:
+    # tr(Σ_diag[i] @ AtA_diag[i]) = sum_j Σ_diag[i, rows[i,j], cols[i,j]] * vals[i,j]
+    n_blocks_diag = ata_diag_rows.shape[0]
+    block_idx_d = jnp.arange(n_blocks_diag)[:, None]
+    sparse_tr_diag = jnp.sum(S_diag[block_idx_d, ata_diag_rows, ata_diag_cols] * ata_diag_vals)
+
+    n_blocks_lower = ata_lower_rows.shape[0]
+    block_idx_l = jnp.arange(n_blocks_lower)[:, None]
+    sparse_tr_lower = jnp.sum(S_lower[block_idx_l, ata_lower_rows, ata_lower_cols] * ata_lower_vals)
+
+    n_blocks_arrow = ata_arrow_rows.shape[0]
+    block_idx_a = jnp.arange(n_blocks_arrow)[:, None]
+    sparse_tr_arrow = jnp.sum(S_arrow[block_idx_a, ata_arrow_rows, ata_arrow_cols] * ata_arrow_vals)
+
+    sparse_tr_tip = jnp.sum(S_tip * ata_tip)
+
+    # Lower blocks contribute twice (symmetry: tr(Σ @ Q) counts both off-diag blocks)
+    grad_lik = likelihood_prec * (sparse_tr_diag + 2.0 * sparse_tr_lower + 2.0 * sparse_tr_arrow + sparse_tr_tip)
+
+    return grad_st, grad_lik
+
+
+def _compute_grad_quad(
+    x, sc, jac_sc,
+    nt, ns, n_fe, n_theta_st,
+    rhs, likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip,
+):
+    """Compute total derivative of quad = rhs^T Q_cond^{-1} rhs w.r.t. theta.
+
+    Since x = Q_cond^{-1} rhs and quad = x^T Q_cond x = rhs^T Q_cond^{-1} rhs:
+    - d(quad)/d(θ_st[k]) = -x^T (∂Q_st/∂θ_st[k]) x
+    - d(quad)/d(θ_lik) = 2 x^T rhs - lik_prec * x^T AtA x
+
+    Parameters
+    ----------
+    x : (nt*ns + n_fe,) solution vector
+    sc, jac_sc : spatial components and their Jacobians
+    nt, ns, n_fe, n_theta_st : int
+    rhs : (nt*ns + n_fe,) right-hand side vector
+    likelihood_prec : scalar
+    ata_* : sparse COO data
+
+    Returns
+    -------
+    grad_st : (n_theta_st,) gradient w.r.t. theta_st
+    grad_lik : scalar gradient w.r.t. theta_lik
+    """
+    x_st = x[:nt * ns].reshape(nt, ns)  # (nt, ns)
+
+    scale = sc['scale']
+    exp_gt = sc['exp_gt']
+    m0_d = sc['m0_diag']
+    m1_d = sc['m1_diag']
+    m2_d = sc['m2_diag']
+    m0_s = sc['m0_subdiag']
+    m1_s = sc['m1_subdiag']
+    m2_s = sc['m2_subdiag']
+
+    # Precompute x^T S_j x for each spatial matrix, for each block
+    spatial_mats = jnp.stack([sc['q3s'], sc['q2s'], sc['q1s']], axis=0)  # (3, ns, ns)
+    # x_st[i]^T @ S_j @ x_st[i] = einsum('j,jk,k->', x_st[i], S_j, x_st[i])
+    # Vectorized: (nt, 3)
+    xSx_diag = jnp.einsum('bi,sij,bj->bs', x_st, spatial_mats, x_st)  # (nt, 3)
+
+    # Lower blocks: x_st[i+1]^T @ S_j @ x_st[i]
+    xSx_lower = jnp.einsum('bi,sij,bj->bs', x_st[1:], spatial_mats, x_st[:-1])  # (nt-1, 3)
+
+    # jacfwd puts input dim last: q3s is (ns, ns, n_theta_st)
+    jac_q3s = jac_sc['q3s']   # (ns, ns, n_theta_st)
+    jac_q2s = jac_sc['q2s']
+    jac_q1s = jac_sc['q1s']
+    jac_scale = jac_sc['scale']   # (n_theta_st,)
+    jac_exp_gt = jac_sc['exp_gt']  # (n_theta_st,)
+
+    coeff_q3s_diag = m0_d
+    coeff_q2s_diag = exp_gt * m1_d
+    coeff_q1s_diag = exp_gt**2 * m2_d
+    coeff_q3s_lower = m0_s
+    coeff_q2s_lower = exp_gt * m1_s
+    coeff_q1s_lower = exp_gt**2 * m2_s
+
+    weighted_diag = (
+        jnp.sum(coeff_q3s_diag * xSx_diag[:, 0])
+        + jnp.sum(coeff_q2s_diag * xSx_diag[:, 1])
+        + jnp.sum(coeff_q1s_diag * xSx_diag[:, 2])
+    )
+    weighted_lower = (
+        jnp.sum(coeff_q3s_lower * xSx_lower[:, 0])
+        + jnp.sum(coeff_q2s_lower * xSx_lower[:, 1])
+        + jnp.sum(coeff_q1s_lower * xSx_lower[:, 2])
+    )
+
+    grad_st = jnp.zeros(n_theta_st, dtype=x.dtype)
+
+    for k in range(n_theta_st):
+        dq3s_k = jac_q3s[..., k]  # (ns, ns)
+        dq2s_k = jac_q2s[..., k]
+        dq1s_k = jac_q1s[..., k]
+
+        # Term 1: d_scale[k] contribution
+        term_scale = jac_scale[k] * (weighted_diag + 2.0 * weighted_lower)
+
+        # Term 2: Jacobians of spatial matrices
+        xDqx_diag_q3 = jnp.einsum('bi,ij,bj->b', x_st, dq3s_k, x_st)  # (nt,)
+        xDqx_diag_q2 = jnp.einsum('bi,ij,bj->b', x_st, dq2s_k, x_st)
+        xDqx_diag_q1 = jnp.einsum('bi,ij,bj->b', x_st, dq1s_k, x_st)
+
+        xDqx_lower_q3 = jnp.einsum('bi,ij,bj->b', x_st[1:], dq3s_k, x_st[:-1])  # (nt-1,)
+        xDqx_lower_q2 = jnp.einsum('bi,ij,bj->b', x_st[1:], dq2s_k, x_st[:-1])
+        xDqx_lower_q1 = jnp.einsum('bi,ij,bj->b', x_st[1:], dq1s_k, x_st[:-1])
+
+        term_spatial_diag = scale * (
+            jnp.sum(m0_d * xDqx_diag_q3)
+            + exp_gt * jnp.sum(m1_d * xDqx_diag_q2)
+            + exp_gt**2 * jnp.sum(m2_d * xDqx_diag_q1)
+        )
+        term_spatial_lower = 2.0 * scale * (
+            jnp.sum(m0_s * xDqx_lower_q3)
+            + exp_gt * jnp.sum(m1_s * xDqx_lower_q2)
+            + exp_gt**2 * jnp.sum(m2_s * xDqx_lower_q1)
+        )
+
+        # Term 3: exp_gt derivative
+        term_exp_gt_diag = scale * jac_exp_gt[k] * (
+            jnp.sum(m1_d * xSx_diag[:, 1])
+            + 2.0 * exp_gt * jnp.sum(m2_d * xSx_diag[:, 2])
+        )
+        term_exp_gt_lower = 2.0 * scale * jac_exp_gt[k] * (
+            jnp.sum(m1_s * xSx_lower[:, 1])
+            + 2.0 * exp_gt * jnp.sum(m2_s * xSx_lower[:, 2])
+        )
+
+        grad_st = grad_st.at[k].set(
+            term_scale + term_spatial_diag + term_spatial_lower
+            + term_exp_gt_diag + term_exp_gt_lower
+        )
+
+    # Negate: total derivative is -x^T (dQ_st/dtheta_st) x
+    grad_st = -grad_st
+
+    # --- Gradient w.r.t. theta_lik ---
+    # d(quad)/d(theta_lik) = 2*x^T*rhs - lik_prec * x^T*AtA*x
+    # Compute x^T AtA x using sparse COO data.
+    x_fe = x[nt * ns:]
+
+    n_blocks_diag = ata_diag_rows.shape[0]
+    block_idx_d = jnp.arange(n_blocks_diag)[:, None]
+    xAtAx_diag = jnp.sum(x_st[block_idx_d, ata_diag_rows] * ata_diag_vals * x_st[block_idx_d, ata_diag_cols])
+
+    n_blocks_lower = ata_lower_rows.shape[0]
+    block_idx_l = jnp.arange(n_blocks_lower)[:, None]
+    xAtAx_lower = jnp.sum(x_st[1:][block_idx_l, ata_lower_rows] * ata_lower_vals * x_st[:-1][block_idx_l, ata_lower_cols])
+
+    n_blocks_arrow = ata_arrow_rows.shape[0]
+    block_idx_a = jnp.arange(n_blocks_arrow)[:, None]
+    xAtAx_arrow = jnp.sum(x_fe[ata_arrow_rows] * ata_arrow_vals * x_st[block_idx_a, ata_arrow_cols])
+
+    xAtAx_tip = x_fe @ ata_tip @ x_fe
+
+    xAtAx = xAtAx_diag + 2.0 * xAtAx_lower + 2.0 * xAtAx_arrow + xAtAx_tip
+
+    grad_lik = 2.0 * jnp.dot(x, rhs) - likelihood_prec * xAtAx
+
+    return grad_st, grad_lik
+
+
+def selected_inversion_grads_jax(
+    L_diag, L_lower, L_arrow, L_tip,
+    sc, jac_sc,
+    nt, ns, n_fe, n_theta_st,
+    likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip,
+):
+    """Fused selected inversion + logdet-gradient accumulation.
+
+    Combines :func:`pobtasi_jax` and :func:`_compute_grad_logdet_cond`
+    into a single backward sweep so that only **one block** of Sigma is
+    live at a time.  This reduces peak memory from
+    ``L (64 GiB) + S (64 GiB) = 128 GiB`` to
+    ``L (64 GiB) + one S block (~128 MB) = ~64 GiB``.
+
+    Parameters
+    ----------
+    L_diag : (nt, ns, ns)
+    L_lower : (nt-1, ns, ns)
+    L_arrow : (nt, n_fe, ns)
+    L_tip : (n_fe, n_fe)
+    sc : dict from :func:`precompute_spatial_components`
+    jac_sc : dict of Jacobians (from ``jax.jacfwd``, input dim last)
+    nt, ns, n_fe, n_theta_st : int
+    likelihood_prec : scalar
+    ata_* : sparse COO data for AtA blocks
+    ata_tip : (n_fe, n_fe)
+
+    Returns
+    -------
+    grad_st : (n_theta_st,)
+        d(logdet Q_cond) / d(theta_st)
+    grad_lik : scalar
+        d(logdet Q_cond) / d(theta_lik)
+    """
+    dtype = L_diag.dtype
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+
+    scale = sc['scale']
+    exp_gt = sc['exp_gt']
+    m0_d = sc['m0_diag']
+    m1_d = sc['m1_diag']
+    m2_d = sc['m2_diag']
+    m0_s = sc['m0_subdiag']
+    m1_s = sc['m1_subdiag']
+    m2_s = sc['m2_subdiag']
+
+    # Build trace-target matrix stack: (n_mats, ns, ns)
+    # Layout: [q3s, q2s, q1s, dq3s_0, dq2s_0, dq1s_0, dq3s_1, ..., dq1s_2]
+    base_mats = [sc['q3s'], sc['q2s'], sc['q1s']]
+    jac_mats = []
+    for k in range(n_theta_st):
+        jac_mats.extend([
+            jac_sc['q3s'][..., k],
+            jac_sc['q2s'][..., k],
+            jac_sc['q1s'][..., k],
+        ])
+    all_mats = jnp.stack(base_mats + jac_mats, axis=0)  # (3 + 3*n_theta_st, ns, ns)
+    n_mats = all_mats.shape[0]
+
+    # --- S_tip ---
+    L_tip_inv = jax.scipy.linalg.solve_triangular(L_tip, eye_nfe, lower=True)
+    S_tip = L_tip_inv.T @ L_tip_inv
+
+    # --- Last block (i = nt-1) ---
+    L_blk_inv = jax.scipy.linalg.solve_triangular(
+        L_diag[nt - 1], eye_ns, lower=True
+    )
+    sa_last = -S_tip @ L_arrow[nt - 1] @ L_blk_inv
+    sd_last = (L_blk_inv.T - sa_last.T @ L_arrow[nt - 1]) @ L_blk_inv
+
+    # Accumulate traces from last diagonal block
+    traces_d = jnp.einsum('ij,sji->s', sd_last, all_mats)
+    m_wt = jnp.tile(jnp.array([m0_d[nt - 1], m1_d[nt - 1], m2_d[nt - 1]], dtype=dtype),
+                     1 + n_theta_st)
+    acc_d = m_wt * traces_d
+
+    # No lower block for last position
+    acc_l = jnp.zeros(n_mats, dtype=dtype)
+
+    # Sparse traces from last block
+    sp_d = jnp.sum(sd_last[ata_diag_rows[nt - 1], ata_diag_cols[nt - 1]]
+                   * ata_diag_vals[nt - 1])
+    sp_l = jnp.array(0.0, dtype=dtype)
+    sp_a = jnp.sum(sa_last[ata_arrow_rows[nt - 1], ata_arrow_cols[nt - 1]]
+                   * ata_arrow_vals[nt - 1])
+
+    # --- Backward loop ---
+    def body_fn(i_rev, carry):
+        sd_prev, sa_prev, acc_d_, acc_l_, sp_d_, sp_l_, sp_a_ = carry
+        i = nt - 2 - i_rev
+
+        Li = L_diag[i]
+        L_blk_inv_i = jax.scipy.linalg.solve_triangular(Li, eye_ns, lower=True)
+
+        sl_i = (-sd_prev @ L_lower[i] - sa_prev.T @ L_arrow[i]) @ L_blk_inv_i
+        sa_i = (-sa_prev @ L_lower[i] - S_tip @ L_arrow[i]) @ L_blk_inv_i
+        sd_i = (L_blk_inv_i.T - sl_i.T @ L_lower[i] - sa_i.T @ L_arrow[i]) @ L_blk_inv_i
+
+        # Diagonal traces
+        tr_d = jnp.einsum('ij,sji->s', sd_i, all_mats)
+        mw_d = jnp.tile(jnp.array([m0_d[i], m1_d[i], m2_d[i]], dtype=dtype),
+                         1 + n_theta_st)
+        acc_d_ = acc_d_ + mw_d * tr_d
+
+        # Lower traces
+        tr_l = jnp.einsum('ij,sji->s', sl_i, all_mats)
+        mw_l = jnp.tile(jnp.array([m0_s[i], m1_s[i], m2_s[i]], dtype=dtype),
+                         1 + n_theta_st)
+        acc_l_ = acc_l_ + mw_l * tr_l
+
+        # Sparse COO traces
+        sp_d_ = sp_d_ + jnp.sum(
+            sd_i[ata_diag_rows[i], ata_diag_cols[i]] * ata_diag_vals[i])
+        sp_l_ = sp_l_ + jnp.sum(
+            sl_i[ata_lower_rows[i], ata_lower_cols[i]] * ata_lower_vals[i])
+        sp_a_ = sp_a_ + jnp.sum(
+            sa_i[ata_arrow_rows[i], ata_arrow_cols[i]] * ata_arrow_vals[i])
+
+        return (sd_i, sa_i, acc_d_, acc_l_, sp_d_, sp_l_, sp_a_)
+
+    init_carry = (sd_last, sa_last, acc_d, acc_l, sp_d, sp_l, sp_a)
+    _, _, acc_d, acc_l, sp_d, sp_l, sp_a = lax.fori_loop(
+        0, nt - 1, body_fn, init_carry
+    )
+
+    # --- Assemble grad_st ---
+    jac_scale = jac_sc['scale']    # (n_theta_st,)
+    jac_exp_gt = jac_sc['exp_gt']  # (n_theta_st,)
+
+    weighted_diag = acc_d[0] + exp_gt * acc_d[1] + exp_gt**2 * acc_d[2]
+    weighted_lower = acc_l[0] + exp_gt * acc_l[1] + exp_gt**2 * acc_l[2]
+
+    grad_st = jnp.zeros(n_theta_st, dtype=dtype)
+    for k in range(n_theta_st):
+        term_scale = jac_scale[k] * (weighted_diag + weighted_lower)
+
+        off = 3 + 3 * k
+        term_spatial_diag = scale * (
+            acc_d[off] + exp_gt * acc_d[off + 1] + exp_gt**2 * acc_d[off + 2])
+        term_spatial_lower = scale * (
+            acc_l[off] + exp_gt * acc_l[off + 1] + exp_gt**2 * acc_l[off + 2])
+
+        term_exp_gt_diag = scale * jac_exp_gt[k] * (
+            acc_d[1] + 2.0 * exp_gt * acc_d[2])
+        term_exp_gt_lower = scale * jac_exp_gt[k] * (
+            acc_l[1] + 2.0 * exp_gt * acc_l[2])
+
+        grad_st = grad_st.at[k].set(
+            term_scale + term_spatial_diag + term_spatial_lower
+            + term_exp_gt_diag + term_exp_gt_lower
+        )
+
+    # --- Assemble grad_lik ---
+    sp_tip = jnp.sum(S_tip * ata_tip)
+    grad_lik = likelihood_prec * (sp_d + 2.0 * sp_l + 2.0 * sp_a + sp_tip)
+
+    return grad_st, grad_lik
+
+
+def lazy_bta_cholesky_carries(
+    spatial_comp, nt, ns, n_fe, fe_prec, likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip, dtype,
+):
+    """BTA Cholesky storing carries instead of L factor blocks.
+
+    Same computation as :func:`lazy_bta_cholesky` but outputs the scan
+    carries ``(cond_schur, arrow_schur)`` entering each step instead of
+    the L factor blocks ``(L_diag, L_lower, L_arrow)``.  This reduces
+    scan output storage from ~64 GiB to ~32 GiB for gst_large.
+
+    L blocks can be reconstructed on-the-fly from stored carries via
+    :func:`selected_inversion_grads_from_carries_jax`.
+
+    Parameters
+    ----------
+    spatial_comp : dict
+        Output of :func:`precompute_spatial_components`.
+    nt, ns, n_fe : int
+    fe_prec : float
+    likelihood_prec : scalar
+    ata_diag_rows, ata_diag_cols, ata_diag_vals : jnp.ndarray
+        Sparse COO for diagonal AtA blocks, shape (nt, max_nnz).
+    ata_lower_rows, ata_lower_cols, ata_lower_vals : jnp.ndarray
+        Sparse COO for lower-diagonal AtA blocks, shape (nt-1, max_nnz).
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals : jnp.ndarray
+        Sparse COO for arrow AtA blocks, shape (nt, max_nnz).
+    ata_tip : jnp.ndarray
+        Arrow tip AtA block, shape (n_fe, n_fe).
+    dtype : jnp.dtype
+
+    Returns
+    -------
+    stored_cond_schurs : (nt, ns, ns)
+        Schur complement entering each step (subtracted from diagonal).
+    stored_arrow_schurs : (nt, n_fe, ns)
+        Arrow Schur complement entering each step.
+    L_tip : (n_fe, n_fe)
+        Arrow tip Cholesky factor.
+    logdet_Q_cond : scalar
+    """
+    eps = jnp.finfo(dtype).eps
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+
+    m0_sub_pad = jnp.concatenate([spatial_comp['m0_subdiag'], jnp.zeros(1, dtype=dtype)])
+    m1_sub_pad = jnp.concatenate([spatial_comp['m1_subdiag'], jnp.zeros(1, dtype=dtype)])
+    m2_sub_pad = jnp.concatenate([spatial_comp['m2_subdiag'], jnp.zeros(1, dtype=dtype)])
+
+    ata_lower_rows_pad = jnp.concatenate([
+        ata_lower_rows, jnp.zeros((1, ata_lower_rows.shape[1]), dtype=jnp.int32)
+    ], axis=0)
+    ata_lower_cols_pad = jnp.concatenate([
+        ata_lower_cols, jnp.zeros((1, ata_lower_cols.shape[1]), dtype=jnp.int32)
+    ], axis=0)
+    ata_lower_vals_pad = jnp.concatenate([
+        ata_lower_vals, jnp.zeros((1, ata_lower_vals.shape[1]), dtype=dtype)
+    ], axis=0)
+
+    sc_padded = {**spatial_comp,
+                 'm0_subdiag': m0_sub_pad,
+                 'm1_subdiag': m1_sub_pad,
+                 'm2_subdiag': m2_sub_pad}
+
+    def scan_body(carry, inputs):
+        (cond_schur, arrow_tip_acc, arrow_schur, logdet_cond) = carry
+        i, d_rows, d_cols, d_vals, l_rows, l_cols, l_vals, a_rows, a_cols, a_vals = inputs
+
+        saved = (cond_schur, arrow_schur)
+
+        q_cond_diag_i = _reconstruct_diag_block(sc_padded, i)
+        q_cond_diag_i = q_cond_diag_i.at[d_rows, d_cols].add(likelihood_prec * d_vals)
+        q_cond_diag_i = q_cond_diag_i + eps_reg * eye_ns - cond_schur
+
+        L_i = _jax_cholesky(q_cond_diag_i)
+        cond_diag_vals = jnp.diag(L_i)
+        safe_cond = jnp.maximum(cond_diag_vals, eps)
+        logdet_cond = logdet_cond + 2.0 * jnp.sum(jnp.log(safe_cond))
+
+        q_cond_lower_i = _reconstruct_lower_block(sc_padded, i)
+        q_cond_lower_i = q_cond_lower_i.at[l_rows, l_cols].add(likelihood_prec * l_vals)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_cond_lower_i.T, lower=True
+        ).T
+
+        q_arrow_i = jnp.zeros((n_fe, ns), dtype=dtype)
+        q_arrow_i = q_arrow_i.at[a_rows, a_cols].add(likelihood_prec * a_vals)
+        q_arrow_i = q_arrow_i - arrow_schur
+        L_arrow_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_arrow_i.T, lower=True
+        ).T
+
+        new_cond_schur = L_lower_i @ L_lower_i.T
+        new_arrow_schur = L_arrow_i @ L_lower_i.T
+        new_arrow_tip_acc = arrow_tip_acc - L_arrow_i @ L_arrow_i.T
+
+        new_cond_schur = jnp.where(i < nt - 1, new_cond_schur, jnp.zeros_like(new_cond_schur))
+        new_arrow_schur = jnp.where(i < nt - 1, new_arrow_schur, jnp.zeros_like(new_arrow_schur))
+
+        new_carry = (new_cond_schur, new_arrow_tip_acc, new_arrow_schur, logdet_cond)
+        return new_carry, saved
+
+    init_carry = (
+        jnp.zeros((ns, ns), dtype=dtype),
+        fe_prec * eye_nfe + likelihood_prec * ata_tip + eps_reg * eye_nfe,
+        jnp.zeros((n_fe, ns), dtype=dtype),
+        jnp.array(0.0, dtype=dtype),
+    )
+
+    scan_inputs = (
+        jnp.arange(nt),
+        ata_diag_rows,
+        ata_diag_cols,
+        ata_diag_vals,
+        ata_lower_rows_pad,
+        ata_lower_cols_pad,
+        ata_lower_vals_pad,
+        ata_arrow_rows,
+        ata_arrow_cols,
+        ata_arrow_vals,
+    )
+
+    (_, arrow_tip_final, _, logdet_cond), \
+        (stored_cond_schurs, stored_arrow_schurs) = lax.scan(
+            scan_body, init_carry, scan_inputs
+        )
+
+    L_tip = _jax_cholesky(arrow_tip_final)
+    tip_diag = jnp.diag(L_tip)
+    safe_tip_diag = jnp.maximum(tip_diag, eps)
+    logdet_Q_cond = logdet_cond + 2.0 * jnp.sum(jnp.log(safe_tip_diag))
+
+    return stored_cond_schurs, stored_arrow_schurs, L_tip, logdet_Q_cond
+
+
+def fused_cholesky_fwd_sub(
+    spatial_comp, nt, ns, n_fe, fe_prec, likelihood_prec,
+    rhs_st, rhs_fe,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip, dtype,
+):
+    """Fused BTA Cholesky + forward substitution in a single scan.
+
+    Combines the Cholesky factorization and forward solve ``L y = rhs``
+    into one :func:`lax.scan`, so L blocks are per-step intermediates
+    that are never stored as scan outputs.  Outputs the Schur complement
+    carries (~32 GiB for gst_large) and forward-sub solutions y_st (~8 MB).
+
+    Parameters
+    ----------
+    spatial_comp : dict
+        Output of :func:`precompute_spatial_components`.
+    nt, ns, n_fe : int
+    fe_prec : float
+    likelihood_prec : scalar
+    rhs_st : (nt, ns)
+        Spatio-temporal portion of the right-hand side.
+    rhs_fe : (n_fe,)
+        Fixed-effects portion of the right-hand side.
+    ata_diag_rows, ata_diag_cols, ata_diag_vals : jnp.ndarray
+        Sparse COO for diagonal AtA blocks, shape (nt, max_nnz).
+    ata_lower_rows, ata_lower_cols, ata_lower_vals : jnp.ndarray
+        Sparse COO for lower-diagonal AtA blocks, shape (nt-1, max_nnz).
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals : jnp.ndarray
+        Sparse COO for arrow AtA blocks, shape (nt, max_nnz).
+    ata_tip : jnp.ndarray
+        Arrow tip AtA block, shape (n_fe, n_fe).
+    dtype : jnp.dtype
+
+    Returns
+    -------
+    stored_cond_schurs : (nt, ns, ns)
+    stored_arrow_schurs : (nt, n_fe, ns)
+    y_st : (nt, ns)
+        Forward substitution result for spatio-temporal blocks.
+    L_tip : (n_fe, n_fe)
+    arrow_rhs_acc : (n_fe,)
+        Modified arrow rhs: ``rhs_fe - sum_i L_arrow[i] @ y_i``.
+    logdet_Q_cond : scalar
+    """
+    eps = jnp.finfo(dtype).eps
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+
+    m0_sub_pad = jnp.concatenate([spatial_comp['m0_subdiag'], jnp.zeros(1, dtype=dtype)])
+    m1_sub_pad = jnp.concatenate([spatial_comp['m1_subdiag'], jnp.zeros(1, dtype=dtype)])
+    m2_sub_pad = jnp.concatenate([spatial_comp['m2_subdiag'], jnp.zeros(1, dtype=dtype)])
+
+    ata_lower_rows_pad = jnp.concatenate([
+        ata_lower_rows, jnp.zeros((1, ata_lower_rows.shape[1]), dtype=jnp.int32)
+    ], axis=0)
+    ata_lower_cols_pad = jnp.concatenate([
+        ata_lower_cols, jnp.zeros((1, ata_lower_cols.shape[1]), dtype=jnp.int32)
+    ], axis=0)
+    ata_lower_vals_pad = jnp.concatenate([
+        ata_lower_vals, jnp.zeros((1, ata_lower_vals.shape[1]), dtype=dtype)
+    ], axis=0)
+
+    sc_padded = {**spatial_comp,
+                 'm0_subdiag': m0_sub_pad,
+                 'm1_subdiag': m1_sub_pad,
+                 'm2_subdiag': m2_sub_pad}
+
+    def scan_body(carry, inputs):
+        (cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
+         prev_lower_y, arrow_rhs_acc) = carry
+        (i, rhs_i, d_rows, d_cols, d_vals,
+         l_rows, l_cols, l_vals, a_rows, a_cols, a_vals) = inputs
+
+        saved_carries = (cond_schur, arrow_schur)
+
+        # --- Cholesky step ---
+        q_cond_diag_i = _reconstruct_diag_block(sc_padded, i)
+        q_cond_diag_i = q_cond_diag_i.at[d_rows, d_cols].add(likelihood_prec * d_vals)
+        q_cond_diag_i = q_cond_diag_i + eps_reg * eye_ns - cond_schur
+
+        L_i = _jax_cholesky(q_cond_diag_i)
+        cond_diag_vals = jnp.diag(L_i)
+        safe_cond = jnp.maximum(cond_diag_vals, eps)
+        logdet_cond = logdet_cond + 2.0 * jnp.sum(jnp.log(safe_cond))
+
+        q_cond_lower_i = _reconstruct_lower_block(sc_padded, i)
+        q_cond_lower_i = q_cond_lower_i.at[l_rows, l_cols].add(likelihood_prec * l_vals)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_cond_lower_i.T, lower=True
+        ).T
+
+        q_arrow_i = jnp.zeros((n_fe, ns), dtype=dtype)
+        q_arrow_i = q_arrow_i.at[a_rows, a_cols].add(likelihood_prec * a_vals)
+        q_arrow_i = q_arrow_i - arrow_schur
+        L_arrow_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_arrow_i.T, lower=True
+        ).T
+
+        new_cond_schur = L_lower_i @ L_lower_i.T
+        new_arrow_schur = L_arrow_i @ L_lower_i.T
+        new_arrow_tip_acc = arrow_tip_acc - L_arrow_i @ L_arrow_i.T
+
+        new_cond_schur = jnp.where(i < nt - 1, new_cond_schur, jnp.zeros_like(new_cond_schur))
+        new_arrow_schur = jnp.where(i < nt - 1, new_arrow_schur, jnp.zeros_like(new_arrow_schur))
+
+        # --- Forward substitution step ---
+        modified_rhs_i = rhs_i - prev_lower_y
+        y_i = jax.scipy.linalg.solve_triangular(L_i, modified_rhs_i, lower=True)
+
+        new_prev_lower_y = L_lower_i @ y_i
+        new_prev_lower_y = jnp.where(i < nt - 1, new_prev_lower_y,
+                                     jnp.zeros_like(new_prev_lower_y))
+
+        new_arrow_rhs_acc = arrow_rhs_acc - L_arrow_i @ y_i
+
+        new_carry = (new_cond_schur, new_arrow_tip_acc, new_arrow_schur, logdet_cond,
+                     new_prev_lower_y, new_arrow_rhs_acc)
+        return new_carry, (saved_carries, y_i)
+
+    init_carry = (
+        jnp.zeros((ns, ns), dtype=dtype),
+        fe_prec * eye_nfe + likelihood_prec * ata_tip + eps_reg * eye_nfe,
+        jnp.zeros((n_fe, ns), dtype=dtype),
+        jnp.array(0.0, dtype=dtype),
+        jnp.zeros(ns, dtype=dtype),
+        rhs_fe,
+    )
+
+    scan_inputs = (
+        jnp.arange(nt),
+        rhs_st,
+        ata_diag_rows,
+        ata_diag_cols,
+        ata_diag_vals,
+        ata_lower_rows_pad,
+        ata_lower_cols_pad,
+        ata_lower_vals_pad,
+        ata_arrow_rows,
+        ata_arrow_cols,
+        ata_arrow_vals,
+    )
+
+    (_, arrow_tip_final, _, logdet_cond, _, arrow_rhs_acc), \
+        ((stored_cond_schurs, stored_arrow_schurs), y_st) = lax.scan(
+            scan_body, init_carry, scan_inputs
+        )
+
+    L_tip = _jax_cholesky(arrow_tip_final)
+    tip_diag = jnp.diag(L_tip)
+    safe_tip_diag = jnp.maximum(tip_diag, eps)
+    logdet_Q_cond = logdet_cond + 2.0 * jnp.sum(jnp.log(safe_tip_diag))
+
+    return stored_cond_schurs, stored_arrow_schurs, y_st, L_tip, arrow_rhs_acc, logdet_Q_cond
+
+
+def backward_sub_from_carries(
+    stored_cond_schurs, stored_arrow_schurs, L_tip,
+    y_st, arrow_rhs_acc,
+    sc, likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    nt, ns, n_fe, dtype,
+):
+    """Backward substitution ``L^T x = y``, reconstructing L from carries.
+
+    Performs the backward solve to obtain ``x = Q_cond^{-1} rhs``, where
+    the Cholesky factor L is reconstructed on-the-fly from stored Schur
+    complement carries, avoiding materialization of full L arrays.
+
+    Also computes the quadratic form ``rhs^T Q_cond^{-1} rhs = ||y||^2``.
+
+    Parameters
+    ----------
+    stored_cond_schurs : (nt, ns, ns)
+    stored_arrow_schurs : (nt, n_fe, ns)
+    L_tip : (n_fe, n_fe)
+    y_st : (nt, ns)
+        Forward substitution result for spatio-temporal blocks.
+    arrow_rhs_acc : (n_fe,)
+        Modified arrow rhs: ``rhs_fe - sum_i L_arrow[i] @ y_i``.
+    sc : dict
+        Output of :func:`precompute_spatial_components` (unpadded).
+    likelihood_prec : scalar
+    ata_* : sparse COO data
+    nt, ns, n_fe : int
+    dtype : jnp.dtype
+
+    Returns
+    -------
+    x : (nt * ns + n_fe,)
+    quad : scalar
+    """
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_ns = jnp.eye(ns, dtype=dtype)
+
+    sc_padded = {**sc,
+                 'm0_subdiag': jnp.concatenate([sc['m0_subdiag'], jnp.zeros(1, dtype=dtype)]),
+                 'm1_subdiag': jnp.concatenate([sc['m1_subdiag'], jnp.zeros(1, dtype=dtype)]),
+                 'm2_subdiag': jnp.concatenate([sc['m2_subdiag'], jnp.zeros(1, dtype=dtype)])}
+
+    ata_lower_rows_pad = jnp.concatenate([
+        ata_lower_rows, jnp.zeros((1, ata_lower_rows.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_cols_pad = jnp.concatenate([
+        ata_lower_cols, jnp.zeros((1, ata_lower_cols.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_vals_pad = jnp.concatenate([
+        ata_lower_vals, jnp.zeros((1, ata_lower_vals.shape[1]), dtype=dtype)], axis=0)
+
+    def reconstruct_L(i):
+        q_diag = _reconstruct_diag_block(sc_padded, i)
+        q_diag = q_diag.at[ata_diag_rows[i], ata_diag_cols[i]].add(
+            likelihood_prec * ata_diag_vals[i])
+        q_diag = q_diag + eps_reg * eye_ns - stored_cond_schurs[i]
+        L_i = _jax_cholesky(q_diag)
+
+        q_lower = _reconstruct_lower_block(sc_padded, i)
+        q_lower = q_lower.at[ata_lower_rows_pad[i], ata_lower_cols_pad[i]].add(
+            likelihood_prec * ata_lower_vals_pad[i])
+        L_lower_i = jax.scipy.linalg.solve_triangular(L_i, q_lower.T, lower=True).T
+
+        q_arrow = jnp.zeros((n_fe, ns), dtype=dtype)
+        q_arrow = q_arrow.at[ata_arrow_rows[i], ata_arrow_cols[i]].add(
+            likelihood_prec * ata_arrow_vals[i])
+        q_arrow = q_arrow - stored_arrow_schurs[i]
+        L_arrow_i = jax.scipy.linalg.solve_triangular(L_i, q_arrow.T, lower=True).T
+
+        return L_i, L_lower_i, L_arrow_i
+
+    # Forward sub on tip + quadratic form
+    y_fe = jax.scipy.linalg.solve_triangular(L_tip, arrow_rhs_acc, lower=True)
+    quad = jnp.sum(y_st ** 2) + jnp.sum(y_fe ** 2)
+
+    # Backward sub: L^T x = y
+    x_fe = jax.scipy.linalg.solve_triangular(L_tip.T, y_fe, lower=False)
+
+    L_last, _, L_arrow_last = reconstruct_L(nt - 1)
+    x_last = jax.scipy.linalg.solve_triangular(
+        L_last.T, y_st[nt - 1] - L_arrow_last.T @ x_fe, lower=False
+    )
+
+    x_st = jnp.zeros((nt, ns), dtype=dtype)
+    x_st = x_st.at[nt - 1].set(x_last)
+
+    def body_fn(i_rev, carry):
+        x_st_, x_next = carry
+        i = nt - 2 - i_rev
+
+        L_i, L_lower_i, L_arrow_i = reconstruct_L(i)
+        x_i = jax.scipy.linalg.solve_triangular(
+            L_i.T,
+            y_st[i] - L_lower_i.T @ x_next - L_arrow_i.T @ x_fe,
+            lower=False,
+        )
+        x_st_ = x_st_.at[i].set(x_i)
+        return (x_st_, x_i)
+
+    x_st, _ = lax.fori_loop(0, nt - 1, body_fn, (x_st, x_last))
+
+    x = jnp.concatenate([x_st.reshape(-1), x_fe])
+    return x, quad
+
+
+def selected_inversion_grads_from_carries_jax(
+    stored_cond_schurs, stored_arrow_schurs, L_tip,
+    sc, jac_sc,
+    nt, ns, n_fe, n_theta_st,
+    likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip, dtype,
+):
+    """Fused selected inversion + gradient accumulation from stored carries.
+
+    Like :func:`selected_inversion_grads_jax` but takes scan carries
+    instead of L blocks.  L blocks are reconstructed on-the-fly from
+    ``stored_cond_schurs`` and ``stored_arrow_schurs``, reducing peak
+    memory from ~64 GiB (full L arrays) to ~32 GiB (carries only).
+
+    Parameters
+    ----------
+    stored_cond_schurs : (nt, ns, ns)
+        Schur complement entering each BTA Cholesky step.
+    stored_arrow_schurs : (nt, n_fe, ns)
+        Arrow Schur complement entering each step.
+    L_tip : (n_fe, n_fe)
+        Arrow tip Cholesky factor.
+    sc : dict
+        Output of :func:`precompute_spatial_components` (unpadded).
+    jac_sc : dict
+        Jacobians of sc w.r.t. theta_st (from ``jax.jacfwd``).
+    nt, ns, n_fe, n_theta_st : int
+    likelihood_prec : scalar
+    ata_* : sparse COO data for AtA blocks
+    ata_tip : (n_fe, n_fe)
+    dtype : jnp.dtype
+
+    Returns
+    -------
+    grad_st : (n_theta_st,)
+    grad_lik : scalar
+    """
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+
+    sc_padded = {**sc,
+                 'm0_subdiag': jnp.concatenate([sc['m0_subdiag'], jnp.zeros(1, dtype=dtype)]),
+                 'm1_subdiag': jnp.concatenate([sc['m1_subdiag'], jnp.zeros(1, dtype=dtype)]),
+                 'm2_subdiag': jnp.concatenate([sc['m2_subdiag'], jnp.zeros(1, dtype=dtype)])}
+
+    ata_lower_rows_pad = jnp.concatenate([
+        ata_lower_rows, jnp.zeros((1, ata_lower_rows.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_cols_pad = jnp.concatenate([
+        ata_lower_cols, jnp.zeros((1, ata_lower_cols.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_vals_pad = jnp.concatenate([
+        ata_lower_vals, jnp.zeros((1, ata_lower_vals.shape[1]), dtype=dtype)], axis=0)
+
+    scale = sc['scale']
+    exp_gt = sc['exp_gt']
+    m0_d = sc['m0_diag']
+    m1_d = sc['m1_diag']
+    m2_d = sc['m2_diag']
+    m0_s = sc['m0_subdiag']
+    m1_s = sc['m1_subdiag']
+    m2_s = sc['m2_subdiag']
+
+    base_mats = [sc['q3s'], sc['q2s'], sc['q1s']]
+    jac_mats = []
+    for k in range(n_theta_st):
+        jac_mats.extend([
+            jac_sc['q3s'][..., k],
+            jac_sc['q2s'][..., k],
+            jac_sc['q1s'][..., k],
+        ])
+    all_mats = jnp.stack(base_mats + jac_mats, axis=0)
+    n_mats = all_mats.shape[0]
+
+    def reconstruct_L(i):
+        q_diag = _reconstruct_diag_block(sc_padded, i)
+        q_diag = q_diag.at[ata_diag_rows[i], ata_diag_cols[i]].add(
+            likelihood_prec * ata_diag_vals[i])
+        q_diag = q_diag + eps_reg * eye_ns - stored_cond_schurs[i]
+        L_i = _jax_cholesky(q_diag)
+
+        q_lower = _reconstruct_lower_block(sc_padded, i)
+        q_lower = q_lower.at[ata_lower_rows_pad[i], ata_lower_cols_pad[i]].add(
+            likelihood_prec * ata_lower_vals_pad[i])
+        L_lower_i = jax.scipy.linalg.solve_triangular(L_i, q_lower.T, lower=True).T
+
+        q_arrow = jnp.zeros((n_fe, ns), dtype=dtype)
+        q_arrow = q_arrow.at[ata_arrow_rows[i], ata_arrow_cols[i]].add(
+            likelihood_prec * ata_arrow_vals[i])
+        q_arrow = q_arrow - stored_arrow_schurs[i]
+        L_arrow_i = jax.scipy.linalg.solve_triangular(L_i, q_arrow.T, lower=True).T
+
+        return L_i, L_lower_i, L_arrow_i
+
+    # --- S_tip ---
+    L_tip_inv = jax.scipy.linalg.solve_triangular(L_tip, eye_nfe, lower=True)
+    S_tip = L_tip_inv.T @ L_tip_inv
+
+    # --- Last block (i = nt-1) ---
+    L_last, _, L_arrow_last = reconstruct_L(nt - 1)
+    L_blk_inv = jax.scipy.linalg.solve_triangular(L_last, eye_ns, lower=True)
+    sa_last = -S_tip @ L_arrow_last @ L_blk_inv
+    sd_last = (L_blk_inv.T - sa_last.T @ L_arrow_last) @ L_blk_inv
+
+    traces_d = jnp.einsum('ij,sji->s', sd_last, all_mats)
+    m_wt = jnp.tile(jnp.array([m0_d[nt - 1], m1_d[nt - 1], m2_d[nt - 1]], dtype=dtype),
+                     1 + n_theta_st)
+    acc_d = m_wt * traces_d
+    acc_l = jnp.zeros(n_mats, dtype=dtype)
+
+    sp_d = jnp.sum(sd_last[ata_diag_rows[nt - 1], ata_diag_cols[nt - 1]]
+                   * ata_diag_vals[nt - 1])
+    sp_l = jnp.array(0.0, dtype=dtype)
+    sp_a = jnp.sum(sa_last[ata_arrow_rows[nt - 1], ata_arrow_cols[nt - 1]]
+                   * ata_arrow_vals[nt - 1])
+
+    # --- Backward loop ---
+    def body_fn(i_rev, carry):
+        sd_prev, sa_prev, acc_d_, acc_l_, sp_d_, sp_l_, sp_a_ = carry
+        i = nt - 2 - i_rev
+
+        L_i, L_lower_i, L_arrow_i = reconstruct_L(i)
+        L_blk_inv_i = jax.scipy.linalg.solve_triangular(L_i, eye_ns, lower=True)
+
+        sl_i = (-sd_prev @ L_lower_i - sa_prev.T @ L_arrow_i) @ L_blk_inv_i
+        sa_i = (-sa_prev @ L_lower_i - S_tip @ L_arrow_i) @ L_blk_inv_i
+        sd_i = (L_blk_inv_i.T - sl_i.T @ L_lower_i - sa_i.T @ L_arrow_i) @ L_blk_inv_i
+
+        tr_d = jnp.einsum('ij,sji->s', sd_i, all_mats)
+        mw_d = jnp.tile(jnp.array([m0_d[i], m1_d[i], m2_d[i]], dtype=dtype),
+                         1 + n_theta_st)
+        acc_d_ = acc_d_ + mw_d * tr_d
+
+        tr_l = jnp.einsum('ij,sji->s', sl_i, all_mats)
+        mw_l = jnp.tile(jnp.array([m0_s[i], m1_s[i], m2_s[i]], dtype=dtype),
+                         1 + n_theta_st)
+        acc_l_ = acc_l_ + mw_l * tr_l
+
+        sp_d_ = sp_d_ + jnp.sum(
+            sd_i[ata_diag_rows[i], ata_diag_cols[i]] * ata_diag_vals[i])
+        sp_l_ = sp_l_ + jnp.sum(
+            sl_i[ata_lower_rows[i], ata_lower_cols[i]] * ata_lower_vals[i])
+        sp_a_ = sp_a_ + jnp.sum(
+            sa_i[ata_arrow_rows[i], ata_arrow_cols[i]] * ata_arrow_vals[i])
+
+        return (sd_i, sa_i, acc_d_, acc_l_, sp_d_, sp_l_, sp_a_)
+
+    init_carry = (sd_last, sa_last, acc_d, acc_l, sp_d, sp_l, sp_a)
+    _, _, acc_d, acc_l, sp_d, sp_l, sp_a = lax.fori_loop(
+        0, nt - 1, body_fn, init_carry
+    )
+
+    # --- Assemble grad_st ---
+    jac_scale = jac_sc['scale']
+    jac_exp_gt = jac_sc['exp_gt']
+
+    weighted_diag = acc_d[0] + exp_gt * acc_d[1] + exp_gt**2 * acc_d[2]
+    weighted_lower = acc_l[0] + exp_gt * acc_l[1] + exp_gt**2 * acc_l[2]
+
+    grad_st = jnp.zeros(n_theta_st, dtype=dtype)
+    for k in range(n_theta_st):
+        term_scale = jac_scale[k] * (weighted_diag + weighted_lower)
+
+        off = 3 + 3 * k
+        term_spatial_diag = scale * (
+            acc_d[off] + exp_gt * acc_d[off + 1] + exp_gt**2 * acc_d[off + 2])
+        term_spatial_lower = scale * (
+            acc_l[off] + exp_gt * acc_l[off + 1] + exp_gt**2 * acc_l[off + 2])
+
+        term_exp_gt_diag = scale * jac_exp_gt[k] * (
+            acc_d[1] + 2.0 * exp_gt * acc_d[2])
+        term_exp_gt_lower = scale * jac_exp_gt[k] * (
+            acc_l[1] + 2.0 * exp_gt * acc_l[2])
+
+        grad_st = grad_st.at[k].set(
+            term_scale + term_spatial_diag + term_spatial_lower
+            + term_exp_gt_diag + term_exp_gt_lower
+        )
+
+    # --- Assemble grad_lik ---
+    sp_tip = jnp.sum(S_tip * ata_tip)
+    grad_lik = likelihood_prec * (sp_d + 2.0 * sp_l + 2.0 * sp_a + sp_tip)
+
+    return grad_st, grad_lik
