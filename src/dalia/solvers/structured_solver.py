@@ -335,27 +335,27 @@ class SerinvSolver(Solver):
             )
             self.bta_arrow_tip_slice = slice_idx
 
-            self.bta_diag_rows = xp.array(self.bta_diag_rows, dtype=xp.int32)
-            self.bta_diag_cols = xp.array(self.bta_diag_cols, dtype=xp.int32)
-            self.bta_lower_rows = xp.array(self.bta_lower_rows, dtype=xp.int32)
-            self.bta_lower_cols = xp.array(self.bta_lower_cols, dtype=xp.int32)
-            self.bta_arrow_bottom_rows = xp.array(
-                self.bta_arrow_bottom_rows, dtype=xp.int32
-            )
-            self.bta_arrow_bottom_cols = xp.array(
-                self.bta_arrow_bottom_cols, dtype=xp.int32
-            )
-            self.bta_arrow_tip_rows = xp.array(self.bta_arrow_tip_rows, dtype=xp.int32)
-            self.bta_arrow_tip_cols = xp.array(self.bta_arrow_tip_cols, dtype=xp.int32)
+            self.bta_diag_rows = [xp.asarray(a, dtype=xp.int32) for a in self.bta_diag_rows]
+            self.bta_diag_cols = [xp.asarray(a, dtype=xp.int32) for a in self.bta_diag_cols]
+            self.bta_lower_rows = [xp.asarray(a, dtype=xp.int32) for a in self.bta_lower_rows]
+            self.bta_lower_cols = [xp.asarray(a, dtype=xp.int32) for a in self.bta_lower_cols]
+            self.bta_arrow_bottom_rows = [
+                xp.asarray(a, dtype=xp.int32) for a in self.bta_arrow_bottom_rows
+            ]
+            self.bta_arrow_bottom_cols = [
+                xp.asarray(a, dtype=xp.int32) for a in self.bta_arrow_bottom_cols
+            ]
+            self.bta_arrow_tip_rows = xp.asarray(self.bta_arrow_tip_rows, dtype=xp.int32)
+            self.bta_arrow_tip_cols = xp.asarray(self.bta_arrow_tip_cols, dtype=xp.int32)
 
             # Print the allocated memory for the BTA-array
             total_bta_bytes: int = (
-                self.bta_diag_rows.nbytes
-                + self.bta_diag_cols.nbytes
-                + self.bta_lower_rows.nbytes
-                + self.bta_lower_cols.nbytes
-                + self.bta_arrow_bottom_rows.nbytes
-                + self.bta_arrow_bottom_cols.nbytes
+                sum(a.nbytes for a in self.bta_diag_rows)
+                + sum(a.nbytes for a in self.bta_diag_cols)
+                + sum(a.nbytes for a in self.bta_lower_rows)
+                + sum(a.nbytes for a in self.bta_lower_cols)
+                + sum(a.nbytes for a in self.bta_arrow_bottom_rows)
+                + sum(a.nbytes for a in self.bta_arrow_bottom_cols)
                 + self.bta_arrow_tip_rows.nbytes
                 + self.bta_arrow_tip_cols.nbytes
             )
@@ -436,17 +436,17 @@ class SerinvSolver(Solver):
                     self.bt_lower_cols.append(cols[slice_idx] - block_offsets[i])
                     self.bt_lower_slice.append(slice_idx)
 
-            self.bt_diag_rows = xp.array(self.bt_diag_rows, dtype=xp.int32)
-            self.bt_diag_cols = xp.array(self.bt_diag_cols, dtype=xp.int32)
-            self.bt_lower_rows = xp.array(self.bt_lower_rows, dtype=xp.int32)
-            self.bt_lower_cols = xp.array(self.bt_lower_cols, dtype=xp.int32)
+            self.bt_diag_rows = [xp.asarray(a, dtype=xp.int32) for a in self.bt_diag_rows]
+            self.bt_diag_cols = [xp.asarray(a, dtype=xp.int32) for a in self.bt_diag_cols]
+            self.bt_lower_rows = [xp.asarray(a, dtype=xp.int32) for a in self.bt_lower_rows]
+            self.bt_lower_cols = [xp.asarray(a, dtype=xp.int32) for a in self.bt_lower_cols]
 
             # Print the allocated memory for the BT array
             total_bt_bytes: int = (
-                self.bt_diag_rows.nbytes
-                + self.bt_diag_cols.nbytes
-                + self.bt_lower_rows.nbytes
-                + self.bt_lower_cols.nbytes
+                sum(a.nbytes for a in self.bt_diag_rows)
+                + sum(a.nbytes for a in self.bt_diag_cols)
+                + sum(a.nbytes for a in self.bt_lower_rows)
+                + sum(a.nbytes for a in self.bt_lower_cols)
             )
             self.total_bytes += total_bt_bytes
             print_msg(

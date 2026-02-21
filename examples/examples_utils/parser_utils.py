@@ -55,6 +55,12 @@ def parse_args():
         action="store_true",
         help="Measure GPU power draw during benchmark using nvidia-smi.",
     )
+    parser.add_argument(
+        "--nt",
+        type=int,
+        default=None,
+        help="Number of time steps (overrides script default).",
+    )
     args = parser.parse_args()
     print("Parsed parameters:")
     print(f"  max_iter: {args.max_iter}")

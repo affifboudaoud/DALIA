@@ -276,11 +276,6 @@ class DALIA:
                     )
                 # Check solver type compatibility
                 is_spatial_only = getattr(self.model, 'coregionalization_type', 'spatio_temporal') == 'spatial'
-                if self.config.solver.type != "serinv" and not is_spatial_only:
-                    raise NotImplementedError(
-                        "JAX autodiff for spatio-temporal CoregionalModel requires solver type 'serinv'. "
-                        "Please use gradient_method='finite_diff' for other solver types."
-                    )
                 if backend_flags["mpi_avail"] and comm_size > 1:
                     raise NotImplementedError(
                         "JAX autodiff for CoregionalModel does not support multi-process execution. "

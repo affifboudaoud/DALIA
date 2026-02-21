@@ -618,20 +618,13 @@ def _extract_static_data_coregional(dalia_instance, dtype=None) -> Dict[str, Any
             'theta_keys': list(model.theta_keys),
         }
     else:
-        # Dense solver path - only supported for spatial-only coregional models
-        if not is_spatial_only:
-            raise NotImplementedError(
-                "Dense solver for spatio-temporal CoregionalModel JAX autodiff is not yet implemented. "
-                "Use solver type 'serinv' for spatio-temporal CoregionalModel."
-            )
-
-        # For spatial coregional models, convert A to dense matrix
+        # Dense solver path
         a_dense = jnp.array(a_scipy.toarray(), dtype=dtype)
         n_observations_idx = [int(x) for x in model.n_observations_idx]
 
         static_data = {
             'is_coregional': True,
-            'is_spatial_only': True,
+            'is_spatial_only': is_spatial_only,
             'n_models': n_models,
             'models_data': models_data,
             'a': a_dense,
@@ -648,6 +641,7 @@ def _extract_static_data_coregional(dalia_instance, dtype=None) -> Dict[str, Any
             'use_sparse_solver': False,
             'nt': nt,
             'ns': ns,
+            'block_size': block_size,
             'hyperparameters_idx': [int(x) for x in model.hyperparameters_idx],
             'theta_keys': list(model.theta_keys),
         }
@@ -1190,11 +1184,13 @@ def _objective_gaussian_st_dense(theta, static_data):
     theta_st = theta[:3]
     theta_likelihood = theta[-1]
 
-    # Build spatio-temporal Q_prior as dense matrix
-    Q_st_bta = build_spatio_temporal_Q_bta_jax(
-        theta_st, spatial_matrices, temporal_matrices, nt, ns, manifold
+    # Build spatio-temporal Q_prior in BT format, then convert to dense
+    diag_blocks, lower_blocks = build_spatio_temporal_Q_bta_jax(
+        theta_st, spatial_matrices, temporal_matrices, manifold
     )
-    Q_st = bta_to_dense_jax(Q_st_bta['diag'], Q_st_bta['lower'], Q_st_bta['arrow'], Q_st_bta['tip'])
+    dummy_arrow = jnp.zeros((nt, 0, ns), dtype=y.dtype)
+    dummy_tip = jnp.zeros((0, 0), dtype=y.dtype)
+    Q_st = bta_to_dense_jax(diag_blocks, lower_blocks, dummy_arrow, dummy_tip)
 
     # Build full Q_prior (block diagonal: spatio-temporal + fixed effects)
     Q_prior = jnp.zeros((n_latent, n_latent), dtype=y.dtype)
@@ -2031,6 +2027,113 @@ def _objective_gaussian_coregional_spatial_dense(theta, static_data):
     return objective, x
 
 
+def _objective_gaussian_coregional_st_dense(theta, static_data):
+    """Pure JAX objective for Gaussian spatio-temporal CoregionalModel with dense solver.
+
+    Builds the coregional Q_prior in BTA format, converts to dense, then uses
+    standard dense linear algebra. This is used as a baseline to compare against
+    the structure-preserving sparse solver.
+    """
+    n_models = static_data['n_models']
+    nt = static_data['nt']
+    ns = static_data['ns']
+    block_size = static_data['block_size']
+    n_fixed_effects_total = static_data['n_fixed_effects_total']
+    fixed_effects_precision = static_data['fixed_effects_precision']
+    models_data = static_data['models_data']
+    y = static_data['y']
+    a = static_data['a']
+    prior_configs = static_data['prior_configs']
+    hyperparameters_idx = static_data['hyperparameters_idx']
+    theta_keys = static_data['theta_keys']
+    n_observations_idx = static_data['n_observations_idx']
+    n_latent = static_data['n_latent_parameters']
+
+    # Build coregional Q_prior in BTA format
+    q_prior_diag, q_prior_lower = build_coregional_Q_bta_jax(
+        theta, n_models, ns, nt, models_data, hyperparameters_idx, theta_keys
+    )
+
+    # Convert block-tridiagonal to dense
+    n_st = nt * block_size
+    Q_prior_st = jnp.zeros((n_st, n_st), dtype=y.dtype)
+    for t in range(nt):
+        s = t * block_size
+        e = s + block_size
+        Q_prior_st = Q_prior_st.at[s:e, s:e].set(q_prior_diag[t])
+    for t in range(nt - 1):
+        s1 = (t + 1) * block_size
+        e1 = s1 + block_size
+        s0 = t * block_size
+        e0 = s0 + block_size
+        Q_prior_st = Q_prior_st.at[s1:e1, s0:e0].set(q_prior_lower[t])
+        Q_prior_st = Q_prior_st.at[s0:e0, s1:e1].set(q_prior_lower[t].T)
+
+    # Build full Q_prior (coregional ST + fixed effects)
+    Q_prior = jnp.zeros((n_latent, n_latent), dtype=y.dtype)
+    Q_prior = Q_prior.at[:n_st, :n_st].set(Q_prior_st)
+    if n_fixed_effects_total > 0:
+        Q_fe = jnp.eye(n_fixed_effects_total, dtype=y.dtype) * fixed_effects_precision
+        Q_prior = Q_prior.at[n_st:, n_st:].set(Q_fe)
+
+    # Compute likelihood precisions for each model
+    likelihood_precisions = []
+    for i in range(n_models):
+        prec_idx = hyperparameters_idx[i + 1] - 1
+        likelihood_precisions.append(jnp.exp(theta[prec_idx]))
+
+    # Build D diagonal (per-observation precision)
+    n_obs = len(y)
+    D_diag = jnp.zeros(n_obs, dtype=y.dtype)
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        D_diag = D_diag.at[obs_start:obs_end].set(-likelihood_precisions[i])
+
+    Q_conditional = Q_prior - (a.T * D_diag) @ a
+
+    # Compute RHS = A^T @ (prec * y)
+    gradient_likelihood = jnp.zeros_like(y)
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        gradient_likelihood = gradient_likelihood.at[obs_start:obs_end].set(
+            likelihood_precisions[i] * y[obs_start:obs_end]
+        )
+    rhs = a.T @ gradient_likelihood
+
+    x = jnp.linalg.solve(Q_conditional, rhs)
+
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
+
+    eta = jnp.zeros_like(y)
+    log_likelihood = 0.0
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        y_i = y[obs_start:obs_end]
+        eta_i = eta[obs_start:obs_end]
+        prec_idx = hyperparameters_idx[i + 1] - 1
+        theta_lik_i = theta[prec_idx]
+        log_likelihood += _evaluate_gaussian_likelihood_jax(eta_i, y_i, theta_lik_i)
+
+    _, logdet_Q_prior = jnp.linalg.slogdet(Q_prior)
+    log_prior_latent = 0.5 * logdet_Q_prior
+
+    _, logdet_Q_conditional = jnp.linalg.slogdet(Q_conditional)
+    quad_form = x.T @ Q_conditional @ x
+    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * quad_form
+
+    objective = -(
+        log_prior_hyperparameters
+        + log_likelihood
+        + log_prior_latent
+        - log_conditional
+    )
+
+    return objective, x
+
+
 def create_pure_jax_objective_coregional(dalia_instance, dtype=None) -> Tuple[Callable, Callable]:
     """Create pure JAX objective function for CoregionalModel with automatic differentiation.
 
@@ -2071,9 +2174,7 @@ def create_pure_jax_objective_coregional(dalia_instance, dtype=None) -> Tuple[Ca
         elif is_spatial_only:
             return _objective_gaussian_coregional_spatial_dense(theta, static_data)
         else:
-            raise NotImplementedError(
-                "Dense solver only supports spatial-only CoregionalModel."
-            )
+            return _objective_gaussian_coregional_st_dense(theta, static_data)
 
     value_and_grad_fn = jax.value_and_grad(objective_pure_jax, has_aux=True)
 
