@@ -109,28 +109,6 @@ if __name__ == "__main__":
     if len(initial_theta) > 0:
         print_msg("\nWARNING: Expected zero hyperparameters for pure Poisson regression!")
 
-    # --- Run with Finite Differences ---
-    print_msg("\n" + "="*70)
-    print_msg("RUNNING WITH FINITE DIFFERENCES")
-    print_msg("="*70)
-
-    model_fd = create_model()
-    dalia_fd = run_with_method(model_fd, "finite_diff", args.max_iter, verbose=False)
-
-    t0 = time.perf_counter()
-    f_fd = get_first_forward_value(dalia_fd)
-    t_first_fd = time.perf_counter() - t0
-
-    print_msg(f"First forward pass: {f_fd:.6f}")
-    print_msg(f"Time for first forward: {t_first_fd:.4f}s")
-
-    t0 = time.perf_counter()
-    results_fd = dalia_fd.minimize()
-    t_total_fd = time.perf_counter() - t0
-
-    print_msg(f"\nOptimization completed in {t_total_fd:.2f}s")
-    print_msg(f"Final latent params (x): {results_fd['x']}")
-
     # --- Run with JAX Autodiff ---
     print_msg("\n" + "="*70)
     print_msg("RUNNING WITH JAX AUTODIFF")
@@ -158,6 +136,28 @@ if __name__ == "__main__":
 
     print_msg(f"\nOptimization completed in {t_total_jax:.2f}s")
     print_msg(f"Final latent params (x): {results_jax['x']}")
+
+    # --- Run with Finite Differences ---
+    print_msg("\n" + "="*70)
+    print_msg("RUNNING WITH FINITE DIFFERENCES")
+    print_msg("="*70)
+
+    model_fd = create_model()
+    dalia_fd = run_with_method(model_fd, "finite_diff", args.max_iter, verbose=False)
+
+    t0 = time.perf_counter()
+    f_fd = get_first_forward_value(dalia_fd)
+    t_first_fd = time.perf_counter() - t0
+
+    print_msg(f"First forward pass: {f_fd:.6f}")
+    print_msg(f"Time for first forward: {t_first_fd:.4f}s")
+
+    t0 = time.perf_counter()
+    results_fd = dalia_fd.minimize()
+    t_total_fd = time.perf_counter() - t0
+
+    print_msg(f"\nOptimization completed in {t_total_fd:.2f}s")
+    print_msg(f"Final latent params (x): {results_fd['x']}")
 
     # --- Numerical Validation ---
     print_msg("\n" + "="*70)

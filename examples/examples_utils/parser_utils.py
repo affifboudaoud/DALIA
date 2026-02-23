@@ -5,7 +5,7 @@ def parse_args():
     parser.add_argument(
         "--max_iter",
         type=int,
-        default=100,
+        default=250,
         help="Maximum number of iterations in the optimization process.",
     )
     parser.add_argument(

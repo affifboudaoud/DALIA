@@ -107,30 +107,6 @@ if __name__ == "__main__":
         run_benchmark(dalia_fd, dalia_jax, args, "gr")
         exit(0)
 
-    # --- Run with Finite Differences ---
-    print_msg("\n" + "="*70)
-    print_msg("RUNNING WITH FINITE DIFFERENCES")
-    print_msg("="*70)
-
-    model_fd = create_model()
-    dalia_fd = run_with_method(model_fd, "finite_diff", args.max_iter, verbose=False)
-
-    t0 = time.perf_counter()
-    f_fd, grad_fd = get_first_forward_and_gradient(dalia_fd)
-    t_first_fd = time.perf_counter() - t0
-
-    print_msg(f"First forward pass: {f_fd:.6f}")
-    print_msg(f"First gradient: {grad_fd}")
-    print_msg(f"Time for first forward+gradient: {t_first_fd:.4f}s")
-
-    t0 = time.perf_counter()
-    results_fd = dalia_fd.run()
-    t_total_fd = time.perf_counter() - t0
-
-    print_msg(f"\nOptimization completed in {t_total_fd:.2f}s")
-    print_msg(f"Final theta: {results_fd['theta']}")
-    print_msg(f"Final objective: {results_fd['f']:.6f}")
-
     # --- Run with JAX Autodiff ---
     print_msg("\n" + "="*70)
     print_msg("RUNNING WITH JAX AUTODIFF")
@@ -160,6 +136,30 @@ if __name__ == "__main__":
     print_msg(f"\nOptimization completed in {t_total_jax:.2f}s")
     print_msg(f"Final theta: {results_jax['theta']}")
     print_msg(f"Final objective: {results_jax['f']:.6f}")
+
+    # --- Run with Finite Differences ---
+    print_msg("\n" + "="*70)
+    print_msg("RUNNING WITH FINITE DIFFERENCES")
+    print_msg("="*70)
+
+    model_fd = create_model()
+    dalia_fd = run_with_method(model_fd, "finite_diff", args.max_iter, verbose=False)
+
+    t0 = time.perf_counter()
+    f_fd, grad_fd = get_first_forward_and_gradient(dalia_fd)
+    t_first_fd = time.perf_counter() - t0
+
+    print_msg(f"First forward pass: {f_fd:.6f}")
+    print_msg(f"First gradient: {grad_fd}")
+    print_msg(f"Time for first forward+gradient: {t_first_fd:.4f}s")
+
+    t0 = time.perf_counter()
+    results_fd = dalia_fd.run()
+    t_total_fd = time.perf_counter() - t0
+
+    print_msg(f"\nOptimization completed in {t_total_fd:.2f}s")
+    print_msg(f"Final theta: {results_fd['theta']}")
+    print_msg(f"Final objective: {results_fd['f']:.6f}")
 
     # --- Numerical Validation ---
     print_msg("\n" + "="*70)
