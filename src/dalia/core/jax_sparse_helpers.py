@@ -7,6 +7,12 @@ from jax import lax
 from typing import Tuple
 from functools import partial
 
+try:
+    import mpi4jax
+    _MPI4JAX_AVAILABLE = True
+except ImportError:
+    _MPI4JAX_AVAILABLE = False
+
 
 def kronecker_to_bta_structure(
     kron_result: jnp.ndarray,
@@ -2791,6 +2797,9 @@ def precompute_spatial_components_coregional(
 def _reconstruct_coregional_diag_block(sc_list, coreg_w, n_models, ns, t):
     """Reconstruct diagonal super-block t of coregional Q_prior.
 
+    Uses concatenation instead of scatter updates to avoid intermediate
+    copies of the full (block_size, block_size) matrix.
+
     Parameters
     ----------
     sc_list : list of dict
@@ -2805,24 +2814,33 @@ def _reconstruct_coregional_diag_block(sc_list, coreg_w, n_models, ns, t):
     -------
     block : (n_models*ns, n_models*ns)
     """
-    block_size = n_models * ns
     dtype = sc_list[0]['q3s'].dtype
-    block = jnp.zeros((block_size, block_size), dtype=dtype)
 
+    # Compute lower triangle sub-blocks (including diagonal)
+    subs = [[None] * n_models for _ in range(n_models)]
     for i in range(n_models):
         for j in range(i + 1):
             sub = jnp.zeros((ns, ns), dtype=dtype)
             for m_idx in range(n_models):
                 sub = sub + coreg_w[i, j, m_idx] * _reconstruct_diag_block(sc_list[m_idx], t)
-            block = block.at[i * ns:(i + 1) * ns, j * ns:(j + 1) * ns].set(sub)
-            if i != j:
-                block = block.at[j * ns:(j + 1) * ns, i * ns:(i + 1) * ns].set(sub)
+            subs[i][j] = sub
 
-    return block
+    # Copy lower triangle to upper triangle (symmetric)
+    for i in range(n_models):
+        for j in range(i + 1, n_models):
+            subs[i][j] = subs[j][i]
+
+    block_rows = []
+    for i in range(n_models):
+        block_rows.append(jnp.concatenate(subs[i], axis=1))
+    return jnp.concatenate(block_rows, axis=0)
 
 
 def _reconstruct_coregional_lower_block(sc_list, coreg_w, n_models, ns, t):
     """Reconstruct lower-diagonal super-block t of coregional Q_prior.
+
+    Uses concatenation instead of scatter updates to avoid intermediate
+    copies of the full (block_size, block_size) matrix.
 
     Parameters
     ----------
@@ -2835,18 +2853,18 @@ def _reconstruct_coregional_lower_block(sc_list, coreg_w, n_models, ns, t):
     -------
     block : (n_models*ns, n_models*ns)
     """
-    block_size = n_models * ns
     dtype = sc_list[0]['q3s'].dtype
-    block = jnp.zeros((block_size, block_size), dtype=dtype)
 
+    block_rows = []
     for i in range(n_models):
+        cols = []
         for j in range(n_models):
             sub = jnp.zeros((ns, ns), dtype=dtype)
             for m_idx in range(n_models):
                 sub = sub + coreg_w[i, j, m_idx] * _reconstruct_lower_block(sc_list[m_idx], t)
-            block = block.at[i * ns:(i + 1) * ns, j * ns:(j + 1) * ns].set(sub)
-
-    return block
+            cols.append(sub)
+        block_rows.append(jnp.concatenate(cols, axis=1))
+    return jnp.concatenate(block_rows, axis=0)
 
 
 def fused_cholesky_fwd_sub_coregional(
@@ -3798,5 +3816,2115 @@ def _compute_grad_quad_coregional(
 
         xAtAx_m = xAtAx_d + 2.0 * xAtAx_l + 2.0 * xAtAx_a + xAtAx_tip
         grad_per_model_lik = grad_per_model_lik.at[m].set(0.0)
+
+    return [grad_per_model_st[m] for m in range(n_models)], grad_per_model_lik, grad_coreg
+
+
+# =========================================================================
+# Distributed (pipeline) functions for multi-GPU JAX autodiff via mpi4jax
+# =========================================================================
+
+
+def pipeline_fused_cholesky_fwd_sub(
+    spatial_comp, nt_global, ns, n_fe, fe_prec, likelihood_prec,
+    rhs_st, rhs_fe,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip, dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed BTA Cholesky + forward substitution.
+
+    Each rank processes its local slice of the time dimension. Carries
+    are forwarded sequentially from rank r to rank r+1 via mpi4jax
+    send/recv.
+
+    Parameters
+    ----------
+    spatial_comp : dict
+        Output of :func:`precompute_spatial_components`.
+    nt_global : int
+        Global number of time steps.
+    ns, n_fe : int
+    fe_prec, likelihood_prec : scalar
+    rhs_st : (n_local, ns)
+        Local spatio-temporal RHS.
+    rhs_fe : (n_fe,)
+        Fixed-effects RHS (replicated).
+    ata_diag_rows, ata_diag_cols, ata_diag_vals : (n_local, max_nnz)
+    ata_lower_rows, ata_lower_cols, ata_lower_vals : (n_local, max_nnz)
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals : (n_local, max_nnz)
+    ata_tip : (n_fe, n_fe)
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    local_stored_cond_schurs : (n_local, ns, ns)
+    local_stored_arrow_schurs : (n_local, n_fe, ns)
+    local_y_st : (n_local, ns)
+    L_tip : (n_fe, n_fe)
+    arrow_rhs_acc : (n_fe,)
+    logdet_Q_cond : scalar
+    """
+    eps = jnp.finfo(dtype).eps
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+
+    m0_sub_pad = jnp.concatenate([spatial_comp['m0_subdiag'], jnp.zeros(1, dtype=dtype)])
+    m1_sub_pad = jnp.concatenate([spatial_comp['m1_subdiag'], jnp.zeros(1, dtype=dtype)])
+    m2_sub_pad = jnp.concatenate([spatial_comp['m2_subdiag'], jnp.zeros(1, dtype=dtype)])
+
+    ata_lower_rows_pad = jnp.concatenate([
+        ata_lower_rows, jnp.zeros((1, ata_lower_rows.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_cols_pad = jnp.concatenate([
+        ata_lower_cols, jnp.zeros((1, ata_lower_cols.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_vals_pad = jnp.concatenate([
+        ata_lower_vals, jnp.zeros((1, ata_lower_vals.shape[1]), dtype=dtype)], axis=0)
+
+    sc_padded = {**spatial_comp,
+                 'm0_subdiag': m0_sub_pad,
+                 'm1_subdiag': m1_sub_pad,
+                 'm2_subdiag': m2_sub_pad}
+
+    def scan_body(carry, inputs):
+        (cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
+         prev_lower_y, arrow_rhs_acc_) = carry
+        (global_i, rhs_i, d_rows, d_cols, d_vals,
+         l_rows, l_cols, l_vals, a_rows, a_cols, a_vals) = inputs
+
+        saved_carries = (cond_schur, arrow_schur)
+
+        q_cond_diag_i = _reconstruct_diag_block(sc_padded, global_i)
+        q_cond_diag_i = q_cond_diag_i.at[d_rows, d_cols].add(likelihood_prec * d_vals)
+        q_cond_diag_i = q_cond_diag_i + eps_reg * eye_ns - cond_schur
+
+        L_i = _jax_cholesky(q_cond_diag_i)
+        cond_diag_vals = jnp.diag(L_i)
+        safe_cond = jnp.maximum(cond_diag_vals, eps)
+        logdet_cond = logdet_cond + 2.0 * jnp.sum(jnp.log(safe_cond))
+
+        q_cond_lower_i = _reconstruct_lower_block(sc_padded, global_i)
+        q_cond_lower_i = q_cond_lower_i.at[l_rows, l_cols].add(likelihood_prec * l_vals)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_cond_lower_i.T, lower=True).T
+
+        q_arrow_i = jnp.zeros((n_fe, ns), dtype=dtype)
+        q_arrow_i = q_arrow_i.at[a_rows, a_cols].add(likelihood_prec * a_vals)
+        q_arrow_i = q_arrow_i - arrow_schur
+        L_arrow_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_arrow_i.T, lower=True).T
+
+        new_cond_schur = L_lower_i @ L_lower_i.T
+        new_arrow_schur = L_arrow_i @ L_lower_i.T
+        new_arrow_tip_acc = arrow_tip_acc - L_arrow_i @ L_arrow_i.T
+
+        new_cond_schur = jnp.where(global_i < nt_global - 1,
+                                   new_cond_schur, jnp.zeros_like(new_cond_schur))
+        new_arrow_schur = jnp.where(global_i < nt_global - 1,
+                                    new_arrow_schur, jnp.zeros_like(new_arrow_schur))
+
+        modified_rhs_i = rhs_i - prev_lower_y
+        y_i = jax.scipy.linalg.solve_triangular(L_i, modified_rhs_i, lower=True)
+
+        new_prev_lower_y = L_lower_i @ y_i
+        new_prev_lower_y = jnp.where(global_i < nt_global - 1,
+                                     new_prev_lower_y, jnp.zeros_like(new_prev_lower_y))
+        new_arrow_rhs_acc = arrow_rhs_acc_ - L_arrow_i @ y_i
+
+        new_carry = (new_cond_schur, new_arrow_tip_acc, new_arrow_schur,
+                     logdet_cond, new_prev_lower_y, new_arrow_rhs_acc)
+        return new_carry, (saved_carries, y_i)
+
+    init_cond_schur = jnp.zeros((ns, ns), dtype=dtype)
+    init_arrow_tip_acc = fe_prec * eye_nfe + likelihood_prec * ata_tip + eps_reg * eye_nfe
+    init_arrow_schur = jnp.zeros((n_fe, ns), dtype=dtype)
+    init_logdet = jnp.array(0.0, dtype=dtype)
+    init_prev_lower_y = jnp.zeros(ns, dtype=dtype)
+    init_arrow_rhs_acc = rhs_fe
+
+    if rank > 0:
+        init_cond_schur = mpi4jax.recv(
+            init_cond_schur, source=rank - 1, tag=0, comm=comm)
+        init_arrow_tip_acc = mpi4jax.recv(
+            init_arrow_tip_acc, source=rank - 1, tag=1, comm=comm)
+        init_arrow_schur = mpi4jax.recv(
+            init_arrow_schur, source=rank - 1, tag=2, comm=comm)
+        init_logdet = mpi4jax.recv(
+            init_logdet, source=rank - 1, tag=3, comm=comm)
+        init_prev_lower_y = mpi4jax.recv(
+            init_prev_lower_y, source=rank - 1, tag=4, comm=comm)
+        init_arrow_rhs_acc = mpi4jax.recv(
+            init_arrow_rhs_acc, source=rank - 1, tag=5, comm=comm)
+
+    init_carry = (init_cond_schur, init_arrow_tip_acc, init_arrow_schur,
+                  init_logdet, init_prev_lower_y, init_arrow_rhs_acc)
+
+    global_indices = jnp.arange(start_idx, start_idx + n_local)
+    scan_inputs = (
+        global_indices, rhs_st,
+        ata_diag_rows, ata_diag_cols, ata_diag_vals,
+        ata_lower_rows_pad[:n_local], ata_lower_cols_pad[:n_local], ata_lower_vals_pad[:n_local],
+        ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    )
+
+    final_carry, ((local_stored_cond_schurs, local_stored_arrow_schurs), local_y_st) = \
+        lax.scan(scan_body, init_carry, scan_inputs)
+
+    (final_cond_schur, final_arrow_tip_acc, final_arrow_schur,
+     local_logdet, final_prev_lower_y, final_arrow_rhs_acc) = final_carry
+
+    if rank < comm_size - 1:
+        mpi4jax.send(final_cond_schur, dest=rank + 1, tag=0, comm=comm)
+        mpi4jax.send(final_arrow_tip_acc, dest=rank + 1, tag=1, comm=comm)
+        mpi4jax.send(final_arrow_schur, dest=rank + 1, tag=2, comm=comm)
+        mpi4jax.send(local_logdet, dest=rank + 1, tag=3, comm=comm)
+        mpi4jax.send(final_prev_lower_y, dest=rank + 1, tag=4, comm=comm)
+        mpi4jax.send(final_arrow_rhs_acc, dest=rank + 1, tag=5, comm=comm)
+
+    logdet_Q_cond_global = mpi4jax.bcast(
+        local_logdet, root=comm_size - 1, comm=comm)
+
+    L_tip = _jax_cholesky(final_arrow_tip_acc)
+    tip_diag = jnp.diag(L_tip)
+    safe_tip_diag = jnp.maximum(tip_diag, eps)
+    logdet_tip = 2.0 * jnp.sum(jnp.log(safe_tip_diag))
+
+    L_tip = mpi4jax.bcast(L_tip, root=comm_size - 1, comm=comm)
+    arrow_rhs_acc_global = mpi4jax.bcast(
+        final_arrow_rhs_acc, root=comm_size - 1, comm=comm)
+    logdet_tip = mpi4jax.bcast(logdet_tip, root=comm_size - 1, comm=comm)
+
+    logdet_Q_cond = logdet_Q_cond_global + logdet_tip
+
+    return (local_stored_cond_schurs, local_stored_arrow_schurs,
+            local_y_st, L_tip, arrow_rhs_acc_global, logdet_Q_cond)
+
+
+def pipeline_backward_sub_from_carries(
+    local_stored_cond_schurs, local_stored_arrow_schurs, L_tip,
+    local_y_st, arrow_rhs_acc,
+    sc, likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    nt_global, ns, n_fe, dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed backward substitution from carries.
+
+    Each rank reconstructs L blocks from local carries and solves
+    backward. The last rank starts, passing its first solution block
+    to the previous rank via send/recv.
+
+    Parameters
+    ----------
+    local_stored_cond_schurs : (n_local, ns, ns)
+    local_stored_arrow_schurs : (n_local, n_fe, ns)
+    L_tip : (n_fe, n_fe)
+    local_y_st : (n_local, ns)
+    arrow_rhs_acc : (n_fe,)
+    sc : dict
+    likelihood_prec : scalar
+    ata_* : local sparse COO data
+    nt_global, ns, n_fe : int
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    x_st_global : (nt_global, ns)
+    x_fe : (n_fe,)
+    quad : scalar
+    """
+    from mpi4py import MPI
+
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_ns = jnp.eye(ns, dtype=dtype)
+
+    sc_padded = {**sc,
+                 'm0_subdiag': jnp.concatenate([sc['m0_subdiag'], jnp.zeros(1, dtype=dtype)]),
+                 'm1_subdiag': jnp.concatenate([sc['m1_subdiag'], jnp.zeros(1, dtype=dtype)]),
+                 'm2_subdiag': jnp.concatenate([sc['m2_subdiag'], jnp.zeros(1, dtype=dtype)])}
+
+    ata_lower_rows_pad = jnp.concatenate([
+        ata_lower_rows, jnp.zeros((1, ata_lower_rows.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_cols_pad = jnp.concatenate([
+        ata_lower_cols, jnp.zeros((1, ata_lower_cols.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_vals_pad = jnp.concatenate([
+        ata_lower_vals, jnp.zeros((1, ata_lower_vals.shape[1]), dtype=dtype)], axis=0)
+
+    def reconstruct_L_local(local_i):
+        global_i = start_idx + local_i
+        q_diag = _reconstruct_diag_block(sc_padded, global_i)
+        q_diag = q_diag.at[ata_diag_rows[local_i], ata_diag_cols[local_i]].add(
+            likelihood_prec * ata_diag_vals[local_i])
+        q_diag = q_diag + eps_reg * eye_ns - local_stored_cond_schurs[local_i]
+        L_i = _jax_cholesky(q_diag)
+
+        q_lower = _reconstruct_lower_block(sc_padded, global_i)
+        q_lower = q_lower.at[ata_lower_rows_pad[local_i], ata_lower_cols_pad[local_i]].add(
+            likelihood_prec * ata_lower_vals_pad[local_i])
+        L_lower_i = jax.scipy.linalg.solve_triangular(L_i, q_lower.T, lower=True).T
+
+        q_arrow = jnp.zeros((n_fe, ns), dtype=dtype)
+        q_arrow = q_arrow.at[ata_arrow_rows[local_i], ata_arrow_cols[local_i]].add(
+            likelihood_prec * ata_arrow_vals[local_i])
+        q_arrow = q_arrow - local_stored_arrow_schurs[local_i]
+        L_arrow_i = jax.scipy.linalg.solve_triangular(L_i, q_arrow.T, lower=True).T
+
+        return L_i, L_lower_i, L_arrow_i
+
+    y_fe = jax.scipy.linalg.solve_triangular(L_tip, arrow_rhs_acc, lower=True)
+    local_quad = jnp.sum(local_y_st ** 2)
+    y_fe_quad = jnp.where(rank == comm_size - 1, jnp.sum(y_fe ** 2), 0.0)
+    local_quad = local_quad + y_fe_quad
+
+    x_fe = jax.scipy.linalg.solve_triangular(L_tip.T, y_fe, lower=False)
+
+    # Pad local arrays to max_n_local so all ranks have same shape for allgather
+    max_n_local = (nt_global + comm_size - 1) // comm_size
+    local_x_st = jnp.zeros((max_n_local, ns), dtype=dtype)
+
+    x_next = jnp.zeros(ns, dtype=dtype)
+    if rank < comm_size - 1:
+        x_next = mpi4jax.recv(x_next, source=rank + 1, tag=10, comm=comm)
+
+    last_local = n_local - 1
+    global_last = start_idx + last_local
+
+    L_last, L_lower_last, L_arrow_last = reconstruct_L_local(last_local)
+    rhs_last = local_y_st[last_local] - L_arrow_last.T @ x_fe
+    rhs_last = jnp.where(global_last < nt_global - 1,
+                         rhs_last - L_lower_last.T @ x_next, rhs_last)
+    x_last_local = jax.scipy.linalg.solve_triangular(L_last.T, rhs_last, lower=False)
+    local_x_st = local_x_st.at[last_local].set(x_last_local)
+
+    def body_fn(j_rev, carry):
+        x_st_, x_next_ = carry
+        local_i = last_local - 1 - j_rev
+
+        L_i, L_lower_i, L_arrow_i = reconstruct_L_local(local_i)
+        x_i = jax.scipy.linalg.solve_triangular(
+            L_i.T,
+            local_y_st[local_i] - L_lower_i.T @ x_next_ - L_arrow_i.T @ x_fe,
+            lower=False,
+        )
+        x_st_ = x_st_.at[local_i].set(x_i)
+        return (x_st_, x_i)
+
+    local_x_st, x_first = lax.fori_loop(0, n_local - 1, body_fn, (local_x_st, x_last_local))
+
+    if rank > 0:
+        mpi4jax.send(x_first, dest=rank - 1, tag=10, comm=comm)
+
+    x_st_gathered = mpi4jax.allgather(local_x_st, comm=comm)
+    x_st_global = x_st_gathered.reshape(-1, ns)[:nt_global]
+
+    quad_global = mpi4jax.allreduce(local_quad, op=MPI.SUM, comm=comm)
+
+    return x_st_global, x_fe, quad_global
+
+
+def pipeline_selected_inversion_grads_from_carries(
+    local_stored_cond_schurs, local_stored_arrow_schurs, L_tip,
+    sc, jac_sc,
+    nt_global, ns, n_fe, n_theta_st,
+    likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip, dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed selected inversion gradients.
+
+    Backward SI sweep with boundary communication between ranks.
+
+    Parameters
+    ----------
+    local_stored_cond_schurs : (n_local, ns, ns)
+    local_stored_arrow_schurs : (n_local, n_fe, ns)
+    L_tip : (n_fe, n_fe)
+    sc, jac_sc : spatial components and Jacobians
+    nt_global, ns, n_fe, n_theta_st : int
+    likelihood_prec : scalar
+    ata_* : local sparse COO data
+    ata_tip : (n_fe, n_fe)
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    grad_st : (n_theta_st,)
+    grad_lik : scalar
+    """
+    from mpi4py import MPI
+
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+
+    sc_padded = {**sc,
+                 'm0_subdiag': jnp.concatenate([sc['m0_subdiag'], jnp.zeros(1, dtype=dtype)]),
+                 'm1_subdiag': jnp.concatenate([sc['m1_subdiag'], jnp.zeros(1, dtype=dtype)]),
+                 'm2_subdiag': jnp.concatenate([sc['m2_subdiag'], jnp.zeros(1, dtype=dtype)])}
+
+    ata_lower_rows_pad = jnp.concatenate([
+        ata_lower_rows, jnp.zeros((1, ata_lower_rows.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_cols_pad = jnp.concatenate([
+        ata_lower_cols, jnp.zeros((1, ata_lower_cols.shape[1]), dtype=jnp.int32)], axis=0)
+    ata_lower_vals_pad = jnp.concatenate([
+        ata_lower_vals, jnp.zeros((1, ata_lower_vals.shape[1]), dtype=dtype)], axis=0)
+
+    scale = sc['scale']
+    exp_gt = sc['exp_gt']
+    m0_d = sc['m0_diag']
+    m1_d = sc['m1_diag']
+    m2_d = sc['m2_diag']
+    m0_s = sc['m0_subdiag']
+    m1_s = sc['m1_subdiag']
+    m2_s = sc['m2_subdiag']
+
+    base_mats = [sc['q3s'], sc['q2s'], sc['q1s']]
+    jac_mats = []
+    for k in range(n_theta_st):
+        jac_mats.extend([
+            jac_sc['q3s'][..., k], jac_sc['q2s'][..., k], jac_sc['q1s'][..., k],
+        ])
+    all_mats = jnp.stack(base_mats + jac_mats, axis=0)
+    n_mats = all_mats.shape[0]
+
+    def reconstruct_L_local(local_i):
+        global_i = start_idx + local_i
+        q_diag = _reconstruct_diag_block(sc_padded, global_i)
+        q_diag = q_diag.at[ata_diag_rows[local_i], ata_diag_cols[local_i]].add(
+            likelihood_prec * ata_diag_vals[local_i])
+        q_diag = q_diag + eps_reg * eye_ns - local_stored_cond_schurs[local_i]
+        L_i = _jax_cholesky(q_diag)
+
+        q_lower = _reconstruct_lower_block(sc_padded, global_i)
+        q_lower = q_lower.at[ata_lower_rows_pad[local_i], ata_lower_cols_pad[local_i]].add(
+            likelihood_prec * ata_lower_vals_pad[local_i])
+        L_lower_i = jax.scipy.linalg.solve_triangular(L_i, q_lower.T, lower=True).T
+
+        q_arrow = jnp.zeros((n_fe, ns), dtype=dtype)
+        q_arrow = q_arrow.at[ata_arrow_rows[local_i], ata_arrow_cols[local_i]].add(
+            likelihood_prec * ata_arrow_vals[local_i])
+        q_arrow = q_arrow - local_stored_arrow_schurs[local_i]
+        L_arrow_i = jax.scipy.linalg.solve_triangular(L_i, q_arrow.T, lower=True).T
+
+        return L_i, L_lower_i, L_arrow_i
+
+    L_tip_inv = jax.scipy.linalg.solve_triangular(L_tip, eye_nfe, lower=True)
+    S_tip = L_tip_inv.T @ L_tip_inv
+
+    sd_boundary = jnp.zeros((ns, ns), dtype=dtype)
+    sa_boundary = jnp.zeros((n_fe, ns), dtype=dtype)
+
+    if rank < comm_size - 1:
+        sd_boundary = mpi4jax.recv(sd_boundary, source=rank + 1, tag=20, comm=comm)
+        sa_boundary = mpi4jax.recv(sa_boundary, source=rank + 1, tag=21, comm=comm)
+
+    last_local = n_local - 1
+    global_last = start_idx + last_local
+    is_global_last = (global_last == nt_global - 1)
+
+    L_last, L_lower_last, L_arrow_last = reconstruct_L_local(last_local)
+    L_blk_inv = jax.scipy.linalg.solve_triangular(L_last, eye_ns, lower=True)
+
+    sa_global_last = -S_tip @ L_arrow_last @ L_blk_inv
+    sd_global_last = (L_blk_inv.T - sa_global_last.T @ L_arrow_last) @ L_blk_inv
+
+    sl_last = (-sd_boundary @ L_lower_last - sa_boundary.T @ L_arrow_last) @ L_blk_inv
+    sa_from_bnd = (-sa_boundary @ L_lower_last - S_tip @ L_arrow_last) @ L_blk_inv
+    sd_from_bnd = (L_blk_inv.T - sl_last.T @ L_lower_last - sa_from_bnd.T @ L_arrow_last) @ L_blk_inv
+
+    sd_last = jnp.where(is_global_last, sd_global_last, sd_from_bnd)
+    sa_last = jnp.where(is_global_last, sa_global_last, sa_from_bnd)
+
+    traces_d = jnp.einsum('ij,sji->s', sd_last, all_mats)
+    m_wt = jnp.tile(jnp.array([m0_d[global_last], m1_d[global_last], m2_d[global_last]], dtype=dtype),
+                     1 + n_theta_st)
+    acc_d = m_wt * traces_d
+    acc_l = jnp.zeros(n_mats, dtype=dtype)
+
+    sp_d = jnp.sum(sd_last[ata_diag_rows[last_local], ata_diag_cols[last_local]]
+                   * ata_diag_vals[last_local])
+    sp_l = jnp.array(0.0, dtype=dtype)
+    sp_a = jnp.sum(sa_last[ata_arrow_rows[last_local], ata_arrow_cols[last_local]]
+                   * ata_arrow_vals[last_local])
+
+    safe_idx = jnp.minimum(global_last, nt_global - 2)
+    sl_trace_val = jnp.where(
+        is_global_last, 0.0,
+        jnp.sum(sl_last[ata_lower_rows[last_local], ata_lower_cols[last_local]]
+                * ata_lower_vals[last_local]))
+    tr_l_last = jnp.where(is_global_last,
+                          jnp.zeros(n_mats, dtype=dtype),
+                          jnp.einsum('ij,sji->s', sl_last, all_mats))
+    mw_l_last = jnp.where(
+        is_global_last,
+        jnp.zeros(n_mats, dtype=dtype),
+        jnp.tile(jnp.array([m0_s[safe_idx], m1_s[safe_idx], m2_s[safe_idx]], dtype=dtype),
+                 1 + n_theta_st))
+    acc_l = acc_l + mw_l_last * tr_l_last
+    sp_l = sp_l + sl_trace_val
+
+    def body_fn(j_rev, carry):
+        sd_prev, sa_prev, acc_d_, acc_l_, sp_d_, sp_l_, sp_a_ = carry
+        local_i = last_local - 1 - j_rev
+        global_i = start_idx + local_i
+
+        L_i, L_lower_i, L_arrow_i = reconstruct_L_local(local_i)
+        L_blk_inv_i = jax.scipy.linalg.solve_triangular(L_i, eye_ns, lower=True)
+
+        sl_i = (-sd_prev @ L_lower_i - sa_prev.T @ L_arrow_i) @ L_blk_inv_i
+        sa_i = (-sa_prev @ L_lower_i - S_tip @ L_arrow_i) @ L_blk_inv_i
+        sd_i = (L_blk_inv_i.T - sl_i.T @ L_lower_i - sa_i.T @ L_arrow_i) @ L_blk_inv_i
+
+        tr_d = jnp.einsum('ij,sji->s', sd_i, all_mats)
+        mw_d = jnp.tile(jnp.array([m0_d[global_i], m1_d[global_i], m2_d[global_i]], dtype=dtype),
+                         1 + n_theta_st)
+        acc_d_ = acc_d_ + mw_d * tr_d
+
+        tr_l = jnp.einsum('ij,sji->s', sl_i, all_mats)
+        mw_l = jnp.tile(jnp.array([m0_s[global_i], m1_s[global_i], m2_s[global_i]], dtype=dtype),
+                         1 + n_theta_st)
+        acc_l_ = acc_l_ + mw_l * tr_l
+
+        sp_d_ = sp_d_ + jnp.sum(
+            sd_i[ata_diag_rows[local_i], ata_diag_cols[local_i]] * ata_diag_vals[local_i])
+        sp_l_ = sp_l_ + jnp.sum(
+            sl_i[ata_lower_rows[local_i], ata_lower_cols[local_i]] * ata_lower_vals[local_i])
+        sp_a_ = sp_a_ + jnp.sum(
+            sa_i[ata_arrow_rows[local_i], ata_arrow_cols[local_i]] * ata_arrow_vals[local_i])
+
+        return (sd_i, sa_i, acc_d_, acc_l_, sp_d_, sp_l_, sp_a_)
+
+    init_bwd = (sd_last, sa_last, acc_d, acc_l, sp_d, sp_l, sp_a)
+    sd_first, sa_first, acc_d, acc_l, sp_d, sp_l, sp_a = lax.fori_loop(
+        0, n_local - 1, body_fn, init_bwd)
+
+    if rank > 0:
+        mpi4jax.send(sd_first, dest=rank - 1, tag=20, comm=comm)
+        mpi4jax.send(sa_first, dest=rank - 1, tag=21, comm=comm)
+
+    acc_l = 2.0 * acc_l
+
+    acc_d = mpi4jax.allreduce(acc_d, op=MPI.SUM, comm=comm)
+    acc_l = mpi4jax.allreduce(acc_l, op=MPI.SUM, comm=comm)
+    sp_d = mpi4jax.allreduce(sp_d, op=MPI.SUM, comm=comm)
+    sp_l = mpi4jax.allreduce(sp_l, op=MPI.SUM, comm=comm)
+    sp_a = mpi4jax.allreduce(sp_a, op=MPI.SUM, comm=comm)
+
+    jac_scale = jac_sc['scale']
+    jac_exp_gt = jac_sc['exp_gt']
+
+    weighted_diag = acc_d[0] + exp_gt * acc_d[1] + exp_gt**2 * acc_d[2]
+    weighted_lower = acc_l[0] + exp_gt * acc_l[1] + exp_gt**2 * acc_l[2]
+
+    grad_st = jnp.zeros(n_theta_st, dtype=dtype)
+    for k in range(n_theta_st):
+        term_scale = jac_scale[k] * (weighted_diag + weighted_lower)
+        off = 3 + 3 * k
+        term_spatial_diag = scale * (
+            acc_d[off] + exp_gt * acc_d[off + 1] + exp_gt**2 * acc_d[off + 2])
+        term_spatial_lower = scale * (
+            acc_l[off] + exp_gt * acc_l[off + 1] + exp_gt**2 * acc_l[off + 2])
+        term_exp_gt_diag = scale * jac_exp_gt[k] * (acc_d[1] + 2.0 * exp_gt * acc_d[2])
+        term_exp_gt_lower = scale * jac_exp_gt[k] * (acc_l[1] + 2.0 * exp_gt * acc_l[2])
+        grad_st = grad_st.at[k].set(
+            term_scale + term_spatial_diag + term_spatial_lower
+            + term_exp_gt_diag + term_exp_gt_lower)
+
+    sp_tip = jnp.where(rank == 0, jnp.sum(S_tip * ata_tip), 0.0)
+    sp_tip = mpi4jax.allreduce(sp_tip, op=MPI.SUM, comm=comm)
+    grad_lik = likelihood_prec * (sp_d + 2.0 * sp_l + 2.0 * sp_a + sp_tip)
+
+    return grad_st, grad_lik
+
+
+def pipeline_bt_logdet_grad(
+    theta_st, spatial_matrices, temporal_matrices, manifold,
+    nt_global, ns, n_theta_st, dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed gradient of logdet(Q_st) via BT selected inversion.
+
+    Parameters
+    ----------
+    theta_st : (n_theta_st,)
+    spatial_matrices, temporal_matrices : dict
+    manifold : str
+    nt_global, ns, n_theta_st : int
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    grad_st : (n_theta_st,)
+    """
+    from mpi4py import MPI
+
+    sc = precompute_spatial_components(theta_st, spatial_matrices, temporal_matrices, manifold)
+    jac_sc = jax.jacfwd(precompute_spatial_components)(
+        theta_st, spatial_matrices, temporal_matrices, manifold)
+
+    eye_ns = jnp.eye(ns, dtype=dtype)
+    scale = sc['scale']
+    exp_gt = sc['exp_gt']
+    m0_d = sc['m0_diag']
+    m1_d = sc['m1_diag']
+    m2_d = sc['m2_diag']
+    m0_s = sc['m0_subdiag']
+    m1_s = sc['m1_subdiag']
+    m2_s = sc['m2_subdiag']
+
+    m0_s_pad = jnp.concatenate([m0_s, jnp.zeros(1, dtype=dtype)])
+    m1_s_pad = jnp.concatenate([m1_s, jnp.zeros(1, dtype=dtype)])
+    m2_s_pad = jnp.concatenate([m2_s, jnp.zeros(1, dtype=dtype)])
+
+    sc_pad = {**sc, 'm0_subdiag': m0_s_pad, 'm1_subdiag': m1_s_pad, 'm2_subdiag': m2_s_pad}
+
+    def fwd_body(schur, global_i):
+        q_diag = _reconstruct_diag_block(sc_pad, global_i) - schur
+        L_i = _jax_cholesky(q_diag)
+        q_lower = _reconstruct_lower_block(sc_pad, global_i)
+        L_lower_i = jax.scipy.linalg.solve_triangular(L_i, q_lower.T, lower=True).T
+        new_schur = L_lower_i @ L_lower_i.T
+        new_schur = jnp.where(global_i < nt_global - 1, new_schur, jnp.zeros_like(new_schur))
+        return new_schur, schur
+
+    init_schur = jnp.zeros((ns, ns), dtype=dtype)
+
+    if rank > 0:
+        init_schur = mpi4jax.recv(init_schur, source=rank - 1, tag=30, comm=comm)
+
+    global_indices = jnp.arange(start_idx, start_idx + n_local)
+    final_schur, local_stored_schurs = lax.scan(fwd_body, init_schur, global_indices)
+
+    if rank < comm_size - 1:
+        mpi4jax.send(final_schur, dest=rank + 1, tag=30, comm=comm)
+
+    base_mats = [sc['q3s'], sc['q2s'], sc['q1s']]
+    jac_mats = []
+    for k in range(n_theta_st):
+        jac_mats.extend([jac_sc['q3s'][..., k], jac_sc['q2s'][..., k], jac_sc['q1s'][..., k]])
+    all_mats = jnp.stack(base_mats + jac_mats, axis=0)
+    n_mats = all_mats.shape[0]
+
+    def _reconstruct_L_local(local_i):
+        global_i = start_idx + local_i
+        q_diag = _reconstruct_diag_block(sc_pad, global_i) - local_stored_schurs[local_i]
+        L_i = _jax_cholesky(q_diag)
+        q_lower = _reconstruct_lower_block(sc_pad, global_i)
+        L_lower_i = jax.scipy.linalg.solve_triangular(L_i, q_lower.T, lower=True).T
+        return L_i, L_lower_i
+
+    sd_boundary = jnp.zeros((ns, ns), dtype=dtype)
+    if rank < comm_size - 1:
+        sd_boundary = mpi4jax.recv(sd_boundary, source=rank + 1, tag=31, comm=comm)
+
+    last_local = n_local - 1
+    global_last = start_idx + last_local
+    is_global_last = (global_last == nt_global - 1)
+
+    L_last, L_lower_last = _reconstruct_L_local(last_local)
+    L_inv_last = jax.scipy.linalg.solve_triangular(L_last, eye_ns, lower=True)
+
+    sd_global_last = L_inv_last.T @ L_inv_last
+    sl_from_bnd = -sd_boundary @ L_lower_last @ L_inv_last
+    sd_from_bnd = (L_inv_last.T - sl_from_bnd.T @ L_lower_last) @ L_inv_last
+
+    sd_last = jnp.where(is_global_last, sd_global_last, sd_from_bnd)
+
+    tr_d_last = jnp.einsum('ij,sji->s', sd_last, all_mats)
+    mw_last = jnp.tile(
+        jnp.array([m0_d[global_last], m1_d[global_last], m2_d[global_last]], dtype=dtype),
+        1 + n_theta_st)
+    acc_d = mw_last * tr_d_last
+    acc_l = jnp.zeros(n_mats, dtype=dtype)
+
+    safe_idx = jnp.minimum(global_last, nt_global - 2)
+    sl_last_trace = jnp.where(is_global_last,
+                              jnp.zeros(n_mats, dtype=dtype),
+                              jnp.einsum('ij,sji->s', sl_from_bnd, all_mats))
+    mw_l_last = jnp.where(
+        is_global_last,
+        jnp.zeros(n_mats, dtype=dtype),
+        jnp.tile(jnp.array([m0_s[safe_idx], m1_s[safe_idx], m2_s[safe_idx]], dtype=dtype),
+                 1 + n_theta_st))
+    acc_l = acc_l + mw_l_last * sl_last_trace
+
+    def bwd_body(j_rev, carry):
+        sd_prev, acc_d_, acc_l_ = carry
+        local_i = last_local - 1 - j_rev
+        global_i = start_idx + local_i
+
+        L_i, L_lower_i = _reconstruct_L_local(local_i)
+        L_inv_i = jax.scipy.linalg.solve_triangular(L_i, eye_ns, lower=True)
+
+        sl_i = -sd_prev @ L_lower_i @ L_inv_i
+        sd_i = (L_inv_i.T - sl_i.T @ L_lower_i) @ L_inv_i
+
+        tr_d = jnp.einsum('ij,sji->s', sd_i, all_mats)
+        mw_d = jnp.tile(
+            jnp.array([m0_d[global_i], m1_d[global_i], m2_d[global_i]], dtype=dtype),
+            1 + n_theta_st)
+        acc_d_ = acc_d_ + mw_d * tr_d
+
+        tr_l = jnp.einsum('ij,sji->s', sl_i, all_mats)
+        mw_l = jnp.tile(
+            jnp.array([m0_s[global_i], m1_s[global_i], m2_s[global_i]], dtype=dtype),
+            1 + n_theta_st)
+        acc_l_ = acc_l_ + mw_l * tr_l
+
+        return (sd_i, acc_d_, acc_l_)
+
+    sd_first, acc_d, acc_l = lax.fori_loop(0, n_local - 1, bwd_body, (sd_last, acc_d, acc_l))
+
+    if rank > 0:
+        mpi4jax.send(sd_first, dest=rank - 1, tag=31, comm=comm)
+
+    acc_l = 2.0 * acc_l
+
+    acc_d = mpi4jax.allreduce(acc_d, op=MPI.SUM, comm=comm)
+    acc_l = mpi4jax.allreduce(acc_l, op=MPI.SUM, comm=comm)
+
+    jac_scale = jac_sc['scale']
+    jac_exp_gt = jac_sc['exp_gt']
+
+    weighted_diag = acc_d[0] + exp_gt * acc_d[1] + exp_gt**2 * acc_d[2]
+    weighted_lower = acc_l[0] + exp_gt * acc_l[1] + exp_gt**2 * acc_l[2]
+
+    grad_st = jnp.zeros(n_theta_st, dtype=dtype)
+    for k in range(n_theta_st):
+        term_scale = jac_scale[k] * (weighted_diag + weighted_lower)
+        off = 3 + 3 * k
+        term_spatial_diag = scale * (
+            acc_d[off] + exp_gt * acc_d[off + 1] + exp_gt**2 * acc_d[off + 2])
+        term_spatial_lower = scale * (
+            acc_l[off] + exp_gt * acc_l[off + 1] + exp_gt**2 * acc_l[off + 2])
+        term_exp_gt_diag = scale * jac_exp_gt[k] * (acc_d[1] + 2.0 * exp_gt * acc_d[2])
+        term_exp_gt_lower = scale * jac_exp_gt[k] * (acc_l[1] + 2.0 * exp_gt * acc_l[2])
+        grad_st = grad_st.at[k].set(
+            term_scale + term_spatial_diag + term_spatial_lower
+            + term_exp_gt_diag + term_exp_gt_lower)
+
+    return grad_st
+
+
+def pipeline_compute_grad_quad(
+    x, sc, jac_sc,
+    nt_global, ns, n_fe, n_theta_st,
+    rhs, likelihood_prec,
+    ata_diag_rows, ata_diag_cols, ata_diag_vals,
+    ata_lower_rows, ata_lower_cols, ata_lower_vals,
+    ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+    ata_tip,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed gradient of quadratic form.
+
+    Each rank computes its local contribution to ``x^T (dQ/dtheta) x``
+    using the allgathered full ``x``, then allreduces.
+
+    Parameters
+    ----------
+    x : (nt_global * ns + n_fe,)
+    sc, jac_sc : spatial components and Jacobians
+    nt_global, ns, n_fe, n_theta_st : int
+    rhs : (nt_global * ns + n_fe,)
+    likelihood_prec : scalar
+    ata_* : local sparse COO data
+    ata_tip : (n_fe, n_fe)
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    grad_st : (n_theta_st,)
+    grad_lik : scalar
+    """
+    from mpi4py import MPI
+
+    x_st_global = x[:nt_global * ns].reshape(nt_global, ns)
+    x_fe = x[nt_global * ns:]
+    x_st_local = x_st_global[start_idx:start_idx + n_local]
+
+    scale = sc['scale']
+    exp_gt = sc['exp_gt']
+    m0_d = sc['m0_diag']
+    m1_d = sc['m1_diag']
+    m2_d = sc['m2_diag']
+    m0_s = sc['m0_subdiag']
+    m1_s = sc['m1_subdiag']
+    m2_s = sc['m2_subdiag']
+
+    spatial_mats = jnp.stack([sc['q3s'], sc['q2s'], sc['q1s']], axis=0)
+
+    xSx_diag = jnp.einsum('bi,sij,bj->bs', x_st_local, spatial_mats, x_st_local)
+
+    # x_st[start_idx+1 : start_idx+n_local+1] for lower blocks
+    end_global = jnp.minimum(start_idx + n_local + 1, nt_global)
+    x_st_next_slice = x_st_global[start_idx + 1:start_idx + n_local + 1]
+    pad_needed = n_local - x_st_next_slice.shape[0]
+    if pad_needed > 0:
+        x_st_next_slice = jnp.concatenate(
+            [x_st_next_slice, jnp.zeros((pad_needed, ns), dtype=x.dtype)])
+    xSx_lower = jnp.einsum('bi,sij,bj->bs', x_st_next_slice, spatial_mats, x_st_local)
+
+    local_m0_d = m0_d[start_idx:start_idx + n_local]
+    local_m1_d = m1_d[start_idx:start_idx + n_local]
+    local_m2_d = m2_d[start_idx:start_idx + n_local]
+
+    # Subdiag temporal coefs — safe slice with padding
+    m0s_full = jnp.concatenate([m0_s, jnp.zeros(1, dtype=x.dtype)])
+    m1s_full = jnp.concatenate([m1_s, jnp.zeros(1, dtype=x.dtype)])
+    m2s_full = jnp.concatenate([m2_s, jnp.zeros(1, dtype=x.dtype)])
+    local_m0_s = m0s_full[start_idx:start_idx + n_local]
+    local_m1_s = m1s_full[start_idx:start_idx + n_local]
+    local_m2_s = m2s_full[start_idx:start_idx + n_local]
+
+    weighted_diag = (
+        jnp.sum(local_m0_d * xSx_diag[:, 0])
+        + jnp.sum(exp_gt * local_m1_d * xSx_diag[:, 1])
+        + jnp.sum(exp_gt**2 * local_m2_d * xSx_diag[:, 2]))
+    weighted_lower = (
+        jnp.sum(local_m0_s * xSx_lower[:, 0])
+        + jnp.sum(exp_gt * local_m1_s * xSx_lower[:, 1])
+        + jnp.sum(exp_gt**2 * local_m2_s * xSx_lower[:, 2]))
+
+    jac_q3s = jac_sc['q3s']
+    jac_q2s = jac_sc['q2s']
+    jac_q1s = jac_sc['q1s']
+    jac_scale = jac_sc['scale']
+    jac_exp_gt = jac_sc['exp_gt']
+
+    grad_st = jnp.zeros(n_theta_st, dtype=x.dtype)
+
+    for k in range(n_theta_st):
+        dq3s_k = jac_q3s[..., k]
+        dq2s_k = jac_q2s[..., k]
+        dq1s_k = jac_q1s[..., k]
+
+        term_scale = jac_scale[k] * (weighted_diag + 2.0 * weighted_lower)
+
+        xDqx_diag_q3 = jnp.einsum('bi,ij,bj->b', x_st_local, dq3s_k, x_st_local)
+        xDqx_diag_q2 = jnp.einsum('bi,ij,bj->b', x_st_local, dq2s_k, x_st_local)
+        xDqx_diag_q1 = jnp.einsum('bi,ij,bj->b', x_st_local, dq1s_k, x_st_local)
+
+        xDqx_lower_q3 = jnp.einsum('bi,ij,bj->b', x_st_next_slice, dq3s_k, x_st_local)
+        xDqx_lower_q2 = jnp.einsum('bi,ij,bj->b', x_st_next_slice, dq2s_k, x_st_local)
+        xDqx_lower_q1 = jnp.einsum('bi,ij,bj->b', x_st_next_slice, dq1s_k, x_st_local)
+
+        term_spatial_diag = scale * (
+            jnp.sum(local_m0_d * xDqx_diag_q3)
+            + exp_gt * jnp.sum(local_m1_d * xDqx_diag_q2)
+            + exp_gt**2 * jnp.sum(local_m2_d * xDqx_diag_q1))
+        term_spatial_lower = 2.0 * scale * (
+            jnp.sum(local_m0_s * xDqx_lower_q3)
+            + exp_gt * jnp.sum(local_m1_s * xDqx_lower_q2)
+            + exp_gt**2 * jnp.sum(local_m2_s * xDqx_lower_q1))
+
+        term_exp_gt_diag = scale * jac_exp_gt[k] * (
+            jnp.sum(local_m1_d * xSx_diag[:, 1])
+            + 2.0 * exp_gt * jnp.sum(local_m2_d * xSx_diag[:, 2]))
+        term_exp_gt_lower = 2.0 * scale * jac_exp_gt[k] * (
+            jnp.sum(local_m1_s * xSx_lower[:, 1])
+            + 2.0 * exp_gt * jnp.sum(local_m2_s * xSx_lower[:, 2]))
+
+        grad_st = grad_st.at[k].set(
+            term_scale + term_spatial_diag + term_spatial_lower
+            + term_exp_gt_diag + term_exp_gt_lower)
+
+    grad_st = -grad_st
+
+    # Likelihood gradient from local AtA blocks
+    global_block_idx = jnp.arange(start_idx, start_idx + n_local)[:, None]
+    xAtAx_diag = jnp.sum(
+        x_st_global[global_block_idx, ata_diag_rows] * ata_diag_vals
+        * x_st_global[global_block_idx, ata_diag_cols])
+
+    next_block_idx = jnp.minimum(
+        jnp.arange(start_idx + 1, start_idx + n_local + 1), nt_global - 1)[:, None]
+    valid_lower = (jnp.arange(start_idx, start_idx + n_local) < nt_global - 1).astype(x.dtype)
+    xAtAx_lower = jnp.sum(valid_lower[:, None] *
+        x_st_global[next_block_idx, ata_lower_rows] * ata_lower_vals
+        * x_st_global[global_block_idx, ata_lower_cols])
+
+    xAtAx_arrow = jnp.sum(
+        x_fe[ata_arrow_rows] * ata_arrow_vals
+        * x_st_global[global_block_idx, ata_arrow_cols])
+
+    xAtAx_tip = jnp.where(rank == 0, x_fe @ ata_tip @ x_fe, 0.0)
+
+    local_xAtAx = xAtAx_diag + 2.0 * xAtAx_lower + 2.0 * xAtAx_arrow + xAtAx_tip
+
+    xAtAx = mpi4jax.allreduce(local_xAtAx, op=MPI.SUM, comm=comm)
+
+    grad_lik = 2.0 * jnp.dot(x, rhs) - likelihood_prec * xAtAx
+
+    grad_st = mpi4jax.allreduce(grad_st, op=MPI.SUM, comm=comm)
+
+    return grad_st, grad_lik
+
+
+# =========================================================================
+# Distributed (pipeline) coregional functions for multi-GPU JAX autodiff
+# =========================================================================
+
+
+def pipeline_fused_cholesky_fwd_sub_coregional(
+    sc_list, coreg_w, n_models, nt_global, ns, n_fe, fe_prec,
+    likelihood_precs,
+    rhs_st, rhs_fe,
+    per_model_ata_diag_rows, per_model_ata_diag_cols, per_model_ata_diag_vals,
+    per_model_ata_lower_rows, per_model_ata_lower_cols, per_model_ata_lower_vals,
+    per_model_ata_arrow_rows, per_model_ata_arrow_cols, per_model_ata_arrow_vals,
+    per_model_ata_tip, per_model_offsets,
+    dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed BTA Cholesky + forward substitution for coregional models.
+
+    Each rank processes its local slice of the time dimension. Carries
+    are forwarded sequentially from rank r to rank r+1 via mpi4jax.
+
+    Parameters
+    ----------
+    sc_list : list of dict
+        Per-model spatial components.
+    coreg_w : (n_models, n_models, n_models)
+    n_models, nt_global, ns, n_fe : int
+    fe_prec : float
+    likelihood_precs : (n_models,)
+    rhs_st : (n_local, block_size)
+    rhs_fe : (n_fe,)
+    per_model_ata_diag_{rows,cols,vals} : list of (n_local, max_nnz_m)
+    per_model_ata_lower_{rows,cols,vals} : list of (n_local, max_nnz_m)
+    per_model_ata_arrow_{rows,cols,vals} : list of (n_local, max_nnz_m)
+    per_model_ata_tip : list of (n_fe, n_fe)
+    per_model_offsets : list of int
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    local_stored_cond_schurs : (n_local, block_size, block_size)
+    local_stored_arrow_schurs : (n_local, n_fe, block_size)
+    local_y_st : (n_local, block_size)
+    L_tip : (n_fe, n_fe)
+    arrow_rhs_acc : (n_fe,)
+    logdet_Q_cond : scalar
+    """
+    block_size = n_models * ns
+    eps = jnp.finfo(dtype).eps
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_bs = jnp.eye(block_size, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+
+    padded_lower_rows = []
+    padded_lower_cols = []
+    padded_lower_vals = []
+    for m in range(n_models):
+        lr = per_model_ata_lower_rows[m]
+        lc = per_model_ata_lower_cols[m]
+        lv = per_model_ata_lower_vals[m]
+        padded_lower_rows.append(jnp.concatenate([
+            lr, jnp.zeros((1, lr.shape[1]), dtype=jnp.int32)], axis=0))
+        padded_lower_cols.append(jnp.concatenate([
+            lc, jnp.zeros((1, lc.shape[1]), dtype=jnp.int32)], axis=0))
+        padded_lower_vals.append(jnp.concatenate([
+            lv, jnp.zeros((1, lv.shape[1]), dtype=dtype)], axis=0))
+
+    sc_list_padded = []
+    for m in range(n_models):
+        sc_m = sc_list[m]
+        sc_list_padded.append({
+            **sc_m,
+            'm0_subdiag': jnp.concatenate([sc_m['m0_subdiag'], jnp.zeros(1, dtype=dtype)]),
+            'm1_subdiag': jnp.concatenate([sc_m['m1_subdiag'], jnp.zeros(1, dtype=dtype)]),
+            'm2_subdiag': jnp.concatenate([sc_m['m2_subdiag'], jnp.zeros(1, dtype=dtype)]),
+        })
+
+    arrow_tip_init = fe_prec * eye_nfe + eps_reg * eye_nfe
+    for m in range(n_models):
+        arrow_tip_init = arrow_tip_init + likelihood_precs[m] * per_model_ata_tip[m]
+
+    # Pre-allocate output buffers (fori_loop with manual accumulation
+    # instead of lax.scan, to help XLA free per-iteration intermediates)
+    stored_cs_buf = jnp.zeros((n_local, block_size, block_size), dtype=dtype)
+    stored_as_buf = jnp.zeros((n_local, n_fe, block_size), dtype=dtype)
+    y_st_buf = jnp.zeros((n_local, block_size), dtype=dtype)
+
+    # Pack per-model scan inputs into indexable arrays
+    global_indices = jnp.arange(start_idx, start_idx + n_local)
+    all_diag_rows = [per_model_ata_diag_rows[m] for m in range(n_models)]
+    all_diag_cols = [per_model_ata_diag_cols[m] for m in range(n_models)]
+    all_diag_vals = [per_model_ata_diag_vals[m] for m in range(n_models)]
+    all_lower_rows = [padded_lower_rows[m][:n_local] for m in range(n_models)]
+    all_lower_cols = [padded_lower_cols[m][:n_local] for m in range(n_models)]
+    all_lower_vals = [padded_lower_vals[m][:n_local] for m in range(n_models)]
+    all_arrow_rows = [per_model_ata_arrow_rows[m] for m in range(n_models)]
+    all_arrow_cols = [per_model_ata_arrow_cols[m] for m in range(n_models)]
+    all_arrow_vals = [per_model_ata_arrow_vals[m] for m in range(n_models)]
+
+    def fori_body(j, state):
+        (cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
+         prev_lower_y, arrow_rhs_acc_,
+         stored_cs_, stored_as_, y_st_) = state
+
+        global_i = global_indices[j]
+        rhs_i = rhs_st[j]
+
+        # Save incoming carries (before this block modifies them)
+        stored_cs_ = stored_cs_.at[j].set(cond_schur)
+        stored_as_ = stored_as_.at[j].set(arrow_schur)
+
+        # Reconstruct diagonal block
+        q_cond_diag_i = _reconstruct_coregional_diag_block(
+            sc_list_padded, coreg_w, n_models, ns, global_i)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_cond_diag_i = q_cond_diag_i.at[
+                m_off + all_diag_rows[m][j], m_off + all_diag_cols[m][j]
+            ].add(likelihood_precs[m] * all_diag_vals[m][j])
+        q_cond_diag_i = q_cond_diag_i + eps_reg * eye_bs - cond_schur
+
+        L_i = _jax_cholesky(q_cond_diag_i)
+        cond_diag_vals = jnp.diag(L_i)
+        safe_cond = jnp.maximum(cond_diag_vals, eps)
+        logdet_cond = logdet_cond + 2.0 * jnp.sum(jnp.log(safe_cond))
+
+        # Reconstruct lower block
+        q_cond_lower_i = _reconstruct_coregional_lower_block(
+            sc_list_padded, coreg_w, n_models, ns, global_i)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_cond_lower_i = q_cond_lower_i.at[
+                m_off + all_lower_rows[m][j], m_off + all_lower_cols[m][j]
+            ].add(likelihood_precs[m] * all_lower_vals[m][j])
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_cond_lower_i.T, lower=True).T
+
+        # Arrow block
+        q_arrow_i = jnp.zeros((n_fe, block_size), dtype=dtype)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_arrow_i = q_arrow_i.at[
+                all_arrow_rows[m][j], m_off + all_arrow_cols[m][j]
+            ].add(likelihood_precs[m] * all_arrow_vals[m][j])
+        q_arrow_i = q_arrow_i - arrow_schur
+        L_arrow_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_arrow_i.T, lower=True).T
+
+        # Schur complement updates
+        new_cond_schur = L_lower_i @ L_lower_i.T
+        new_arrow_schur = L_arrow_i @ L_lower_i.T
+        new_arrow_tip_acc = arrow_tip_acc - L_arrow_i @ L_arrow_i.T
+
+        new_cond_schur = jnp.where(global_i < nt_global - 1,
+                                   new_cond_schur, jnp.zeros_like(new_cond_schur))
+        new_arrow_schur = jnp.where(global_i < nt_global - 1,
+                                    new_arrow_schur, jnp.zeros_like(new_arrow_schur))
+
+        # Forward substitution
+        modified_rhs_i = rhs_i - prev_lower_y
+        y_i = jax.scipy.linalg.solve_triangular(L_i, modified_rhs_i, lower=True)
+        y_st_ = y_st_.at[j].set(y_i)
+
+        new_prev_lower_y = L_lower_i @ y_i
+        new_prev_lower_y = jnp.where(global_i < nt_global - 1,
+                                     new_prev_lower_y, jnp.zeros_like(new_prev_lower_y))
+        new_arrow_rhs_acc = arrow_rhs_acc_ - L_arrow_i @ y_i
+
+        return (new_cond_schur, new_arrow_tip_acc, new_arrow_schur,
+                logdet_cond, new_prev_lower_y, new_arrow_rhs_acc,
+                stored_cs_, stored_as_, y_st_)
+
+    init_cond_schur = jnp.zeros((block_size, block_size), dtype=dtype)
+    init_arrow_tip_acc = arrow_tip_init
+    init_arrow_schur = jnp.zeros((n_fe, block_size), dtype=dtype)
+    init_logdet = jnp.array(0.0, dtype=dtype)
+    init_prev_lower_y = jnp.zeros(block_size, dtype=dtype)
+    init_arrow_rhs_acc = rhs_fe
+
+    if rank > 0:
+        init_cond_schur = mpi4jax.recv(
+            init_cond_schur, source=rank - 1, tag=0, comm=comm)
+        init_arrow_tip_acc = mpi4jax.recv(
+            init_arrow_tip_acc, source=rank - 1, tag=1, comm=comm)
+        init_arrow_schur = mpi4jax.recv(
+            init_arrow_schur, source=rank - 1, tag=2, comm=comm)
+        init_logdet = mpi4jax.recv(
+            init_logdet, source=rank - 1, tag=3, comm=comm)
+        init_prev_lower_y = mpi4jax.recv(
+            init_prev_lower_y, source=rank - 1, tag=4, comm=comm)
+        init_arrow_rhs_acc = mpi4jax.recv(
+            init_arrow_rhs_acc, source=rank - 1, tag=5, comm=comm)
+
+    init_state = (init_cond_schur, init_arrow_tip_acc, init_arrow_schur,
+                  init_logdet, init_prev_lower_y, init_arrow_rhs_acc,
+                  stored_cs_buf, stored_as_buf, y_st_buf)
+
+    (final_cond_schur, final_arrow_tip_acc, final_arrow_schur,
+     local_logdet, final_prev_lower_y, final_arrow_rhs_acc,
+     local_stored_cond_schurs, local_stored_arrow_schurs, local_y_st) = \
+        lax.fori_loop(0, n_local, fori_body, init_state)
+
+    if rank < comm_size - 1:
+        mpi4jax.send(final_cond_schur, dest=rank + 1, tag=0, comm=comm)
+        mpi4jax.send(final_arrow_tip_acc, dest=rank + 1, tag=1, comm=comm)
+        mpi4jax.send(final_arrow_schur, dest=rank + 1, tag=2, comm=comm)
+        mpi4jax.send(local_logdet, dest=rank + 1, tag=3, comm=comm)
+        mpi4jax.send(final_prev_lower_y, dest=rank + 1, tag=4, comm=comm)
+        mpi4jax.send(final_arrow_rhs_acc, dest=rank + 1, tag=5, comm=comm)
+
+    logdet_Q_cond_global = mpi4jax.bcast(
+        local_logdet, root=comm_size - 1, comm=comm)
+
+    L_tip = _jax_cholesky(final_arrow_tip_acc)
+    tip_diag = jnp.diag(L_tip)
+    safe_tip_diag = jnp.maximum(tip_diag, eps)
+    logdet_tip = 2.0 * jnp.sum(jnp.log(safe_tip_diag))
+
+    L_tip = mpi4jax.bcast(L_tip, root=comm_size - 1, comm=comm)
+    arrow_rhs_acc_global = mpi4jax.bcast(
+        final_arrow_rhs_acc, root=comm_size - 1, comm=comm)
+    logdet_tip = mpi4jax.bcast(logdet_tip, root=comm_size - 1, comm=comm)
+
+    logdet_Q_cond = logdet_Q_cond_global + logdet_tip
+
+    return (local_stored_cond_schurs, local_stored_arrow_schurs,
+            local_y_st, L_tip, arrow_rhs_acc_global, logdet_Q_cond)
+
+
+def pipeline_backward_sub_from_carries_coregional(
+    local_stored_cond_schurs, local_stored_arrow_schurs, L_tip,
+    local_y_st, arrow_rhs_acc,
+    sc_list, coreg_w, likelihood_precs,
+    per_model_ata_diag_rows, per_model_ata_diag_cols, per_model_ata_diag_vals,
+    per_model_ata_lower_rows, per_model_ata_lower_cols, per_model_ata_lower_vals,
+    per_model_ata_arrow_rows, per_model_ata_arrow_cols, per_model_ata_arrow_vals,
+    per_model_offsets,
+    n_models, nt_global, ns, n_fe, dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed backward substitution for coregional models.
+
+    Parameters
+    ----------
+    local_stored_cond_schurs : (n_local, block_size, block_size)
+    local_stored_arrow_schurs : (n_local, n_fe, block_size)
+    L_tip : (n_fe, n_fe)
+    local_y_st : (n_local, block_size)
+    arrow_rhs_acc : (n_fe,)
+    sc_list : list of dict
+    coreg_w : (n_models, n_models, n_models)
+    likelihood_precs : (n_models,)
+    per_model_ata_* : local per-model sparse COO data
+    per_model_offsets : list of int
+    n_models, nt_global, ns, n_fe : int
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    x_st_global : (nt_global, block_size)
+    x_fe : (n_fe,)
+    quad : scalar
+    """
+    from mpi4py import MPI
+
+    block_size = n_models * ns
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_bs = jnp.eye(block_size, dtype=dtype)
+
+    sc_padded = []
+    for m in range(n_models):
+        sc_m = sc_list[m]
+        sc_padded.append({
+            **sc_m,
+            'm0_subdiag': jnp.concatenate([sc_m['m0_subdiag'], jnp.zeros(1, dtype=dtype)]),
+            'm1_subdiag': jnp.concatenate([sc_m['m1_subdiag'], jnp.zeros(1, dtype=dtype)]),
+            'm2_subdiag': jnp.concatenate([sc_m['m2_subdiag'], jnp.zeros(1, dtype=dtype)]),
+        })
+
+    padded_lower_rows = []
+    padded_lower_cols = []
+    padded_lower_vals = []
+    for m in range(n_models):
+        lr = per_model_ata_lower_rows[m]
+        lc = per_model_ata_lower_cols[m]
+        lv = per_model_ata_lower_vals[m]
+        padded_lower_rows.append(jnp.concatenate([
+            lr, jnp.zeros((1, lr.shape[1]), dtype=jnp.int32)], axis=0))
+        padded_lower_cols.append(jnp.concatenate([
+            lc, jnp.zeros((1, lc.shape[1]), dtype=jnp.int32)], axis=0))
+        padded_lower_vals.append(jnp.concatenate([
+            lv, jnp.zeros((1, lv.shape[1]), dtype=dtype)], axis=0))
+
+    def reconstruct_L_local(local_i):
+        global_i = start_idx + local_i
+        q_diag = _reconstruct_coregional_diag_block(sc_padded, coreg_w, n_models, ns, global_i)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_diag = q_diag.at[
+                m_off + per_model_ata_diag_rows[m][local_i],
+                m_off + per_model_ata_diag_cols[m][local_i]
+            ].add(likelihood_precs[m] * per_model_ata_diag_vals[m][local_i])
+        q_diag = q_diag + eps_reg * eye_bs - local_stored_cond_schurs[local_i]
+        L_i = _jax_cholesky(q_diag)
+
+        q_lower = _reconstruct_coregional_lower_block(sc_padded, coreg_w, n_models, ns, global_i)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_lower = q_lower.at[
+                m_off + padded_lower_rows[m][local_i],
+                m_off + padded_lower_cols[m][local_i]
+            ].add(likelihood_precs[m] * padded_lower_vals[m][local_i])
+        L_lower_i = jax.scipy.linalg.solve_triangular(L_i, q_lower.T, lower=True).T
+
+        q_arrow = jnp.zeros((n_fe, block_size), dtype=dtype)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_arrow = q_arrow.at[
+                per_model_ata_arrow_rows[m][local_i],
+                m_off + per_model_ata_arrow_cols[m][local_i]
+            ].add(likelihood_precs[m] * per_model_ata_arrow_vals[m][local_i])
+        q_arrow = q_arrow - local_stored_arrow_schurs[local_i]
+        L_arrow_i = jax.scipy.linalg.solve_triangular(L_i, q_arrow.T, lower=True).T
+
+        return L_i, L_lower_i, L_arrow_i
+
+    y_fe = jax.scipy.linalg.solve_triangular(L_tip, arrow_rhs_acc, lower=True)
+    local_quad = jnp.sum(local_y_st ** 2)
+    y_fe_quad = jnp.where(rank == comm_size - 1, jnp.sum(y_fe ** 2), 0.0)
+    local_quad = local_quad + y_fe_quad
+
+    x_fe = jax.scipy.linalg.solve_triangular(L_tip.T, y_fe, lower=False)
+
+    max_n_local = (nt_global + comm_size - 1) // comm_size
+    local_x_st = jnp.zeros((max_n_local, block_size), dtype=dtype)
+
+    x_next = jnp.zeros(block_size, dtype=dtype)
+    if rank < comm_size - 1:
+        x_next = mpi4jax.recv(x_next, source=rank + 1, tag=10, comm=comm)
+
+    last_local = n_local - 1
+    global_last = start_idx + last_local
+
+    L_last, L_lower_last, L_arrow_last = reconstruct_L_local(last_local)
+    rhs_last = local_y_st[last_local] - L_arrow_last.T @ x_fe
+    rhs_last = jnp.where(global_last < nt_global - 1,
+                         rhs_last - L_lower_last.T @ x_next, rhs_last)
+    x_last_local = jax.scipy.linalg.solve_triangular(L_last.T, rhs_last, lower=False)
+    local_x_st = local_x_st.at[last_local].set(x_last_local)
+
+    def body_fn(j_rev, carry):
+        x_st_, x_next_ = carry
+        local_i = last_local - 1 - j_rev
+
+        L_i, L_lower_i, L_arrow_i = reconstruct_L_local(local_i)
+        x_i = jax.scipy.linalg.solve_triangular(
+            L_i.T,
+            local_y_st[local_i] - L_lower_i.T @ x_next_ - L_arrow_i.T @ x_fe,
+            lower=False,
+        )
+        x_st_ = x_st_.at[local_i].set(x_i)
+        return (x_st_, x_i)
+
+    local_x_st, x_first = lax.fori_loop(0, n_local - 1, body_fn, (local_x_st, x_last_local))
+
+    if rank > 0:
+        mpi4jax.send(x_first, dest=rank - 1, tag=10, comm=comm)
+
+    x_st_gathered = mpi4jax.allgather(local_x_st, comm=comm)
+    x_st_global = x_st_gathered.reshape(-1, block_size)[:nt_global]
+
+    quad_global = mpi4jax.allreduce(local_quad, op=MPI.SUM, comm=comm)
+
+    return x_st_global, x_fe, quad_global
+
+
+def pipeline_logdet_Q_prior_coregional_scan(
+    sc_list, coreg_w, n_models, ns, nt_global, dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed logdet(Q_prior) for coregional model via BT Cholesky.
+
+    Parameters
+    ----------
+    sc_list : list of dict
+        Per-model spatial components (padded subdiags).
+    coreg_w : (n_models, n_models, n_models)
+    n_models, ns, nt_global : int
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    logdet : scalar
+    """
+    block_size = n_models * ns
+    eps = jnp.finfo(dtype).eps
+
+    def fori_body(j, state):
+        schur, logdet = state
+        global_i = global_indices[j]
+        q_diag_i = _reconstruct_coregional_diag_block(
+            sc_list, coreg_w, n_models, ns, global_i) - schur
+        L_i = _jax_cholesky(q_diag_i)
+        diag_vals = jnp.diag(L_i)
+        safe_vals = jnp.maximum(diag_vals, eps)
+        logdet = logdet + 2.0 * jnp.sum(jnp.log(safe_vals))
+
+        q_lower_i = _reconstruct_coregional_lower_block(
+            sc_list, coreg_w, n_models, ns, global_i)
+        L_inv_lower = jax.scipy.linalg.solve_triangular(
+            L_i, q_lower_i.T, lower=True)
+        new_schur = L_inv_lower.T @ L_inv_lower
+        new_schur = jnp.where(global_i < nt_global - 1, new_schur,
+                              jnp.zeros_like(new_schur))
+        return new_schur, logdet
+
+    init_schur = jnp.zeros((block_size, block_size), dtype=dtype)
+    init_logdet = jnp.array(0.0, dtype=dtype)
+
+    if rank > 0:
+        init_schur = mpi4jax.recv(init_schur, source=rank - 1, tag=30, comm=comm)
+        init_logdet = mpi4jax.recv(init_logdet, source=rank - 1, tag=33, comm=comm)
+
+    global_indices = jnp.arange(start_idx, start_idx + n_local)
+    final_schur, local_logdet = lax.fori_loop(
+        0, n_local, fori_body, (init_schur, init_logdet))
+
+    if rank < comm_size - 1:
+        mpi4jax.send(final_schur, dest=rank + 1, tag=30, comm=comm)
+        mpi4jax.send(local_logdet, dest=rank + 1, tag=33, comm=comm)
+
+    logdet = mpi4jax.bcast(local_logdet, root=comm_size - 1, comm=comm)
+    return logdet
+
+
+def pipeline_logdet_Q_prior_coregional_grad(
+    sc_list, jac_sc_list, coreg_w, jac_coreg_w,
+    n_models, ns, nt_global, dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed gradient of logdet(Q_prior) for coregional models.
+
+    Forward BT Cholesky storing Schur carries, then backward BT selected
+    inversion with boundary communication to accumulate gradient traces.
+
+    Parameters
+    ----------
+    sc_list : list of dict
+        Per-model spatial components (padded subdiags).
+    jac_sc_list : list of dict
+        Per-model Jacobians.
+    coreg_w : (n_models, n_models, n_models)
+    jac_coreg_w : (n_models, n_models, n_models, n_coreg_params)
+    n_models, ns, nt_global : int
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    grad_per_model_st : list of (n_theta_st_m,) arrays
+    grad_coreg : (n_coreg_params,)
+    """
+    from mpi4py import MPI
+
+    block_size = n_models * ns
+    eye_bs = jnp.eye(block_size, dtype=dtype)
+    n_coreg = jac_coreg_w.shape[-1]
+    n_models_cubed = n_models * n_models * n_models
+
+    # Stack spatial components and Jacobians for fori_loop dynamic indexing
+    q1s_all = jnp.stack([sc_list[m]['q1s'] for m in range(n_models)])
+    q2s_all = jnp.stack([sc_list[m]['q2s'] for m in range(n_models)])
+    q3s_all = jnp.stack([sc_list[m]['q3s'] for m in range(n_models)])
+    scale_all = jnp.array([sc_list[m]['scale'] for m in range(n_models)])
+    exp_gt_all = jnp.array([sc_list[m]['exp_gt'] for m in range(n_models)])
+    m0_diag_all = jnp.stack([sc_list[m]['m0_diag'] for m in range(n_models)])
+    m1_diag_all = jnp.stack([sc_list[m]['m1_diag'] for m in range(n_models)])
+    m2_diag_all = jnp.stack([sc_list[m]['m2_diag'] for m in range(n_models)])
+    m0_sub_all = jnp.stack([sc_list[m]['m0_subdiag'] for m in range(n_models)])
+    m1_sub_all = jnp.stack([sc_list[m]['m1_subdiag'] for m in range(n_models)])
+    m2_sub_all = jnp.stack([sc_list[m]['m2_subdiag'] for m in range(n_models)])
+    jac_q1s_all = jnp.stack([jac_sc_list[m]['q1s'] for m in range(n_models)])
+    jac_q2s_all = jnp.stack([jac_sc_list[m]['q2s'] for m in range(n_models)])
+    jac_q3s_all = jnp.stack([jac_sc_list[m]['q3s'] for m in range(n_models)])
+    jac_scale_all = jnp.stack([jac_sc_list[m]['scale'] for m in range(n_models)])
+    jac_exp_gt_all = jnp.stack([jac_sc_list[m]['exp_gt'] for m in range(n_models)])
+
+    # --- Forward BT Cholesky, store incoming Schurs ---
+    # Use fori_loop instead of lax.scan to reduce XLA memory pressure.
+    global_indices = jnp.arange(start_idx, start_idx + n_local)
+    stored_schurs_buf = jnp.zeros((n_local, block_size, block_size), dtype=dtype)
+
+    init_schur = jnp.zeros((block_size, block_size), dtype=dtype)
+    if rank > 0:
+        init_schur = mpi4jax.recv(init_schur, source=rank - 1, tag=30, comm=comm)
+
+    def fwd_fori_body(j, state):
+        schur, stored_ = state
+        stored_ = stored_.at[j].set(schur)
+        global_i = global_indices[j]
+        q_diag = _reconstruct_coregional_diag_block(
+            sc_list, coreg_w, n_models, ns, global_i) - schur
+        L_i = _jax_cholesky(q_diag)
+        q_lower = _reconstruct_coregional_lower_block(
+            sc_list, coreg_w, n_models, ns, global_i)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_lower.T, lower=True).T
+        new_schur = L_lower_i @ L_lower_i.T
+        new_schur = jnp.where(global_i < nt_global - 1, new_schur,
+                              jnp.zeros_like(new_schur))
+        return new_schur, stored_
+
+    final_schur, local_stored_schurs = lax.fori_loop(
+        0, n_local, fwd_fori_body, (init_schur, stored_schurs_buf))
+
+    if rank < comm_size - 1:
+        mpi4jax.send(final_schur, dest=rank + 1, tag=30, comm=comm)
+
+    def _reconstruct_L_local(local_i):
+        global_i = start_idx + local_i
+        q_diag = _reconstruct_coregional_diag_block(
+            sc_list, coreg_w, n_models, ns, global_i) - local_stored_schurs[local_i]
+        L_i = _jax_cholesky(q_diag)
+        q_lower = _reconstruct_coregional_lower_block(
+            sc_list, coreg_w, n_models, ns, global_i)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_lower.T, lower=True).T
+        return L_i, L_lower_i
+
+    def _accumulate_traces(sd_i, sl_i, t_diag, t_lower):
+        def _diag_trace_body(flat_idx, acc):
+            g_st_, g_c_ = acc
+            ii = flat_idx // (n_models * n_models)
+            jj = (flat_idx // n_models) % n_models
+            m_idx = flat_idx % n_models
+
+            sd_ij = lax.dynamic_slice(sd_i, (ii * ns, jj * ns), (ns, ns))
+            w_ijm = coreg_w[ii, jj, m_idx]
+
+            scale_m = scale_all[m_idx]
+            exp_gt_m = exp_gt_all[m_idx]
+            m0_d = m0_diag_all[m_idx, t_diag]
+            m1_d = m1_diag_all[m_idx, t_diag]
+            m2_d = m2_diag_all[m_idx, t_diag]
+            q1s_m = q1s_all[m_idx]
+            q2s_m = q2s_all[m_idx]
+            q3s_m = q3s_all[m_idx]
+
+            base_d = m0_d * q3s_m + exp_gt_m * m1_d * q2s_m + exp_gt_m**2 * m2_d * q1s_m
+            tr_val = jnp.sum(sd_ij * (scale_m * base_d).T)
+
+            dw = jac_coreg_w[ii, jj, m_idx, :]
+            g_c_ = g_c_ + dw * tr_val
+
+            partial_gt_d = m1_d * q2s_m + 2.0 * exp_gt_m * m2_d * q1s_m
+            for k in range(3):
+                dq3 = jac_q3s_all[m_idx, :, :, k]
+                dq2 = jac_q2s_all[m_idx, :, :, k]
+                dq1 = jac_q1s_all[m_idx, :, :, k]
+                d_scale = jac_scale_all[m_idx, k]
+                d_exp_gt = jac_exp_gt_all[m_idx, k]
+
+                dQu = (
+                    d_scale * base_d
+                    + scale_m * (m0_d * dq3 + exp_gt_m * m1_d * dq2
+                                 + exp_gt_m**2 * m2_d * dq1)
+                    + scale_m * d_exp_gt * partial_gt_d
+                )
+                g_st_ = g_st_.at[m_idx, k].add(w_ijm * jnp.sum(sd_ij * dQu.T))
+
+            return (g_st_, g_c_)
+
+        g_st_init = jnp.zeros((n_models, 3), dtype=dtype)
+        g_c_init = jnp.zeros(n_coreg, dtype=dtype)
+        g_st, g_c = lax.fori_loop(0, n_models_cubed, _diag_trace_body, (g_st_init, g_c_init))
+
+        if t_lower is not None:
+            def _lower_trace_body(flat_idx, acc):
+                g_st_, g_c_ = acc
+                ii = flat_idx // (n_models * n_models)
+                jj = (flat_idx // n_models) % n_models
+                m_idx = flat_idx % n_models
+
+                sl_ij = lax.dynamic_slice(sl_i, (ii * ns, jj * ns), (ns, ns))
+                w_ijm = coreg_w[ii, jj, m_idx]
+
+                scale_m = scale_all[m_idx]
+                exp_gt_m = exp_gt_all[m_idx]
+                m0_s = m0_sub_all[m_idx, t_lower]
+                m1_s = m1_sub_all[m_idx, t_lower]
+                m2_s = m2_sub_all[m_idx, t_lower]
+                q1s_m = q1s_all[m_idx]
+                q2s_m = q2s_all[m_idx]
+                q3s_m = q3s_all[m_idx]
+
+                base_l = m0_s * q3s_m + exp_gt_m * m1_s * q2s_m + exp_gt_m**2 * m2_s * q1s_m
+                tr_val_l = jnp.sum(sl_ij * (scale_m * base_l).T)
+
+                dw = jac_coreg_w[ii, jj, m_idx, :]
+                g_c_ = g_c_ + 2.0 * dw * tr_val_l
+
+                partial_gt_l = m1_s * q2s_m + 2.0 * exp_gt_m * m2_s * q1s_m
+                for k in range(3):
+                    dq3 = jac_q3s_all[m_idx, :, :, k]
+                    dq2 = jac_q2s_all[m_idx, :, :, k]
+                    dq1 = jac_q1s_all[m_idx, :, :, k]
+                    d_scale = jac_scale_all[m_idx, k]
+                    d_exp_gt = jac_exp_gt_all[m_idx, k]
+
+                    dQu_l = (
+                        d_scale * base_l
+                        + scale_m * (m0_s * dq3 + exp_gt_m * m1_s * dq2
+                                     + exp_gt_m**2 * m2_s * dq1)
+                        + scale_m * d_exp_gt * partial_gt_l
+                    )
+                    g_st_ = g_st_.at[m_idx, k].add(
+                        2.0 * w_ijm * jnp.sum(sl_ij * dQu_l.T))
+
+                return (g_st_, g_c_)
+
+            g_st_l, g_c_l = lax.fori_loop(
+                0, n_models_cubed, _lower_trace_body, (g_st_init, g_c_init))
+            g_st = g_st + g_st_l
+            g_c = g_c + g_c_l
+
+        return g_st, g_c
+
+    # --- Backward SI sweep ---
+    sd_boundary = jnp.zeros((block_size, block_size), dtype=dtype)
+    if rank < comm_size - 1:
+        sd_boundary = mpi4jax.recv(sd_boundary, source=rank + 1, tag=31, comm=comm)
+
+    last_local = n_local - 1
+    global_last = start_idx + last_local
+    is_global_last = (global_last == nt_global - 1)
+
+    L_last, L_lower_last = _reconstruct_L_local(last_local)
+    L_inv_last = jax.scipy.linalg.solve_triangular(L_last, eye_bs, lower=True)
+
+    sd_global_last = L_inv_last.T @ L_inv_last
+    sl_from_bnd = -sd_boundary @ L_lower_last @ L_inv_last
+    sd_from_bnd = (L_inv_last.T - sl_from_bnd.T @ L_lower_last) @ L_inv_last
+
+    sd_last = jnp.where(is_global_last, sd_global_last, sd_from_bnd)
+
+    g_st_last, g_c_last = _accumulate_traces(sd_last, None, global_last, None)
+
+    safe_idx = jnp.minimum(global_last, nt_global - 2)
+    sl_last_for_trace = jnp.where(is_global_last, jnp.zeros_like(sl_from_bnd), sl_from_bnd)
+    t_lower_last = jnp.where(is_global_last, global_last, safe_idx)
+    g_st_sl, g_c_sl = _accumulate_traces(
+        jnp.zeros_like(sd_last), sl_last_for_trace, global_last, t_lower_last)
+    g_st_last = g_st_last + jnp.where(is_global_last, jnp.zeros_like(g_st_sl), g_st_sl)
+    g_c_last = g_c_last + jnp.where(is_global_last, jnp.zeros_like(g_c_sl), g_c_sl)
+
+    grad_per_model_st = g_st_last
+    grad_coreg = g_c_last
+
+    def bwd_body(i_rev, carry):
+        sd_prev, grad_st_acc, grad_c_acc = carry
+        local_i = last_local - 1 - i_rev
+        global_i = start_idx + local_i
+
+        L_i, L_lower_i = _reconstruct_L_local(local_i)
+        L_inv_i = jax.scipy.linalg.solve_triangular(L_i, eye_bs, lower=True)
+        sl_i = -sd_prev @ L_lower_i @ L_inv_i
+        sd_i = (L_inv_i.T - sl_i.T @ L_lower_i) @ L_inv_i
+
+        g_st_i, g_c_i = _accumulate_traces(sd_i, sl_i, global_i, global_i)
+        return (sd_i, grad_st_acc + g_st_i, grad_c_acc + g_c_i)
+
+    carry = (sd_last, grad_per_model_st, grad_coreg)
+    sd_first, grad_per_model_st, grad_coreg = lax.fori_loop(
+        0, n_local - 1, bwd_body, carry)
+
+    if rank > 0:
+        mpi4jax.send(sd_first, dest=rank - 1, tag=31, comm=comm)
+
+    grad_per_model_st = mpi4jax.allreduce(grad_per_model_st, op=MPI.SUM, comm=comm)
+    grad_coreg = mpi4jax.allreduce(grad_coreg, op=MPI.SUM, comm=comm)
+
+    return [grad_per_model_st[m] for m in range(n_models)], grad_coreg
+
+
+def pipeline_selected_inversion_grads_from_carries_coregional(
+    local_stored_cond_schurs, local_stored_arrow_schurs, L_tip,
+    sc_list, jac_sc_list, coreg_w, jac_coreg_w,
+    n_models, nt_global, ns, n_fe,
+    likelihood_precs,
+    per_model_ata_diag_rows, per_model_ata_diag_cols, per_model_ata_diag_vals,
+    per_model_ata_lower_rows, per_model_ata_lower_cols, per_model_ata_lower_vals,
+    per_model_ata_arrow_rows, per_model_ata_arrow_cols, per_model_ata_arrow_vals,
+    per_model_ata_tip, per_model_offsets,
+    dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed selected inversion gradients for coregional models.
+
+    Backward SI sweep with boundary communication between ranks.
+
+    Parameters
+    ----------
+    local_stored_cond_schurs : (n_local, block_size, block_size)
+    local_stored_arrow_schurs : (n_local, n_fe, block_size)
+    L_tip : (n_fe, n_fe)
+    sc_list : list of dict
+        Per-model spatial components (padded subdiags).
+    jac_sc_list : list of dict
+    coreg_w : (n_models, n_models, n_models)
+    jac_coreg_w : (n_models, n_models, n_models, n_coreg_params)
+    n_models, nt_global, ns, n_fe : int
+    likelihood_precs : (n_models,)
+    per_model_ata_* : local per-model sparse COO data
+    per_model_ata_tip : list of (n_fe, n_fe)
+    per_model_offsets : list of int
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    grad_per_model_st : list of (3,) arrays
+    grad_per_model_lik : (n_models,)
+    grad_coreg : (n_coreg_params,)
+    """
+    from mpi4py import MPI
+
+    block_size = n_models * ns
+    is_fp32 = (dtype == jnp.float32)
+    eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
+    eye_bs = jnp.eye(block_size, dtype=dtype)
+    eye_nfe = jnp.eye(n_fe, dtype=dtype)
+    n_coreg = jac_coreg_w.shape[-1]
+    n_models_cubed = n_models * n_models * n_models
+
+    # Stack spatial components and Jacobians for fori_loop dynamic indexing
+    q1s_all = jnp.stack([sc_list[m]['q1s'] for m in range(n_models)])
+    q2s_all = jnp.stack([sc_list[m]['q2s'] for m in range(n_models)])
+    q3s_all = jnp.stack([sc_list[m]['q3s'] for m in range(n_models)])
+    scale_all = jnp.array([sc_list[m]['scale'] for m in range(n_models)])
+    exp_gt_all = jnp.array([sc_list[m]['exp_gt'] for m in range(n_models)])
+    m0_diag_all = jnp.stack([sc_list[m]['m0_diag'] for m in range(n_models)])
+    m1_diag_all = jnp.stack([sc_list[m]['m1_diag'] for m in range(n_models)])
+    m2_diag_all = jnp.stack([sc_list[m]['m2_diag'] for m in range(n_models)])
+    m0_sub_all = jnp.stack([sc_list[m]['m0_subdiag'] for m in range(n_models)])
+    m1_sub_all = jnp.stack([sc_list[m]['m1_subdiag'] for m in range(n_models)])
+    m2_sub_all = jnp.stack([sc_list[m]['m2_subdiag'] for m in range(n_models)])
+    jac_q1s_all = jnp.stack([jac_sc_list[m]['q1s'] for m in range(n_models)])
+    jac_q2s_all = jnp.stack([jac_sc_list[m]['q2s'] for m in range(n_models)])
+    jac_q3s_all = jnp.stack([jac_sc_list[m]['q3s'] for m in range(n_models)])
+    jac_scale_all = jnp.stack([jac_sc_list[m]['scale'] for m in range(n_models)])
+    jac_exp_gt_all = jnp.stack([jac_sc_list[m]['exp_gt'] for m in range(n_models)])
+
+    padded_lower_rows = []
+    padded_lower_cols = []
+    padded_lower_vals = []
+    for m in range(n_models):
+        lr = per_model_ata_lower_rows[m]
+        lc = per_model_ata_lower_cols[m]
+        lv = per_model_ata_lower_vals[m]
+        padded_lower_rows.append(jnp.concatenate([
+            lr, jnp.zeros((1, lr.shape[1]), dtype=jnp.int32)], axis=0))
+        padded_lower_cols.append(jnp.concatenate([
+            lc, jnp.zeros((1, lc.shape[1]), dtype=jnp.int32)], axis=0))
+        padded_lower_vals.append(jnp.concatenate([
+            lv, jnp.zeros((1, lv.shape[1]), dtype=dtype)], axis=0))
+
+    def reconstruct_L_local(local_i):
+        global_i = start_idx + local_i
+        q_diag = _reconstruct_coregional_diag_block(sc_list, coreg_w, n_models, ns, global_i)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_diag = q_diag.at[
+                m_off + per_model_ata_diag_rows[m][local_i],
+                m_off + per_model_ata_diag_cols[m][local_i]
+            ].add(likelihood_precs[m] * per_model_ata_diag_vals[m][local_i])
+        q_diag = q_diag + eps_reg * eye_bs - local_stored_cond_schurs[local_i]
+        L_i = _jax_cholesky(q_diag)
+
+        q_lower = _reconstruct_coregional_lower_block(sc_list, coreg_w, n_models, ns, global_i)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_lower = q_lower.at[
+                m_off + padded_lower_rows[m][local_i],
+                m_off + padded_lower_cols[m][local_i]
+            ].add(likelihood_precs[m] * padded_lower_vals[m][local_i])
+        L_lower_i = jax.scipy.linalg.solve_triangular(L_i, q_lower.T, lower=True).T
+
+        q_arrow = jnp.zeros((n_fe, block_size), dtype=dtype)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            q_arrow = q_arrow.at[
+                per_model_ata_arrow_rows[m][local_i],
+                m_off + per_model_ata_arrow_cols[m][local_i]
+            ].add(likelihood_precs[m] * per_model_ata_arrow_vals[m][local_i])
+        q_arrow = q_arrow - local_stored_arrow_schurs[local_i]
+        L_arrow_i = jax.scipy.linalg.solve_triangular(L_i, q_arrow.T, lower=True).T
+
+        return L_i, L_lower_i, L_arrow_i
+
+    def _accumulate_block_grads(sd_i, sl_i, sa_i, t_diag, t_lower, local_i):
+        # Diagonal trace accumulation via fori_loop (sequential over (ii,jj,m_idx) triples)
+        def _diag_trace_body(flat_idx, acc):
+            g_st_, g_c_ = acc
+            ii = flat_idx // (n_models * n_models)
+            jj = (flat_idx // n_models) % n_models
+            m_idx = flat_idx % n_models
+
+            sd_ij = lax.dynamic_slice(sd_i, (ii * ns, jj * ns), (ns, ns))
+            w_ijm = coreg_w[ii, jj, m_idx]
+
+            scale_m = scale_all[m_idx]
+            exp_gt_m = exp_gt_all[m_idx]
+            m0_d = m0_diag_all[m_idx, t_diag]
+            m1_d = m1_diag_all[m_idx, t_diag]
+            m2_d = m2_diag_all[m_idx, t_diag]
+            q1s_m = q1s_all[m_idx]
+            q2s_m = q2s_all[m_idx]
+            q3s_m = q3s_all[m_idx]
+
+            base_d = m0_d * q3s_m + exp_gt_m * m1_d * q2s_m + exp_gt_m**2 * m2_d * q1s_m
+            tr_val = jnp.sum(sd_ij * (scale_m * base_d).T)
+
+            dw = jac_coreg_w[ii, jj, m_idx, :]
+            g_c_ = g_c_ + dw * tr_val
+
+            partial_gt_d = m1_d * q2s_m + 2.0 * exp_gt_m * m2_d * q1s_m
+            for k in range(3):
+                dq3 = jac_q3s_all[m_idx, :, :, k]
+                dq2 = jac_q2s_all[m_idx, :, :, k]
+                dq1 = jac_q1s_all[m_idx, :, :, k]
+                d_scale = jac_scale_all[m_idx, k]
+                d_exp_gt = jac_exp_gt_all[m_idx, k]
+
+                dQu = (
+                    d_scale * base_d
+                    + scale_m * (m0_d * dq3 + exp_gt_m * m1_d * dq2
+                                 + exp_gt_m**2 * m2_d * dq1)
+                    + scale_m * d_exp_gt * partial_gt_d
+                )
+                g_st_ = g_st_.at[m_idx, k].add(w_ijm * jnp.sum(sd_ij * dQu.T))
+
+            return (g_st_, g_c_)
+
+        g_st_init = jnp.zeros((n_models, 3), dtype=dtype)
+        g_c_init = jnp.zeros(n_coreg, dtype=dtype)
+        g_st, g_c = lax.fori_loop(0, n_models_cubed, _diag_trace_body, (g_st_init, g_c_init))
+
+        # Lower trace accumulation via fori_loop (only when sl_i provided)
+        if sl_i is not None and t_lower is not None:
+            def _lower_trace_body(flat_idx, acc):
+                g_st_, g_c_ = acc
+                ii = flat_idx // (n_models * n_models)
+                jj = (flat_idx // n_models) % n_models
+                m_idx = flat_idx % n_models
+
+                sl_ij = lax.dynamic_slice(sl_i, (ii * ns, jj * ns), (ns, ns))
+                w_ijm = coreg_w[ii, jj, m_idx]
+
+                scale_m = scale_all[m_idx]
+                exp_gt_m = exp_gt_all[m_idx]
+                m0_s = m0_sub_all[m_idx, t_lower]
+                m1_s = m1_sub_all[m_idx, t_lower]
+                m2_s = m2_sub_all[m_idx, t_lower]
+                q1s_m = q1s_all[m_idx]
+                q2s_m = q2s_all[m_idx]
+                q3s_m = q3s_all[m_idx]
+
+                base_l = m0_s * q3s_m + exp_gt_m * m1_s * q2s_m + exp_gt_m**2 * m2_s * q1s_m
+                tr_val_l = jnp.sum(sl_ij * (scale_m * base_l).T)
+
+                dw = jac_coreg_w[ii, jj, m_idx, :]
+                g_c_ = g_c_ + 2.0 * dw * tr_val_l
+
+                partial_gt_l = m1_s * q2s_m + 2.0 * exp_gt_m * m2_s * q1s_m
+                for k in range(3):
+                    dq3 = jac_q3s_all[m_idx, :, :, k]
+                    dq2 = jac_q2s_all[m_idx, :, :, k]
+                    dq1 = jac_q1s_all[m_idx, :, :, k]
+                    d_scale = jac_scale_all[m_idx, k]
+                    d_exp_gt = jac_exp_gt_all[m_idx, k]
+
+                    dQu_l = (
+                        d_scale * base_l
+                        + scale_m * (m0_s * dq3 + exp_gt_m * m1_s * dq2
+                                     + exp_gt_m**2 * m2_s * dq1)
+                        + scale_m * d_exp_gt * partial_gt_l
+                    )
+                    g_st_ = g_st_.at[m_idx, k].add(
+                        2.0 * w_ijm * jnp.sum(sl_ij * dQu_l.T))
+
+                return (g_st_, g_c_)
+
+            g_st_l, g_c_l = lax.fori_loop(
+                0, n_models_cubed, _lower_trace_body, (g_st_init, g_c_init))
+            g_st = g_st + g_st_l
+            g_c = g_c + g_c_l
+
+        # Likelihood gradient from sparse AtA (small ops, keep as Python loop)
+        g_lik = jnp.zeros(n_models, dtype=dtype)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            sp_d = jnp.sum(
+                sd_i[m_off + per_model_ata_diag_rows[m][local_i],
+                     m_off + per_model_ata_diag_cols[m][local_i]]
+                * per_model_ata_diag_vals[m][local_i])
+            g_lik = g_lik.at[m].add(sp_d)
+
+            if sa_i is not None:
+                sp_a = jnp.sum(
+                    sa_i[per_model_ata_arrow_rows[m][local_i],
+                         m_off + per_model_ata_arrow_cols[m][local_i]]
+                    * per_model_ata_arrow_vals[m][local_i])
+                g_lik = g_lik.at[m].add(2.0 * sp_a)
+
+            if sl_i is not None and t_lower is not None:
+                sp_l = jnp.sum(
+                    sl_i[m_off + padded_lower_rows[m][local_i],
+                         m_off + padded_lower_cols[m][local_i]]
+                    * padded_lower_vals[m][local_i])
+                g_lik = g_lik.at[m].add(2.0 * sp_l)
+
+        return g_st, g_lik, g_c
+
+    # --- S_tip ---
+    L_tip_inv = jax.scipy.linalg.solve_triangular(L_tip, eye_nfe, lower=True)
+    S_tip = L_tip_inv.T @ L_tip_inv
+
+    # --- Boundary communication ---
+    sd_boundary = jnp.zeros((block_size, block_size), dtype=dtype)
+    sa_boundary = jnp.zeros((n_fe, block_size), dtype=dtype)
+
+    if rank < comm_size - 1:
+        sd_boundary = mpi4jax.recv(sd_boundary, source=rank + 1, tag=20, comm=comm)
+        sa_boundary = mpi4jax.recv(sa_boundary, source=rank + 1, tag=21, comm=comm)
+
+    last_local = n_local - 1
+    global_last = start_idx + last_local
+    is_global_last = (global_last == nt_global - 1)
+
+    L_last, L_lower_last, L_arrow_last = reconstruct_L_local(last_local)
+    L_blk_inv = jax.scipy.linalg.solve_triangular(L_last, eye_bs, lower=True)
+
+    sa_global_last = -S_tip @ L_arrow_last @ L_blk_inv
+    sd_global_last = (L_blk_inv.T - sa_global_last.T @ L_arrow_last) @ L_blk_inv
+
+    sl_last = (-sd_boundary @ L_lower_last - sa_boundary.T @ L_arrow_last) @ L_blk_inv
+    sa_from_bnd = (-sa_boundary @ L_lower_last - S_tip @ L_arrow_last) @ L_blk_inv
+    sd_from_bnd = (L_blk_inv.T - sl_last.T @ L_lower_last - sa_from_bnd.T @ L_arrow_last) @ L_blk_inv
+
+    sd_last = jnp.where(is_global_last, sd_global_last, sd_from_bnd)
+    sa_last = jnp.where(is_global_last, sa_global_last, sa_from_bnd)
+
+    # Diagonal + arrow contribution (sl=None, t_lower=None for last block)
+    g_st_last, g_lik_last, g_c_last = _accumulate_block_grads(
+        sd_last, None, sa_last, global_last, None, last_local)
+
+    # Tip contribution to likelihood
+    for m in range(n_models):
+        tip_val = jnp.where(rank == comm_size - 1,
+                            jnp.sum(S_tip * per_model_ata_tip[m]), 0.0)
+        g_lik_last = g_lik_last.at[m].add(tip_val)
+
+    # Lower block contribution at last local step (non-global-last only)
+    sl_last_for_trace = jnp.where(is_global_last,
+                                  jnp.zeros_like(sl_last), sl_last)
+    safe_idx = jnp.minimum(global_last, nt_global - 2)
+    g_st_sl, g_lik_sl, g_c_sl = _accumulate_block_grads(
+        jnp.zeros_like(sd_last), sl_last_for_trace, None, global_last,
+        safe_idx, last_local)
+    g_st_last = g_st_last + jnp.where(is_global_last,
+                                      jnp.zeros_like(g_st_sl), g_st_sl)
+    g_c_last = g_c_last + jnp.where(is_global_last,
+                                    jnp.zeros_like(g_c_sl), g_c_sl)
+
+    # Lower AtA likelihood contribution
+    for m in range(n_models):
+        m_off = per_model_offsets[m] * ns
+        sl_lik_val = jnp.where(
+            is_global_last, 0.0,
+            jnp.sum(sl_last[m_off + padded_lower_rows[m][last_local],
+                            m_off + padded_lower_cols[m][last_local]]
+                    * padded_lower_vals[m][last_local]))
+        g_lik_last = g_lik_last.at[m].add(2.0 * sl_lik_val)
+
+    grad_per_model_st = g_st_last.copy()
+    grad_lik_acc = g_lik_last.copy()
+    grad_coreg = g_c_last.copy()
+
+    # --- Backward loop ---
+    def bwd_body(i_rev, carry):
+        sd_prev, sa_prev, grad_st_acc, grad_lik, grad_c = carry
+        local_i = last_local - 1 - i_rev
+
+        L_i, L_lower_i, L_arrow_i = reconstruct_L_local(local_i)
+        L_blk_inv_i = jax.scipy.linalg.solve_triangular(L_i, eye_bs, lower=True)
+
+        sl_i = (-sd_prev @ L_lower_i - sa_prev.T @ L_arrow_i) @ L_blk_inv_i
+        sa_i = (-sa_prev @ L_lower_i - S_tip @ L_arrow_i) @ L_blk_inv_i
+        sd_i = (L_blk_inv_i.T - sl_i.T @ L_lower_i - sa_i.T @ L_arrow_i) @ L_blk_inv_i
+
+        g_st_i, g_lik_i, g_c_i = _accumulate_block_grads(
+            sd_i, sl_i, sa_i, start_idx + local_i, start_idx + local_i, local_i)
+
+        return (sd_i, sa_i, grad_st_acc + g_st_i, grad_lik + g_lik_i, grad_c + g_c_i)
+
+    carry = (sd_last, sa_last, grad_per_model_st, grad_lik_acc, grad_coreg)
+    sd_first, sa_first, grad_per_model_st, grad_lik_acc, grad_coreg = lax.fori_loop(
+        0, n_local - 1, bwd_body, carry)
+
+    if rank > 0:
+        mpi4jax.send(sd_first, dest=rank - 1, tag=20, comm=comm)
+        mpi4jax.send(sa_first, dest=rank - 1, tag=21, comm=comm)
+
+    grad_per_model_st = mpi4jax.allreduce(grad_per_model_st, op=MPI.SUM, comm=comm)
+    grad_lik_acc = mpi4jax.allreduce(grad_lik_acc, op=MPI.SUM, comm=comm)
+    grad_coreg = mpi4jax.allreduce(grad_coreg, op=MPI.SUM, comm=comm)
+
+    grad_per_model_lik = likelihood_precs * grad_lik_acc
+
+    return [grad_per_model_st[m] for m in range(n_models)], grad_per_model_lik, grad_coreg
+
+
+def pipeline_compute_grad_quad_coregional(
+    x, sc_list, jac_sc_list, coreg_w, jac_coreg_w,
+    n_models, nt_global, ns, n_fe,
+    rhs, likelihood_precs,
+    per_model_ata_diag_rows, per_model_ata_diag_cols, per_model_ata_diag_vals,
+    per_model_ata_lower_rows, per_model_ata_lower_cols, per_model_ata_lower_vals,
+    per_model_ata_arrow_rows, per_model_ata_arrow_cols, per_model_ata_arrow_vals,
+    per_model_ata_tip, per_model_offsets,
+    a_sparse, y, n_observations_idx,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Pipeline-distributed gradient of quadratic form for coregional models.
+
+    Parameters
+    ----------
+    x : (nt_global * block_size + n_fe,)
+    sc_list, jac_sc_list : spatial components and Jacobians
+    coreg_w, jac_coreg_w : coregional weights and Jacobians
+    n_models, nt_global, ns, n_fe : int
+    rhs : (nt_global * block_size + n_fe,)
+    likelihood_precs : (n_models,)
+    per_model_ata_* : local per-model sparse COO data
+    per_model_ata_tip : list of (n_fe, n_fe)
+    per_model_offsets : list of int
+    a_sparse : BCOO sparse matrix
+    y : (n_obs,)
+    n_observations_idx : list of int
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    grad_per_model_st : list of (3,) arrays
+    grad_per_model_lik : (n_models,)
+    grad_coreg : (n_coreg_params,)
+    """
+    from mpi4py import MPI
+
+    block_size = n_models * ns
+    dtype = x.dtype
+    n_coreg = jac_coreg_w.shape[-1]
+
+    x_st = x[:nt_global * block_size].reshape(nt_global, block_size)
+    x_fe = x[nt_global * block_size:]
+
+    x_st_local = x_st[start_idx:start_idx + n_local]
+
+    sc_padded = []
+    for m in range(n_models):
+        sc_m = sc_list[m]
+        sc_padded.append({
+            **sc_m,
+            'm0_subdiag': jnp.concatenate([sc_m['m0_subdiag'], jnp.zeros(1, dtype=dtype)]),
+            'm1_subdiag': jnp.concatenate([sc_m['m1_subdiag'], jnp.zeros(1, dtype=dtype)]),
+            'm2_subdiag': jnp.concatenate([sc_m['m2_subdiag'], jnp.zeros(1, dtype=dtype)]),
+        })
+
+    x_st_padded = jnp.concatenate([x_st, jnp.zeros((1, block_size), dtype=dtype)], axis=0)
+
+    n_models_cubed = n_models * n_models * n_models
+
+    # Stack spatial components and Jacobians for fori_loop dynamic indexing
+    q1s_all = jnp.stack([sc_padded[m]['q1s'] for m in range(n_models)])
+    q2s_all = jnp.stack([sc_padded[m]['q2s'] for m in range(n_models)])
+    q3s_all = jnp.stack([sc_padded[m]['q3s'] for m in range(n_models)])
+    scale_all = jnp.array([sc_padded[m]['scale'] for m in range(n_models)])
+    exp_gt_all = jnp.array([sc_padded[m]['exp_gt'] for m in range(n_models)])
+    m0_diag_all = jnp.stack([sc_padded[m]['m0_diag'] for m in range(n_models)])
+    m1_diag_all = jnp.stack([sc_padded[m]['m1_diag'] for m in range(n_models)])
+    m2_diag_all = jnp.stack([sc_padded[m]['m2_diag'] for m in range(n_models)])
+    m0_sub_all = jnp.stack([sc_padded[m]['m0_subdiag'] for m in range(n_models)])
+    m1_sub_all = jnp.stack([sc_padded[m]['m1_subdiag'] for m in range(n_models)])
+    m2_sub_all = jnp.stack([sc_padded[m]['m2_subdiag'] for m in range(n_models)])
+    jac_q1s_all = jnp.stack([jac_sc_list[m]['q1s'] for m in range(n_models)])
+    jac_q2s_all = jnp.stack([jac_sc_list[m]['q2s'] for m in range(n_models)])
+    jac_q3s_all = jnp.stack([jac_sc_list[m]['q3s'] for m in range(n_models)])
+    jac_scale_all = jnp.stack([jac_sc_list[m]['scale'] for m in range(n_models)])
+    jac_exp_gt_all = jnp.stack([jac_sc_list[m]['exp_gt'] for m in range(n_models)])
+
+    # --- ST + coreg gradient ---
+    grad_per_model_st = jnp.zeros((n_models, 3), dtype=dtype)
+    grad_coreg = jnp.zeros(n_coreg, dtype=dtype)
+
+    def quad_body(t_local, carry):
+        g_st_acc, g_c_acc = carry
+        t = start_idx + t_local
+        x_t = x_st[t]
+        x_tp1 = x_st_padded[t + 1]
+        is_interior = jnp.where(t < nt_global - 1, 1.0, 0.0).astype(dtype)
+
+        def _quad_trace_body(flat_idx, acc):
+            g_st_, g_c_ = acc
+            ii = flat_idx // (n_models * n_models)
+            jj = (flat_idx // n_models) % n_models
+            m_idx = flat_idx % n_models
+
+            xi = lax.dynamic_slice(x_t, (ii * ns,), (ns,))
+            xi_next = lax.dynamic_slice(x_tp1, (ii * ns,), (ns,))
+            xj = lax.dynamic_slice(x_t, (jj * ns,), (ns,))
+
+            w_ijm = coreg_w[ii, jj, m_idx]
+
+            scale_m = scale_all[m_idx]
+            exp_gt_m = exp_gt_all[m_idx]
+            m0_d = m0_diag_all[m_idx, t]
+            m1_d = m1_diag_all[m_idx, t]
+            m2_d = m2_diag_all[m_idx, t]
+            m0_s = m0_sub_all[m_idx, t]
+            m1_s = m1_sub_all[m_idx, t]
+            m2_s = m2_sub_all[m_idx, t]
+            q1s_m = q1s_all[m_idx]
+            q2s_m = q2s_all[m_idx]
+            q3s_m = q3s_all[m_idx]
+
+            base_d = m0_d * q3s_m + exp_gt_m * m1_d * q2s_m + exp_gt_m**2 * m2_d * q1s_m
+            qu_d = scale_m * base_d
+            xQx = xi @ qu_d @ xj
+
+            dw = jac_coreg_w[ii, jj, m_idx, :]
+            g_c_ = g_c_ - dw * xQx
+
+            base_l = m0_s * q3s_m + exp_gt_m * m1_s * q2s_m + exp_gt_m**2 * m2_s * q1s_m
+            qu_l = scale_m * base_l
+            xQx_l = xi_next @ qu_l @ xj
+            g_c_ = g_c_ - 2.0 * is_interior * dw * xQx_l
+
+            partial_gt_d = m1_d * q2s_m + 2.0 * exp_gt_m * m2_d * q1s_m
+            partial_gt_l = m1_s * q2s_m + 2.0 * exp_gt_m * m2_s * q1s_m
+
+            for k in range(3):
+                dq3 = jac_q3s_all[m_idx, :, :, k]
+                dq2 = jac_q2s_all[m_idx, :, :, k]
+                dq1 = jac_q1s_all[m_idx, :, :, k]
+                d_scale = jac_scale_all[m_idx, k]
+                d_exp_gt = jac_exp_gt_all[m_idx, k]
+
+                dQu = (
+                    d_scale * base_d
+                    + scale_m * (m0_d * dq3 + exp_gt_m * m1_d * dq2
+                                 + exp_gt_m**2 * m2_d * dq1)
+                    + scale_m * d_exp_gt * partial_gt_d
+                )
+                g_st_ = g_st_.at[m_idx, k].add(-w_ijm * (xi @ dQu @ xj))
+
+                dQu_l = (
+                    d_scale * base_l
+                    + scale_m * (m0_s * dq3 + exp_gt_m * m1_s * dq2
+                                 + exp_gt_m**2 * m2_s * dq1)
+                    + scale_m * d_exp_gt * partial_gt_l
+                )
+                g_st_ = g_st_.at[m_idx, k].add(
+                    -2.0 * is_interior * w_ijm * (xi_next @ dQu_l @ xj))
+
+            return (g_st_, g_c_)
+
+        g_st_acc, g_c_acc = lax.fori_loop(
+            0, n_models_cubed, _quad_trace_body, (g_st_acc, g_c_acc))
+
+        return (g_st_acc, g_c_acc)
+
+    grad_per_model_st, grad_coreg = lax.fori_loop(
+        0, n_local, quad_body, (grad_per_model_st, grad_coreg))
+
+    # --- Likelihood gradient ---
+    grad_per_model_lik = jnp.zeros(n_models, dtype=dtype)
+
+    for m in range(n_models):
+        m_off = per_model_offsets[m] * ns
+        prec_m = likelihood_precs[m]
+
+        # Local x^T AtA_m x contributions
+        local_xAtAx_d = jnp.array(0.0, dtype=dtype)
+        for t_local in range(n_local):
+            t = start_idx + t_local
+            local_xAtAx_d = local_xAtAx_d + jnp.sum(
+                x_st[t, m_off + per_model_ata_diag_rows[m][t_local]]
+                * per_model_ata_diag_vals[m][t_local]
+                * x_st[t, m_off + per_model_ata_diag_cols[m][t_local]])
+
+        local_xAtAx_l = jnp.array(0.0, dtype=dtype)
+        for t_local in range(n_local):
+            t = start_idx + t_local
+            t_next = min(t + 1, nt_global - 1)
+            valid = jnp.array(1.0 if t < nt_global - 1 else 0.0, dtype=dtype)
+            local_xAtAx_l = local_xAtAx_l + valid * jnp.sum(
+                x_st[t_next, m_off + per_model_ata_lower_rows[m][t_local]]
+                * per_model_ata_lower_vals[m][t_local]
+                * x_st[t, m_off + per_model_ata_lower_cols[m][t_local]])
+
+        local_xAtAx_a = jnp.array(0.0, dtype=dtype)
+        for t_local in range(n_local):
+            t = start_idx + t_local
+            local_xAtAx_a = local_xAtAx_a + jnp.sum(
+                x_fe[per_model_ata_arrow_rows[m][t_local]]
+                * per_model_ata_arrow_vals[m][t_local]
+                * x_st[t, m_off + per_model_ata_arrow_cols[m][t_local]])
+
+        xAtAx_tip = jnp.where(rank == 0, x_fe @ per_model_ata_tip[m] @ x_fe, 0.0)
+
+        local_xAtAx = local_xAtAx_d + 2.0 * local_xAtAx_l + 2.0 * local_xAtAx_a + xAtAx_tip
+        xAtAx_m = mpi4jax.allreduce(local_xAtAx, op=MPI.SUM, comm=comm)
+
+        obs_start = n_observations_idx[m]
+        obs_end = n_observations_idx[m + 1]
+        y_m_weighted = jnp.zeros_like(y)
+        y_m_weighted = y_m_weighted.at[obs_start:obs_end].set(y[obs_start:obs_end])
+        rhs_m = a_sparse.T @ y_m_weighted
+        xTAmy = jnp.dot(x, rhs_m)
+
+        grad_per_model_lik = grad_per_model_lik.at[m].set(
+            prec_m * (2.0 * xTAmy - xAtAx_m))
+
+    grad_per_model_st = mpi4jax.allreduce(grad_per_model_st, op=MPI.SUM, comm=comm)
+    grad_coreg = mpi4jax.allreduce(grad_coreg, op=MPI.SUM, comm=comm)
 
     return [grad_per_model_st[m] for m in range(n_models)], grad_per_model_lik, grad_coreg

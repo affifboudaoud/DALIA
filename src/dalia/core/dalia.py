@@ -30,7 +30,13 @@ from dalia.utils import (
     DummyCommunicator,
 )
 
-from dalia.core.jax_autodiff import create_pure_jax_objective, create_pure_jax_objective_coregional
+from dalia.core.jax_autodiff import (
+    create_pure_jax_objective,
+    create_pure_jax_objective_coregional,
+    create_pure_jax_objective_distributed,
+    create_pure_jax_objective_distributed_coregional,
+    create_pure_jax_objective_distributed_coregional_splitjit,
+)
 
 if backend_flags["mpi_avail"]:
     from mpi4py import MPI
@@ -277,20 +283,33 @@ class DALIA:
                 # Check solver type compatibility
                 is_spatial_only = getattr(self.model, 'coregionalization_type', 'spatio_temporal') == 'spatial'
                 if backend_flags["mpi_avail"] and comm_size > 1:
-                    raise NotImplementedError(
-                        "JAX autodiff for CoregionalModel does not support multi-process execution. "
-                        "Please use gradient_method='finite_diff' for distributed runs."
+                    if self.config.solver.type != "serinv":
+                        raise NotImplementedError(
+                            "Distributed JAX autodiff for CoregionalModel requires serinv solver.")
+                    print_msg(f"Using distributed JAX autodiff (split-JIT) with {comm_size} ranks "
+                              f"(CoregionalModel, {self.model.n_models} variates)")
+                    self.jax_objective, self.jax_grad_func = \
+                        create_pure_jax_objective_distributed_coregional_splitjit(
+                            dalia_instance=self, comm=self.comm_qeval)
+                else:
+                    print_msg(f"Using JAX automatic differentiation with JIT compilation "
+                              f"(CoregionalModel, {self.model.n_models} variates)")
+                    self.jax_objective, self.jax_grad_func = create_pure_jax_objective_coregional(
+                        dalia_instance=self,
                     )
-
-                print_msg(f"Using JAX automatic differentiation with JIT compilation (CoregionalModel, {self.model.n_models} variates)")
-                self.jax_objective, self.jax_grad_func = create_pure_jax_objective_coregional(
-                    dalia_instance=self,
-                )
             else:
                 # Regular Model
                 likelihood_type = self.model.likelihood_config.type
                 all_supported = likelihood_type in supported_likelihoods
                 likelihood_name = likelihood_type.capitalize()
+
+                can_use_distributed_jax = (
+                    all_supported
+                    and likelihood_type == 'gaussian'
+                    and self.config.solver.type == "serinv"
+                    and backend_flags["mpi_avail"]
+                    and comm_size > 1
+                )
 
                 can_use_pure_jax = (
                     all_supported
@@ -298,7 +317,13 @@ class DALIA:
                     and (not backend_flags["mpi_avail"] or comm_size == 1)
                 )
 
-                if can_use_pure_jax:
+                if can_use_distributed_jax:
+                    print_msg(f"Using distributed JAX autodiff with {comm_size} ranks ({likelihood_name} likelihood)")
+                    self.jax_objective, self.jax_grad_func = create_pure_jax_objective_distributed(
+                        dalia_instance=self,
+                        comm=self.comm_qeval,
+                    )
+                elif can_use_pure_jax:
                     print_msg(f"Using JAX automatic differentiation with JIT compilation ({likelihood_name} likelihood)")
                     self.jax_objective, self.jax_grad_func = create_pure_jax_objective(
                         dalia_instance=self,
@@ -306,7 +331,7 @@ class DALIA:
                 else:
                     raise NotImplementedError(
                         "JAX autodiff currently only supports: "
-                        "Gaussian/Poisson/Binomial likelihoods + dense/serinv solver + single process. "
+                        "Gaussian/Poisson/Binomial likelihoods + dense/serinv solver. "
                         "For other configurations, use gradient_method='finite_diff'."
                     )
 
