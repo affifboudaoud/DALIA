@@ -36,6 +36,7 @@ from dalia.core.jax_autodiff import (
     create_pure_jax_objective_distributed,
     create_pure_jax_objective_distributed_coregional,
     create_pure_jax_objective_distributed_coregional_splitjit,
+    create_pure_jax_objective_distributed_coregional_twophase,
 )
 
 if backend_flags["mpi_avail"]:
@@ -286,10 +287,10 @@ class DALIA:
                     if self.config.solver.type != "serinv":
                         raise NotImplementedError(
                             "Distributed JAX autodiff for CoregionalModel requires serinv solver.")
-                    print_msg(f"Using distributed JAX autodiff (split-JIT) with {comm_size} ranks "
+                    print_msg(f"Using distributed JAX autodiff (two-phase) with {comm_size} ranks "
                               f"(CoregionalModel, {self.model.n_models} variates)")
                     self.jax_objective, self.jax_grad_func = \
-                        create_pure_jax_objective_distributed_coregional_splitjit(
+                        create_pure_jax_objective_distributed_coregional_twophase(
                             dalia_instance=self, comm=self.comm_qeval)
                 else:
                     print_msg(f"Using JAX automatic differentiation with JIT compilation "

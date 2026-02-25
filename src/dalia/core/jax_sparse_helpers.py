@@ -5928,3 +5928,181 @@ def pipeline_compute_grad_quad_coregional(
     grad_coreg = mpi4jax.allreduce(grad_coreg, op=MPI.SUM, comm=comm)
 
     return [grad_per_model_st[m] for m in range(n_models)], grad_per_model_lik, grad_coreg
+
+
+def twophase_logdet_Q_prior_coregional_scan(
+    sc_list, coreg_w, n_models, ns, nt_global, dtype,
+    rank, comm_size, n_local, start_idx, comm,
+):
+    """Two-phase parallel logdet(Q_prior) for coregional model via BT Cholesky.
+
+    Phase 1: All ranks compute BT Cholesky simultaneously (root standard,
+    non-root permuted with buffer). Phase 2: Allgather boundary blocks,
+    factorize reduced BT system, combine logdets.
+
+    Parameters
+    ----------
+    sc_list : list of dict
+        Per-model spatial components (padded subdiags).
+    coreg_w : (n_models, n_models, n_models)
+    n_models, ns, nt_global : int
+    dtype : jnp.dtype
+    rank, comm_size, n_local, start_idx : int
+    comm : MPI communicator
+
+    Returns
+    -------
+    logdet : scalar
+    """
+    from mpi4py import MPI
+    block_size = n_models * ns
+    eps = jnp.finfo(dtype).eps
+
+    def _bt_chol_step(schur, global_i):
+        q_diag_i = _reconstruct_coregional_diag_block(
+            sc_list, coreg_w, n_models, ns, global_i) - schur
+        L_i = _jax_cholesky(q_diag_i)
+        diag_vals = jnp.diag(L_i)
+        safe_vals = jnp.maximum(diag_vals, eps)
+        logdet_i = 2.0 * jnp.sum(jnp.log(safe_vals))
+        q_lower_i = _reconstruct_coregional_lower_block(
+            sc_list, coreg_w, n_models, ns, global_i)
+        L_lower_i = jax.scipy.linalg.solve_triangular(
+            L_i, q_lower_i.T, lower=True).T
+        new_schur = L_lower_i @ L_lower_i.T
+        new_schur = jnp.where(global_i < nt_global - 1, new_schur,
+                              jnp.zeros_like(new_schur))
+        return L_i, L_lower_i, new_schur, logdet_i
+
+    global_indices = jnp.arange(start_idx, start_idx + n_local)
+
+    if rank == 0:
+        # Root: standard BT Cholesky on [0..n_local-2], skip last block
+        def root_fwd_body(j, state):
+            schur, logdet = state
+            global_i = global_indices[j]
+            _, _, new_schur, logdet_i = _bt_chol_step(schur, global_i)
+            logdet = logdet + logdet_i
+            return new_schur, logdet
+
+        init_schur = jnp.zeros((block_size, block_size), dtype=dtype)
+        n_interior = jnp.where(n_local > 1, n_local - 1, 0)
+        final_schur, local_logdet = lax.fori_loop(
+            0, n_interior, root_fwd_body, (init_schur, jnp.array(0.0, dtype=dtype)))
+
+        # Boundary: Schur-complemented last diagonal (not factorized)
+        last_gi = start_idx + n_local - 1
+        bnd_diag = _reconstruct_coregional_diag_block(
+            sc_list, coreg_w, n_models, ns, last_gi) - final_schur
+
+        # Pack into reduced system position [1]:
+        rs_diag_local = jnp.zeros((2 * comm_size, block_size, block_size), dtype=dtype)
+        rs_lower_local = jnp.zeros((2 * comm_size, block_size, block_size), dtype=dtype)
+        rs_diag_local = rs_diag_local.at[1].set(bnd_diag)
+        last_lower = jnp.where(
+            n_local > 1,
+            _reconstruct_coregional_lower_block(
+                sc_list, coreg_w, n_models, ns, last_gi - 1),
+            jnp.zeros((block_size, block_size), dtype=dtype))
+        rs_lower_local = rs_lower_local.at[1].set(last_lower)
+    else:
+        # Non-root: permuted BT Cholesky with buffer on [1..n_local-2]
+        # Buffer tracks coupling to block[0]
+        first_gi = start_idx
+        block0_lower = _reconstruct_coregional_lower_block(
+            sc_list, coreg_w, n_models, ns, first_gi - 1)
+        buffer_init = block0_lower.T  # A_{top, 1} = A_{lower}[start-1].T
+
+        block0_diag = _reconstruct_coregional_diag_block(
+            sc_list, coreg_w, n_models, ns, first_gi)
+
+        def nonroot_fwd_body(j, state):
+            schur, logdet, buf, b0_diag = state
+            # j runs from 0 to n_interior-1, mapping to local index j+1
+            local_j = j + 1
+            global_i = global_indices[local_j]
+
+            L_i, L_lower_i, new_schur, logdet_i = _bt_chol_step(schur, global_i)
+
+            # Buffer propagation: solve_tri(L_i, buf.T, lower=True).T
+            buf_solved = jax.scipy.linalg.solve_triangular(
+                L_i, buf.T, lower=True).T
+            b0_diag = b0_diag - buf_solved @ buf_solved.T
+            new_buf = -buf_solved @ L_lower_i.T
+            new_buf = jnp.where(global_i < nt_global - 1,
+                                new_buf, jnp.zeros_like(new_buf))
+
+            logdet = logdet + logdet_i
+            return new_schur, logdet, new_buf, b0_diag
+
+        init_schur_nr = jnp.zeros((block_size, block_size), dtype=dtype)
+        # First block (local 1) gets schur from block[0] lower
+        first_lower = _reconstruct_coregional_lower_block(
+            sc_list, coreg_w, n_models, ns, first_gi)
+        # We need to factorize block[1] with schur from block[0]
+        # but block[0] is a boundary block => we skip block[0] entirely
+        # The schur for block[1] comes from the lower block at global first_gi
+        # But block[0] is NOT factorized in phase 1, so no schur propagates.
+        # Per the algorithm: non-root processes blocks [1..n_local-2]
+        # The first block they process (local=1) starts with zero schur
+        # because only the boundary block (local=0) connects to previous rank
+        n_interior_nr = jnp.where(n_local > 2, n_local - 2, 0)
+        final_schur_nr, local_logdet, final_buf, block0_diag_acc = lax.fori_loop(
+            0, n_interior_nr, nonroot_fwd_body,
+            (init_schur_nr, jnp.array(0.0, dtype=dtype), buffer_init, block0_diag))
+
+        # Boundary extraction
+        last_gi = start_idx + n_local - 1
+        last_diag = _reconstruct_coregional_diag_block(
+            sc_list, coreg_w, n_models, ns, last_gi) - final_schur_nr
+
+        rs_diag_local = jnp.zeros((2 * comm_size, block_size, block_size), dtype=dtype)
+        rs_lower_local = jnp.zeros((2 * comm_size, block_size, block_size), dtype=dtype)
+        rs_diag_local = rs_diag_local.at[2 * rank].set(block0_diag_acc)
+        rs_diag_local = rs_diag_local.at[2 * rank + 1].set(last_diag)
+
+        # Lower: buffer[-1].T at position [2*rank], original lower at [2*rank+1]
+        rs_lower_local = rs_lower_local.at[2 * rank].set(final_buf.T)
+        last_lower = jnp.where(
+            rank < comm_size - 1,
+            _reconstruct_coregional_lower_block(
+                sc_list, coreg_w, n_models, ns, last_gi),
+            jnp.zeros((block_size, block_size), dtype=dtype))
+        rs_lower_local = rs_lower_local.at[2 * rank + 1].set(last_lower)
+
+    # Phase 2: Allgather + factorize reduced BT system
+    rs_diag = mpi4jax.allreduce(rs_diag_local, op=MPI.SUM, comm=comm)
+    rs_lower = mpi4jax.allreduce(rs_lower_local, op=MPI.SUM, comm=comm)
+
+    # Factorize reduced BT system [1:2P-1]
+    def rs_fwd_body(j, state):
+        schur, logdet = state
+        idx = j + 1  # reduced system indices [1..2P-1]
+        diag_j = rs_diag[idx] - schur
+        L_j = _jax_cholesky(diag_j)
+        d_vals = jnp.diag(L_j)
+        safe_d = jnp.maximum(d_vals, eps)
+        logdet = logdet + 2.0 * jnp.sum(jnp.log(safe_d))
+        lower_j = rs_lower[idx]
+        L_lower_j = jax.scipy.linalg.solve_triangular(
+            L_j, lower_j.T, lower=True).T
+        new_schur = L_lower_j @ L_lower_j.T
+        is_last = (idx == 2 * comm_size - 1)
+        new_schur = jnp.where(is_last, jnp.zeros_like(new_schur), new_schur)
+        return new_schur, logdet
+
+    _, rs_logdet = lax.fori_loop(
+        0, 2 * comm_size - 1, rs_fwd_body,
+        (jnp.zeros((block_size, block_size), dtype=dtype), jnp.array(0.0, dtype=dtype)))
+
+    # Allreduce local logdets (each rank computed different interior blocks)
+    local_logdet_val = jnp.where(rank == 0, local_logdet, local_logdet)
+    total_interior_logdet = mpi4jax.allreduce(local_logdet_val, op=MPI.SUM, comm=comm)
+
+    return total_interior_logdet + rs_logdet
+
+
+    # twophase_logdet_Q_prior_coregional_grad has been removed.
+    # Its logic is now inlined in _grad_prior_fn in jax_autodiff.py
+    # using Python-level loops with per-block @jax.jit functions
+    # to avoid GPU memory pressure from monolithic XLA compilation.
