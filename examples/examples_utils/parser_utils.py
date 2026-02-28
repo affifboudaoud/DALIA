@@ -56,10 +56,31 @@ def parse_args():
         help="Measure GPU power draw during benchmark using nvidia-smi.",
     )
     parser.add_argument(
+        "--energy_monitor",
+        action="store_true",
+        help="Measure energy via Cray PM hardware counters.",
+    )
+    parser.add_argument(
         "--nt",
         type=int,
         default=None,
         help="Number of time steps (overrides script default).",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Directory for structured JSON/CSV result output.",
+    )
+    parser.add_argument(
+        "--skip_fd",
+        action="store_true",
+        help="Skip finite differences run (JAX AD only).",
+    )
+    parser.add_argument(
+        "--skip_jax",
+        action="store_true",
+        help="Skip JAX autodiff run (FD only).",
     )
     args = parser.parse_args()
     print("Parsed parameters:")
@@ -72,4 +93,10 @@ def parse_args():
         print(f"  n_benchmark_runs: {args.n_benchmark_runs}")
         print(f"  benchmark_method: {args.benchmark_method}")
         print(f"  output_csv: {args.output_csv}")
+    if args.output_dir:
+        print(f"  output_dir: {args.output_dir}")
+    if args.skip_fd:
+        print(f"  skip_fd: {args.skip_fd}")
+    if args.skip_jax:
+        print(f"  skip_jax: {args.skip_jax}")
     return args

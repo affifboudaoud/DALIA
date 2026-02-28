@@ -3438,7 +3438,7 @@ def create_pure_jax_objective_distributed_coregional(dalia_instance, comm, dtype
                     jac_padded[key] = val
             jac_sc_list_padded.append(jac_padded)
 
-        grad_prior_st, grad_prior_coreg = pipeline_logdet_Q_prior_coregional_grad(
+        _, grad_prior_st, grad_prior_coreg = pipeline_logdet_Q_prior_coregional_grad(
             sc_padded, jac_sc_list_padded, coreg_w, jac_coreg_w,
             n_models, ns, nt, dtype,
             rank, comm_size, n_local, start_idx, comm)
@@ -3810,7 +3810,8 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
 
         return (new_cond_schur, new_arrow_tip_acc, new_arrow_schur,
                 logdet_cond, new_prev_lower_y, new_arrow_rhs_acc,
-                cond_schur, arrow_schur, y_i)
+                cond_schur, arrow_schur, y_i,
+                L_i, L_lower_i, L_arrow_i)
 
     @jax.jit
     def _chol_recv_carries(cs, at, a_s, ld, ply, ara):
@@ -3886,8 +3887,9 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         # Python loop over local blocks — each block is a separate JIT call.
         # Accumulate results in CPU (host) memory to avoid GPU OOM when
         # n_local blocks of (block_size, block_size) don't fit simultaneously.
-        stored_cs_host = np.empty((n_local, block_size, block_size), dtype=np_dtype)
-        stored_as_host = np.empty((n_local, n_fe, block_size), dtype=np_dtype)
+        stored_L_host = np.empty((n_local, block_size, block_size), dtype=np_dtype)
+        stored_Ll_host = np.empty((n_local, block_size, block_size), dtype=np_dtype)
+        stored_La_host = np.empty((n_local, n_fe, block_size), dtype=np_dtype)
         y_st_host = np.empty((n_local, block_size), dtype=np_dtype)
         sc_args = (q1s_all, q2s_all, q3s_all, scale_all, exp_gt_all,
                    m0_diag_all, m1_diag_all, m2_diag_all,
@@ -3897,18 +3899,20 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
             j_jax = jnp.array(j_py, dtype=jnp.int32)
             (cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
              prev_lower_y, arrow_rhs_acc,
-             cs_out, as_out, y_out) = _chol_one_block(
+             cs_out, as_out, y_out,
+             L_out, Ll_out, La_out) = _chol_one_block(
                 cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
                 prev_lower_y, arrow_rhs_acc,
                 j_jax, rhs_st_local,
                 *sc_args,
                 coreg_w, likelihood_precs)
-            stored_cs_host[j_py] = np.asarray(cs_out)
-            stored_as_host[j_py] = np.asarray(as_out)
+            stored_L_host[j_py] = np.asarray(L_out)
+            stored_Ll_host[j_py] = np.asarray(Ll_out)
+            stored_La_host[j_py] = np.asarray(La_out)
             y_st_host[j_py] = np.asarray(y_out)
-            del cs_out, as_out, y_out
+            del cs_out, as_out, y_out, L_out, Ll_out, La_out
 
-        # y_st is small — transfer to GPU; stored_cs/as stay on CPU
+        # y_st is small — transfer to GPU; stored L factors stay on CPU
         y_st_local = jnp.array(y_st_host)
         del y_st_host
 
@@ -3921,67 +3925,12 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         logdet_cond_final, L_tip, arrow_rhs_global = _chol_finalize(
             logdet_cond, arrow_tip_acc, arrow_rhs_acc)
 
-        return stored_cs_host, stored_as_host, y_st_local, L_tip, arrow_rhs_global, logdet_cond_final
+        return (stored_L_host, stored_Ll_host, stored_La_host,
+                y_st_local, L_tip, arrow_rhs_global, logdet_cond_final)
 
-    # ---- Shared block reconstruction (traced into calling JIT) ----
-
-    def _reconstruct_L_at_block(stored_cs_i, stored_as_i, local_i,
-                                sc_args_tuple, coreg_w_arg, likelihood_precs_arg):
-        (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
-         m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a) = sc_args_tuple
-        global_i = start_idx + local_i
-        sc_loc = []
-        for m in range(n_models):
-            sc_loc.append({
-                'q1s': q1s_a[m], 'q2s': q2s_a[m], 'q3s': q3s_a[m],
-                'scale': scale_a[m], 'exp_gt': exp_gt_a[m],
-                'm0_diag': m0d_a[m], 'm1_diag': m1d_a[m], 'm2_diag': m2d_a[m],
-                'm0_subdiag': m0s_a[m], 'm1_subdiag': m1s_a[m], 'm2_subdiag': m2s_a[m],
-            })
-
-        q_diag = _reconstruct_coregional_diag_block(
-            sc_loc, coreg_w_arg, n_models, ns, global_i)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            q_diag = q_diag.at[
-                m_off + per_model_ata_diag_rows[m][local_i],
-                m_off + per_model_ata_diag_cols[m][local_i]
-            ].add(likelihood_precs_arg[m] * per_model_ata_diag_vals[m][local_i])
-        q_diag = q_diag + _chol_eps_reg * _chol_eye_bs - stored_cs_i
-        L_i = _jax_cholesky(q_diag)
-
-        q_lower = _reconstruct_coregional_lower_block(
-            sc_loc, coreg_w_arg, n_models, ns, global_i)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            q_lower = q_lower.at[
-                m_off + _padded_lower_rows[m][local_i],
-                m_off + _padded_lower_cols[m][local_i]
-            ].add(likelihood_precs_arg[m] * _padded_lower_vals[m][local_i])
-        L_lower_i = jax.scipy.linalg.solve_triangular(
-            L_i, q_lower.T, lower=True).T
-
-        q_arrow = jnp.zeros((n_fe, block_size), dtype=dtype)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            q_arrow = q_arrow.at[
-                per_model_ata_arrow_rows[m][local_i],
-                m_off + per_model_ata_arrow_cols[m][local_i]
-            ].add(likelihood_precs_arg[m] * per_model_ata_arrow_vals[m][local_i])
-        q_arrow = q_arrow - stored_as_i
-        L_arrow_i = jax.scipy.linalg.solve_triangular(
-            L_i, q_arrow.T, lower=True).T
-
-        return L_i, L_lower_i, L_arrow_i
-
-    # ---- Stage 1b: Backward sub (Python loop with per-block JIT) ----
 
     @jax.jit
-    def _bwd_one_block(stored_cs_i, stored_as_i, y_i, x_next, x_fe, local_i,
-                       sc_args_tuple, coreg_w_arg, likelihood_precs_arg):
-        L_i, L_lower_i, L_arrow_i = _reconstruct_L_at_block(
-            stored_cs_i, stored_as_i, local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg)
+    def _bwd_one_block(L_i, L_lower_i, L_arrow_i, y_i, x_next, x_fe, local_i):
         global_i = start_idx + local_i
         rhs = y_i - L_arrow_i.T @ x_fe
         rhs = jnp.where(global_i < nt - 1, rhs - L_lower_i.T @ x_next, rhs)
@@ -4004,25 +3953,8 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         quad_global = mpi4jax.allreduce(local_quad, op=_MPI.SUM, comm=comm)
         return x_st_global, quad_global
 
-    def _bwd_fn(theta, stored_cs_host, stored_as_host, L_tip, y_st_local, arrow_rhs_acc):
-        likelihood_precs = _theta_to_likelihood_precs(theta)
-        sc_list, coreg_w = _theta_to_sc_coreg(theta)
-        sc_padded = _pad_subdiags(sc_list)
-
-        q1s_a = jnp.stack([sc_padded[m]['q1s'] for m in range(n_models)])
-        q2s_a = jnp.stack([sc_padded[m]['q2s'] for m in range(n_models)])
-        q3s_a = jnp.stack([sc_padded[m]['q3s'] for m in range(n_models)])
-        scale_a = jnp.array([sc_padded[m]['scale'] for m in range(n_models)])
-        exp_gt_a = jnp.array([sc_padded[m]['exp_gt'] for m in range(n_models)])
-        m0d_a = jnp.stack([sc_padded[m]['m0_diag'] for m in range(n_models)])
-        m1d_a = jnp.stack([sc_padded[m]['m1_diag'] for m in range(n_models)])
-        m2d_a = jnp.stack([sc_padded[m]['m2_diag'] for m in range(n_models)])
-        m0s_a = jnp.stack([sc_padded[m]['m0_subdiag'] for m in range(n_models)])
-        m1s_a = jnp.stack([sc_padded[m]['m1_subdiag'] for m in range(n_models)])
-        m2s_a = jnp.stack([sc_padded[m]['m2_subdiag'] for m in range(n_models)])
-        sc_args_t = (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
-                     m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a)
-
+    def _bwd_fn(theta, stored_L_host, stored_Ll_host, stored_La_host,
+                L_tip, y_st_local, arrow_rhs_acc):
         y_fe = jax.scipy.linalg.solve_triangular(L_tip, arrow_rhs_acc, lower=True)
         local_quad = jnp.sum(y_st_local ** 2)
         y_fe_quad = jnp.where(rank == comm_size - 1, jnp.sum(y_fe ** 2), 0.0)
@@ -4037,15 +3969,15 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         local_x_host = np.zeros((max_n_local, block_size), dtype=np_dtype)
 
         for local_i_py in range(n_local - 1, -1, -1):
-            cs_i = jnp.array(stored_cs_host[local_i_py])
-            as_i = jnp.array(stored_as_host[local_i_py])
+            Li = jnp.array(stored_L_host[local_i_py])
+            Lli = jnp.array(stored_Ll_host[local_i_py])
+            Lai = jnp.array(stored_La_host[local_i_py])
             local_i_jax = jnp.array(local_i_py, dtype=jnp.int32)
-            x_i = _bwd_one_block(cs_i, as_i, y_st_local[local_i_py],
-                                 x_next, x_fe, local_i_jax,
-                                 sc_args_t, coreg_w, likelihood_precs)
+            x_i = _bwd_one_block(Li, Lli, Lai, y_st_local[local_i_py],
+                                 x_next, x_fe, local_i_jax)
             local_x_host[local_i_py] = np.asarray(x_i)
             x_next = x_i
-            del cs_i, as_i
+            del Li, Lli, Lai
 
         if rank > 0:
             _bwd_send_x_first(x_next)
@@ -4071,15 +4003,12 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
     n_models_cubed = n_models * n_models * n_models
 
     @jax.jit
-    def _si_last_block(stored_cs_i, stored_as_i, sd_boundary, sa_boundary,
+    def _si_last_block(L_i, L_lower_i, L_arrow_i, sd_boundary, sa_boundary,
                        S_tip_arg, L_tip_arg, local_i,
                        sc_args_tuple, coreg_w_arg, likelihood_precs_arg,
                        jac_q1s_a, jac_q2s_a, jac_q3s_a,
                        jac_scale_a, jac_exp_gt_a, jac_coreg_w_arg):
         """Process the last local block for SI grads."""
-        L_i, L_lower_i, L_arrow_i = _reconstruct_L_at_block(
-            stored_cs_i, stored_as_i, local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg)
         L_blk_inv = jax.scipy.linalg.solve_triangular(L_i, _chol_eye_bs, lower=True)
 
         global_i = start_idx + local_i
@@ -4187,26 +4116,37 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         return sd_last, sa_last, g_st, g_lik, g_c
 
     @jax.jit
-    def _si_inner_block(stored_cs_i, stored_as_i, sd_prev, sa_prev, S_tip_arg,
-                        local_i,
-                        sc_args_tuple, coreg_w_arg, likelihood_precs_arg,
-                        jac_q1s_a, jac_q2s_a, jac_q3s_a,
-                        jac_scale_a, jac_exp_gt_a, jac_coreg_w_arg):
-        """Process an inner block for SI grads."""
-        L_i, L_lower_i, L_arrow_i = _reconstruct_L_at_block(
-            stored_cs_i, stored_as_i, local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg)
-        L_blk_inv = jax.scipy.linalg.solve_triangular(L_i, _chol_eye_bs, lower=True)
+    def _si_allreduce(g_st, g_lik, g_c):
+        from mpi4py import MPI as _MPI
+        g_st = mpi4jax.allreduce(g_st, op=_MPI.SUM, comm=comm)
+        g_lik = mpi4jax.allreduce(g_lik, op=_MPI.SUM, comm=comm)
+        g_c = mpi4jax.allreduce(g_c, op=_MPI.SUM, comm=comm)
+        return g_st, g_lik, g_c
 
+    @jax.jit
+    def _bwd_si_block(L_i, L_lower_i, L_arrow_i, y_i, x_next, x_fe,
+                      sd_prev, sa_prev, S_tip_arg, local_i,
+                      sc_args_tuple, coreg_w_arg, likelihood_precs_arg,
+                      jac_q1s_a, jac_q2s_a, jac_q3s_a,
+                      jac_scale_a, jac_exp_gt_a, jac_coreg_w_arg):
+        """Merged backward sub + SI gradient traces (L factors from CPU)."""
+        L_blk_inv = jax.scipy.linalg.solve_triangular(L_i, _chol_eye_bs, lower=True)
         global_i = start_idx + local_i
+
+        # Backward sub
+        rhs = y_i - L_arrow_i.T @ x_fe
+        rhs = jnp.where(global_i < nt - 1, rhs - L_lower_i.T @ x_next, rhs)
+        x_i = jax.scipy.linalg.solve_triangular(L_i.T, rhs, lower=False)
+
+        # SI recurrence
         sl_i = (-sd_prev @ L_lower_i - sa_prev.T @ L_arrow_i) @ L_blk_inv
         sa_i = (-sa_prev @ L_lower_i - S_tip_arg @ L_arrow_i) @ L_blk_inv
         sd_i = (L_blk_inv.T - sl_i.T @ L_lower_i - sa_i.T @ L_arrow_i) @ L_blk_inv
 
+        # Gradient traces
         (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
          m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a) = sc_args_tuple
 
-        # Diagonal trace
         def _diag_body(flat_idx, acc):
             g_st_, g_c_ = acc
             ii = flat_idx // (n_models * n_models)
@@ -4235,7 +4175,6 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         g_c_init = jnp.zeros(n_coreg, dtype=dtype)
         g_st, g_c = lax.fori_loop(0, n_models_cubed, _diag_body, (g_st_init, g_c_init))
 
-        # Lower trace
         def _lower_body(flat_idx, acc):
             g_st_, g_c_ = acc
             ii = flat_idx // (n_models * n_models)
@@ -4264,7 +4203,6 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         g_st = g_st + g_st_l
         g_c = g_c + g_c_l
 
-        # Likelihood from sparse AtA
         g_lik = jnp.zeros(n_models, dtype=dtype)
         for m in range(n_models):
             m_off = per_model_offsets[m] * ns
@@ -4279,28 +4217,24 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
                            * _padded_lower_vals[m][local_i])
             g_lik = g_lik.at[m].add(sp_d + 2.0 * sp_a + 2.0 * sp_l)
 
-        return sd_i, sa_i, g_st, g_lik, g_c
+        return x_i, sd_i, sa_i, g_st, g_lik, g_c
 
     @jax.jit
-    def _si_recv_boundary(sd_b, sa_b):
+    def _bwd_si_recv(x_next, sd_b, sa_b):
+        x_next = mpi4jax.recv(x_next, source=rank + 1, tag=10, comm=comm)
         sd_b = mpi4jax.recv(sd_b, source=rank + 1, tag=20, comm=comm)
         sa_b = mpi4jax.recv(sa_b, source=rank + 1, tag=21, comm=comm)
-        return sd_b, sa_b
+        return x_next, sd_b, sa_b
 
     @jax.jit
-    def _si_send_boundary(sd_b, sa_b):
+    def _bwd_si_send(x_first, sd_b, sa_b):
+        mpi4jax.send(x_first, dest=rank - 1, tag=10, comm=comm)
         mpi4jax.send(sd_b, dest=rank - 1, tag=20, comm=comm)
         mpi4jax.send(sa_b, dest=rank - 1, tag=21, comm=comm)
 
-    @jax.jit
-    def _si_allreduce(g_st, g_lik, g_c):
-        from mpi4py import MPI as _MPI
-        g_st = mpi4jax.allreduce(g_st, op=_MPI.SUM, comm=comm)
-        g_lik = mpi4jax.allreduce(g_lik, op=_MPI.SUM, comm=comm)
-        g_c = mpi4jax.allreduce(g_c, op=_MPI.SUM, comm=comm)
-        return g_st, g_lik, g_c
-
-    def _grad_si_fn(theta, stored_cs_host, stored_as_host, L_tip):
+    def _bwd_and_si_fn(theta, stored_L_host, stored_Ll_host, stored_La_host,
+                       L_tip, y_st_local, arrow_rhs_acc):
+        """Merged backward sub + SI gradient computation in a single pass (pipeline)."""
         likelihood_precs = _theta_to_likelihood_precs(theta)
         sc_list, coreg_w = _theta_to_sc_coreg(theta)
         sc_padded = _pad_subdiags(sc_list)
@@ -4327,47 +4261,89 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         jac_scale_a = jnp.stack([jac_sc_list[m]['scale'] for m in range(n_models)])
         jac_exp_gt_a = jnp.stack([jac_sc_list[m]['exp_gt'] for m in range(n_models)])
 
+        # Forward solve for arrow block
+        y_fe = jax.scipy.linalg.solve_triangular(L_tip, arrow_rhs_acc, lower=True)
+        local_quad = jnp.sum(y_st_local ** 2)
+        y_fe_quad = jnp.where(rank == comm_size - 1, jnp.sum(y_fe ** 2), 0.0)
+        local_quad = local_quad + y_fe_quad
+        x_fe = jax.scipy.linalg.solve_triangular(L_tip.T, y_fe, lower=False)
+
         L_tip_inv = jax.scipy.linalg.solve_triangular(L_tip, _chol_eye_nfe, lower=True)
         S_tip = L_tip_inv.T @ L_tip_inv
 
+        # Receive both x_next and SI boundary from next rank
+        x_next = jnp.zeros(block_size, dtype=dtype)
         sd_boundary = jnp.zeros((block_size, block_size), dtype=dtype)
         sa_boundary = jnp.zeros((n_fe, block_size), dtype=dtype)
         if rank < comm_size - 1:
-            sd_boundary, sa_boundary = _si_recv_boundary(sd_boundary, sa_boundary)
+            x_next, sd_boundary, sa_boundary = _bwd_si_recv(
+                x_next, sd_boundary, sa_boundary)
 
+        max_n_local = (nt + comm_size - 1) // comm_size
+        local_x_host = np.zeros((max_n_local, block_size), dtype=np_dtype)
+
+        g_st_acc = jnp.zeros((n_models, 3), dtype=dtype)
+        g_lik_acc = jnp.zeros(n_models, dtype=dtype)
+        g_c_acc = jnp.zeros(n_coreg, dtype=dtype)
+
+        # Process last block (has special SI initialization)
         last_local = n_local - 1
-        cs_last = jnp.array(stored_cs_host[last_local])
-        as_last = jnp.array(stored_as_host[last_local])
+        L_last = jnp.array(stored_L_host[last_local])
+        Ll_last = jnp.array(stored_Ll_host[last_local])
+        La_last = jnp.array(stored_La_host[last_local])
         local_i_last = jnp.array(last_local, dtype=jnp.int32)
 
-        sd_prev, sa_prev, g_st_acc, g_lik_acc, g_c_acc = _si_last_block(
-            cs_last, as_last, sd_boundary, sa_boundary, S_tip, L_tip,
+        # Last block: backward sub + SI init
+        sd_prev, sa_prev, g_st_b, g_lik_b, g_c_b = _si_last_block(
+            L_last, Ll_last, La_last, sd_boundary, sa_boundary, S_tip, L_tip,
             local_i_last, sc_args_t, coreg_w, likelihood_precs,
             jac_q1s_a, jac_q2s_a, jac_q3s_a, jac_scale_a, jac_exp_gt_a,
             jac_coreg_w)
-        del cs_last, as_last
+        # Also do backward sub for last block
+        x_last = _bwd_one_block(L_last, Ll_last, La_last,
+                                y_st_local[last_local],
+                                x_next, x_fe, local_i_last)
+        local_x_host[last_local] = np.asarray(x_last)
+        x_next = x_last
+        g_st_acc = g_st_acc + g_st_b
+        g_lik_acc = g_lik_acc + g_lik_b
+        g_c_acc = g_c_acc + g_c_b
+        del L_last, Ll_last, La_last
 
+        # Inner blocks: merged backward sub + SI
         for local_i_py in range(n_local - 2, -1, -1):
-            cs_i = jnp.array(stored_cs_host[local_i_py])
-            as_i = jnp.array(stored_as_host[local_i_py])
+            Li = jnp.array(stored_L_host[local_i_py])
+            Lli = jnp.array(stored_Ll_host[local_i_py])
+            Lai = jnp.array(stored_La_host[local_i_py])
             local_i_jax = jnp.array(local_i_py, dtype=jnp.int32)
 
-            sd_prev, sa_prev, g_st_i, g_lik_i, g_c_i = _si_inner_block(
-                cs_i, as_i, sd_prev, sa_prev, S_tip,
-                local_i_jax, sc_args_t, coreg_w, likelihood_precs,
+            x_i, sd_prev, sa_prev, g_st_i, g_lik_i, g_c_i = _bwd_si_block(
+                Li, Lli, Lai, y_st_local[local_i_py], x_next, x_fe,
+                sd_prev, sa_prev, S_tip, local_i_jax,
+                sc_args_t, coreg_w, likelihood_precs,
                 jac_q1s_a, jac_q2s_a, jac_q3s_a, jac_scale_a, jac_exp_gt_a,
                 jac_coreg_w)
+            local_x_host[local_i_py] = np.asarray(x_i)
+            x_next = x_i
             g_st_acc = g_st_acc + g_st_i
             g_lik_acc = g_lik_acc + g_lik_i
             g_c_acc = g_c_acc + g_c_i
-            del cs_i, as_i
+            del Li, Lli, Lai
 
+        # Send both x and SI boundary to previous rank
         if rank > 0:
-            _si_send_boundary(sd_prev, sa_prev)
+            _bwd_si_send(x_next, sd_prev, sa_prev)
 
+        # Allreduce for x and quad
+        local_x_st = jnp.array(local_x_host)
+        x_st_global, quad_global = _bwd_allgather_reduce(local_x_st, local_quad)
+        x = jnp.concatenate([x_st_global.reshape(-1), x_fe])
+
+        # Allreduce for SI gradients
         g_st_acc, g_lik_acc, g_c_acc = _si_allreduce(g_st_acc, g_lik_acc, g_c_acc)
         grad_lik = likelihood_precs * g_lik_acc
-        return g_st_acc, grad_lik, g_c_acc
+
+        return quad_global, x, g_st_acc, grad_lik, g_c_acc
 
     # ---- Stage 3: logdet Q_prior gradients (JIT-compiled) ----
 
@@ -4378,13 +4354,14 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         jac_sc_list_padded = _theta_to_jac_sc_padded(theta)
         jac_coreg_w = _theta_to_jac_coreg_w(theta)
 
-        grad_prior_st, grad_prior_coreg = pipeline_logdet_Q_prior_coregional_grad(
-            sc_padded, jac_sc_list_padded, coreg_w, jac_coreg_w,
-            n_models, ns, nt, dtype,
-            rank, comm_size, n_local, start_idx, comm)
+        logdet_prior, grad_prior_st, grad_prior_coreg = \
+            pipeline_logdet_Q_prior_coregional_grad(
+                sc_padded, jac_sc_list_padded, coreg_w, jac_coreg_w,
+                n_models, ns, nt, dtype,
+                rank, comm_size, n_local, start_idx, comm)
 
         grad_prior_st_arr = jnp.stack(grad_prior_st)
-        return grad_prior_st_arr, grad_prior_coreg
+        return logdet_prior, grad_prior_st_arr, grad_prior_coreg
 
     # ---- Stage 4: Quadratic form gradients (JIT-compiled) ----
 
@@ -4493,36 +4470,23 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
     def objective_with_grad(theta):
         theta_jax = jnp.asarray(theta, dtype=dtype)
 
-        # Stage 1a: Cholesky + forward sub (stored_cs/as on CPU)
-        cs_host, as_host, y_st_local, L_tip, arrow_rhs_acc, logdet_cond = \
+        L_host, Ll_host, La_host, y_st_local, L_tip, arrow_rhs_acc, logdet_cond = \
             _chol_fn(theta_jax)
 
-        # Stage 1b: Backward sub (fetches stored_cs from CPU one block at a time)
-        quad, x_val = _bwd_fn(
-            theta_jax, cs_host, as_host, L_tip, y_st_local, arrow_rhs_acc)
-        del y_st_local, arrow_rhs_acc
+        quad, x_val, grad_cond_st, grad_cond_lik, grad_cond_coreg = \
+            _bwd_and_si_fn(theta_jax, L_host, Ll_host, La_host, L_tip,
+                           y_st_local, arrow_rhs_acc)
+        del y_st_local, arrow_rhs_acc, L_host, Ll_host, La_host, L_tip
 
-        # Stage 1c: logdet prior
-        logdet_prior = _logdet_prior_fn(theta_jax)
+        logdet_prior, grad_prior_st, grad_prior_coreg = _grad_prior_fn(theta_jax)
 
         f_val = _compute_objective(theta_jax, logdet_cond, quad, logdet_prior)
 
-        # Stage 2: SI gradients (fetches stored_cs from CPU one block at a time)
-        grad_cond_st, grad_cond_lik, grad_cond_coreg = _grad_si_fn(
-            theta_jax, cs_host, as_host, L_tip)
-        del cs_host, as_host, L_tip
-
-        # Stage 3: logdet prior gradients
-        grad_prior_st, grad_prior_coreg = _grad_prior_fn(theta_jax)
-
-        # Stage 4: Quad gradients (uses x from forward)
         grad_quad_st, grad_quad_lik, grad_quad_coreg = _grad_quad_fn(
             theta_jax, x_val)
 
-        # Stage 5: Scalar term gradients
         grad_scalar = _grad_scalar_fn(theta_jax)
 
-        # Combine
         grad_val = _combine_gradients(
             theta_jax,
             grad_cond_st, grad_cond_lik, grad_cond_coreg,
@@ -4534,10 +4498,10 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
 
     def objective_fn(theta):
         theta_jax = jnp.asarray(theta, dtype=dtype)
-        cs_host, as_host, y_st_local, L_tip, arrow_rhs_acc, logdet_cond = \
+        L_h, Ll_h, La_h, y_st_local, L_tip, arrow_rhs_acc, logdet_cond = \
             _chol_fn(theta_jax)
         quad, x_val = _bwd_fn(
-            theta_jax, cs_host, as_host, L_tip, y_st_local, arrow_rhs_acc)
+            theta_jax, L_h, Ll_h, La_h, L_tip, y_st_local, arrow_rhs_acc)
         logdet_prior = _logdet_prior_fn(theta_jax)
         f_val = _compute_objective(theta_jax, logdet_cond, quad, logdet_prior)
         return float(f_val), np.asarray(x_val, dtype=np_dtype)
@@ -4546,16 +4510,11 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
     theta_init = jnp.ones(n_hyperparameters, dtype=dtype)
     from dalia.utils import print_msg
     print_msg("Split-JIT: compiling Cholesky + forward sub...")
-    cs0, as0, yst0, lt0, arr0, logdet0 = _chol_fn(theta_init)
-    print_msg("Split-JIT: compiling backward sub...")
-    quad0, x0 = _bwd_fn(theta_init, cs0, as0, lt0, yst0, arr0)
-    del yst0, arr0
-    print_msg("Split-JIT: compiling logdet prior...")
-    _ = _logdet_prior_fn(theta_init)
-    print_msg("Split-JIT: compiling SI gradient...")
-    _ = _grad_si_fn(theta_init, cs0, as0, lt0)
-    del cs0, as0, lt0
-    print_msg("Split-JIT: compiling prior gradient...")
+    L0, Ll0, La0, yst0, lt0, arr0, logdet0 = _chol_fn(theta_init)
+    print_msg("Split-JIT: compiling merged bwd+SI...")
+    quad0, x0, _, _, _ = _bwd_and_si_fn(theta_init, L0, Ll0, La0, lt0, yst0, arr0)
+    del yst0, arr0, L0, Ll0, La0, lt0
+    print_msg("Split-JIT: compiling prior logdet + gradient...")
     _ = _grad_prior_fn(theta_init)
     print_msg("Split-JIT: compiling quad gradient...")
     _ = _grad_quad_fn(theta_init, x0)
@@ -4564,7 +4523,6 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
     print_msg("Split-JIT: all stages compiled.")
 
     return objective_fn, objective_with_grad
-
 
 
 def create_pure_jax_objective_distributed_coregional_twophase(
@@ -4847,7 +4805,8 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
         return (new_cond_schur, new_arrow_tip_acc, new_arrow_schur,
                 logdet_cond, new_prev_lower_y, new_arrow_rhs_acc,
-                cond_schur, arrow_schur, y_i)
+                cond_schur, arrow_schur, y_i,
+                L_i, L_lower_i, L_arrow_i)
 
     # Per-block JIT for permuted (non-root) forward Cholesky with buffer
     @jax.jit
@@ -4960,7 +4919,8 @@ def create_pure_jax_objective_distributed_coregional_twophase(
                 logdet_cond, new_prev_lower_y, new_arrow_rhs_acc,
                 buffer_solved, new_buffer,
                 new_block0_diag, new_block0_arrow, new_block0_rhs,
-                cond_schur, arrow_schur, y_i)
+                cond_schur, arrow_schur, y_i,
+                L_i, L_lower_i, L_arrow_i)
 
     # Reduced system assembly and factorization
     n_rs = 2 * comm_size
@@ -5084,6 +5044,9 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         prev_lower_y = jnp.zeros(block_size, dtype=dtype)
         arrow_rhs_acc = jnp.zeros(n_fe, dtype=dtype)
 
+        stored_L_host = np.zeros((n_local, block_size, block_size), dtype=np_dtype)
+        stored_Ll_host = np.zeros((n_local, block_size, block_size), dtype=np_dtype)
+        stored_La_host = np.zeros((n_local, n_fe, block_size), dtype=np_dtype)
         stored_cs_host = np.empty((n_local, block_size, block_size), dtype=np_dtype)
         stored_as_host = np.empty((n_local, n_fe, block_size), dtype=np_dtype)
         stored_buf_host = np.empty((n_local, block_size, block_size), dtype=np_dtype)
@@ -5105,16 +5068,20 @@ def create_pure_jax_objective_distributed_coregional_twophase(
                 j_jax = jnp.array(j_py, dtype=jnp.int32)
                 (cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
                  prev_lower_y, arrow_rhs_acc,
-                 cs_out, as_out, y_out) = _chol_one_block(
+                 cs_out, as_out, y_out,
+                 L_out, Ll_out, La_out) = _chol_one_block(
                     cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
                     prev_lower_y, arrow_rhs_acc,
                     j_jax, rhs_st_local,
                     *sc_args,
                     coreg_w, likelihood_precs)
+                stored_L_host[j_py] = np.asarray(L_out)
+                stored_Ll_host[j_py] = np.asarray(Ll_out)
+                stored_La_host[j_py] = np.asarray(La_out)
                 stored_cs_host[j_py] = np.asarray(cs_out)
                 stored_as_host[j_py] = np.asarray(as_out)
                 y_st_host[j_py] = np.asarray(y_out)
-                del cs_out, as_out, y_out
+                del cs_out, as_out, y_out, L_out, Ll_out, La_out
 
             # Last block: store Schur but don't factorize
             stored_cs_host[n_local - 1] = np.asarray(cond_schur)
@@ -5237,7 +5204,8 @@ def create_pure_jax_objective_distributed_coregional_twophase(
                  prev_lower_y, arrow_rhs_acc,
                  buf_solved, buffer_cur,
                  block0_diag_acc, block0_arrow_acc, block0_rhs_acc,
-                 cs_out, as_out, y_out) = _chol_one_block_permuted(
+                 cs_out, as_out, y_out,
+                 L_out, Ll_out, La_out) = _chol_one_block_permuted(
                     cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
                     prev_lower_y, arrow_rhs_acc,
                     buffer_cur,
@@ -5245,11 +5213,14 @@ def create_pure_jax_objective_distributed_coregional_twophase(
                     j_jax, rhs_st_local,
                     *sc_args,
                     coreg_w, likelihood_precs)
+                stored_L_host[j_py] = np.asarray(L_out)
+                stored_Ll_host[j_py] = np.asarray(Ll_out)
+                stored_La_host[j_py] = np.asarray(La_out)
                 stored_cs_host[j_py] = np.asarray(cs_out)
                 stored_as_host[j_py] = np.asarray(as_out)
                 stored_buf_host[j_py] = np.asarray(buf_solved)
                 y_st_host[j_py] = np.asarray(y_out)
-                del cs_out, as_out, y_out, buf_solved
+                del cs_out, as_out, y_out, buf_solved, L_out, Ll_out, La_out
 
             # Last block boundary
             stored_cs_host[n_local - 1] = np.asarray(cond_schur)
@@ -5365,70 +5336,15 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         interior_arrow = mpi4jax.allreduce(arrow_rhs_acc, op=MPI.SUM, comm=comm)
         arrow_rhs_global = rhs_fe + interior_arrow + rs_arrow_rhs
 
-        return (stored_cs_host, stored_as_host, stored_buf_host,
+        return (stored_L_host, stored_Ll_host, stored_La_host,
+                stored_cs_host, stored_as_host, stored_buf_host,
                 y_st_local, L_tip, arrow_rhs_global, logdet_cond_final,
                 rs_diag_g, rs_lower_g, rs_arrow_g,
                 rs_stored_cs, rs_stored_as, rs_y)
 
-    # ---- Shared block reconstruction ----
-
-    def _reconstruct_L_at_block(stored_cs_i, stored_as_i, local_i,
-                                sc_args_tuple, coreg_w_arg, likelihood_precs_arg):
-        (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
-         m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a) = sc_args_tuple
-        global_i = start_idx + local_i
-        sc_loc = []
-        for m in range(n_models):
-            sc_loc.append({
-                'q1s': q1s_a[m], 'q2s': q2s_a[m], 'q3s': q3s_a[m],
-                'scale': scale_a[m], 'exp_gt': exp_gt_a[m],
-                'm0_diag': m0d_a[m], 'm1_diag': m1d_a[m], 'm2_diag': m2d_a[m],
-                'm0_subdiag': m0s_a[m], 'm1_subdiag': m1s_a[m], 'm2_subdiag': m2s_a[m],
-            })
-
-        q_diag = _reconstruct_coregional_diag_block(
-            sc_loc, coreg_w_arg, n_models, ns, global_i)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            q_diag = q_diag.at[
-                m_off + per_model_ata_diag_rows[m][local_i],
-                m_off + per_model_ata_diag_cols[m][local_i]
-            ].add(likelihood_precs_arg[m] * per_model_ata_diag_vals[m][local_i])
-        q_diag = q_diag + _chol_eps_reg * _chol_eye_bs - stored_cs_i
-        L_i = _jax_cholesky(q_diag)
-
-        q_lower = _reconstruct_coregional_lower_block(
-            sc_loc, coreg_w_arg, n_models, ns, global_i)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            q_lower = q_lower.at[
-                m_off + _padded_lower_rows[m][local_i],
-                m_off + _padded_lower_cols[m][local_i]
-            ].add(likelihood_precs_arg[m] * _padded_lower_vals[m][local_i])
-        L_lower_i = jax.scipy.linalg.solve_triangular(
-            L_i, q_lower.T, lower=True).T
-
-        q_arrow = jnp.zeros((n_fe, block_size), dtype=dtype)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            q_arrow = q_arrow.at[
-                per_model_ata_arrow_rows[m][local_i],
-                m_off + per_model_ata_arrow_cols[m][local_i]
-            ].add(likelihood_precs_arg[m] * per_model_ata_arrow_vals[m][local_i])
-        q_arrow = q_arrow - stored_as_i
-        L_arrow_i = jax.scipy.linalg.solve_triangular(
-            L_i, q_arrow.T, lower=True).T
-
-        return L_i, L_lower_i, L_arrow_i
-
-    # ---- Stage 1b: Two-phase backward sub ----
 
     @jax.jit
-    def _bwd_one_block(stored_cs_i, stored_as_i, y_i, x_next, x_fe, local_i,
-                       sc_args_tuple, coreg_w_arg, likelihood_precs_arg):
-        L_i, L_lower_i, L_arrow_i = _reconstruct_L_at_block(
-            stored_cs_i, stored_as_i, local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg)
+    def _bwd_one_block(L_i, L_lower_i, L_arrow_i, y_i, x_next, x_fe, local_i):
         global_i = start_idx + local_i
         rhs = y_i - L_arrow_i.T @ x_fe
         rhs = jnp.where(global_i < nt - 1, rhs - L_lower_i.T @ x_next, rhs)
@@ -5436,13 +5352,9 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         return x_i
 
     @jax.jit
-    def _bwd_one_block_permuted(stored_cs_i, stored_as_i, stored_buf_i,
-                                y_i, x_next, x_fe, x_block0, local_i,
-                                sc_args_tuple, coreg_w_arg, likelihood_precs_arg):
+    def _bwd_one_block_permuted(L_i, L_lower_i, L_arrow_i, stored_buf_i,
+                                y_i, x_next, x_fe, x_block0, local_i):
         """Backward sub for non-root interior blocks with buffer term."""
-        L_i, L_lower_i, L_arrow_i = _reconstruct_L_at_block(
-            stored_cs_i, stored_as_i, local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg)
         global_i = start_idx + local_i
         rhs = y_i - L_arrow_i.T @ x_fe - stored_buf_i.T @ x_block0
         rhs = jnp.where(global_i < nt - 1, rhs - L_lower_i.T @ x_next, rhs)
@@ -5541,28 +5453,11 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
         return rs_sd, rs_sl, rs_sa
 
-    def _bwd_fn(theta, stored_cs_host, stored_as_host, stored_buf_host,
+    def _bwd_fn(theta, stored_L_host, stored_Ll_host, stored_La_host,
+                stored_buf_host,
                 L_tip, y_st_local, arrow_rhs_total,
                 rs_diag_g, rs_lower_g, rs_arrow_g, rs_stored_cs, rs_stored_as,
                 rs_y):
-        likelihood_precs = _theta_to_likelihood_precs(theta)
-        sc_list, coreg_w = _theta_to_sc_coreg(theta)
-        sc_padded = _pad_subdiags(sc_list)
-
-        q1s_a = jnp.stack([sc_padded[m]['q1s'] for m in range(n_models)])
-        q2s_a = jnp.stack([sc_padded[m]['q2s'] for m in range(n_models)])
-        q3s_a = jnp.stack([sc_padded[m]['q3s'] for m in range(n_models)])
-        scale_a = jnp.array([sc_padded[m]['scale'] for m in range(n_models)])
-        exp_gt_a = jnp.array([sc_padded[m]['exp_gt'] for m in range(n_models)])
-        m0d_a = jnp.stack([sc_padded[m]['m0_diag'] for m in range(n_models)])
-        m1d_a = jnp.stack([sc_padded[m]['m1_diag'] for m in range(n_models)])
-        m2d_a = jnp.stack([sc_padded[m]['m2_diag'] for m in range(n_models)])
-        m0s_a = jnp.stack([sc_padded[m]['m0_subdiag'] for m in range(n_models)])
-        m1s_a = jnp.stack([sc_padded[m]['m1_subdiag'] for m in range(n_models)])
-        m2s_a = jnp.stack([sc_padded[m]['m2_subdiag'] for m in range(n_models)])
-        sc_args_t = (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
-                     m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a)
-
         y_fe = jax.scipy.linalg.solve_triangular(L_tip, arrow_rhs_total, lower=True)
         local_quad = jnp.sum(y_st_local ** 2)
         y_fe_quad = jnp.where(rank == comm_size - 1, jnp.sum(y_fe ** 2), 0.0)
@@ -5578,40 +5473,38 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         local_x_host = np.zeros((max_n_local, block_size), dtype=np_dtype)
 
         if rank == 0:
-            # Root: standard backward on [n_local-2..0]
             x_last = rs_x[1]
             local_x_host[n_local - 1] = np.asarray(x_last)
             x_next = x_last
             for local_i_py in range(n_local - 2, -1, -1):
-                cs_i = jnp.array(stored_cs_host[local_i_py])
-                as_i = jnp.array(stored_as_host[local_i_py])
+                Li = jnp.array(stored_L_host[local_i_py])
+                Lli = jnp.array(stored_Ll_host[local_i_py])
+                Lai = jnp.array(stored_La_host[local_i_py])
                 local_i_jax = jnp.array(local_i_py, dtype=jnp.int32)
-                x_i = _bwd_one_block(cs_i, as_i, y_st_local[local_i_py],
-                                     x_next, x_fe, local_i_jax,
-                                     sc_args_t, coreg_w, likelihood_precs)
+                x_i = _bwd_one_block(Li, Lli, Lai, y_st_local[local_i_py],
+                                     x_next, x_fe, local_i_jax)
                 local_x_host[local_i_py] = np.asarray(x_i)
                 x_next = x_i
-                del cs_i, as_i
+                del Li, Lli, Lai
         else:
-            # Non-root: permuted backward on [n_local-2..1] with buffer
             x_block0 = rs_x[2 * rank]
             x_last = rs_x[2 * rank + 1]
             local_x_host[0] = np.asarray(x_block0)
             local_x_host[n_local - 1] = np.asarray(x_last)
             x_next = x_last
             for local_i_py in range(n_local - 2, 0, -1):
-                cs_i = jnp.array(stored_cs_host[local_i_py])
-                as_i = jnp.array(stored_as_host[local_i_py])
+                Li = jnp.array(stored_L_host[local_i_py])
+                Lli = jnp.array(stored_Ll_host[local_i_py])
+                Lai = jnp.array(stored_La_host[local_i_py])
                 buf_i = jnp.array(stored_buf_host[local_i_py])
                 local_i_jax = jnp.array(local_i_py, dtype=jnp.int32)
                 x_i = _bwd_one_block_permuted(
-                    cs_i, as_i, buf_i,
+                    Li, Lli, Lai, buf_i,
                     y_st_local[local_i_py], x_next, x_fe, x_block0,
-                    local_i_jax,
-                    sc_args_t, coreg_w, likelihood_precs)
+                    local_i_jax)
                 local_x_host[local_i_py] = np.asarray(x_i)
                 x_next = x_i
-                del cs_i, as_i, buf_i
+                del Li, Lli, Lai, buf_i
 
         local_x_st = jnp.array(local_x_host)
         x_st_global, quad_global = _bwd_allgather_reduce(local_x_st, local_quad)
@@ -5632,316 +5525,6 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
     n_coreg = n_sigmas + n_lambdas
     n_models_cubed = n_models * n_models * n_models
-
-    @jax.jit
-    def _si_last_block(stored_cs_i, stored_as_i, sd_boundary, sa_boundary,
-                       S_tip_arg, L_tip_arg, local_i,
-                       sc_args_tuple, coreg_w_arg, likelihood_precs_arg,
-                       jac_q1s_a, jac_q2s_a, jac_q3s_a,
-                       jac_scale_a, jac_exp_gt_a, jac_coreg_w_arg):
-        """Process the last local block for SI grads."""
-        L_i, L_lower_i, L_arrow_i = _reconstruct_L_at_block(
-            stored_cs_i, stored_as_i, local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg)
-        L_blk_inv = jax.scipy.linalg.solve_triangular(L_i, _chol_eye_bs, lower=True)
-
-        global_i = start_idx + local_i
-        is_global_last = (global_i == nt - 1)
-
-        sa_global_last = -S_tip_arg @ L_arrow_i @ L_blk_inv
-        sd_global_last = (L_blk_inv.T - sa_global_last.T @ L_arrow_i) @ L_blk_inv
-
-        sl_bnd = (-sd_boundary @ L_lower_i - sa_boundary.T @ L_arrow_i) @ L_blk_inv
-        sa_bnd = (-sa_boundary @ L_lower_i - S_tip_arg @ L_arrow_i) @ L_blk_inv
-        sd_bnd = (L_blk_inv.T - sl_bnd.T @ L_lower_i - sa_bnd.T @ L_arrow_i) @ L_blk_inv
-
-        sd_last = jnp.where(is_global_last, sd_global_last, sd_bnd)
-        sa_last = jnp.where(is_global_last, sa_global_last, sa_bnd)
-
-        (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
-         m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a) = sc_args_tuple
-
-        def _diag_body(flat_idx, acc):
-            g_st_, g_c_ = acc
-            ii = flat_idx // (n_models * n_models)
-            jj = (flat_idx // n_models) % n_models
-            m_idx = flat_idx % n_models
-            sd_ij = lax.dynamic_slice(sd_last, (ii * ns, jj * ns), (ns, ns))
-            w_ijm = coreg_w_arg[ii, jj, m_idx]
-            base_d = (m0d_a[m_idx, global_i] * q3s_a[m_idx]
-                      + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * q2s_a[m_idx]
-                      + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * q1s_a[m_idx])
-            tr_val = jnp.sum(sd_ij * (scale_a[m_idx] * base_d).T)
-            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
-            g_c_ = g_c_ + dw * tr_val
-            partial_gt_d = (m1d_a[m_idx, global_i] * q2s_a[m_idx]
-                            + 2.0 * exp_gt_a[m_idx] * m2d_a[m_idx, global_i] * q1s_a[m_idx])
-            for k in range(3):
-                dQu = (jac_scale_a[m_idx, k] * base_d
-                       + scale_a[m_idx] * (m0d_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
-                                           + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
-                                           + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
-                       + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt_d)
-                g_st_ = g_st_.at[m_idx, k].add(w_ijm * jnp.sum(sd_ij * dQu.T))
-            return (g_st_, g_c_)
-
-        g_st_init = jnp.zeros((n_models, 3), dtype=dtype)
-        g_c_init = jnp.zeros(n_coreg, dtype=dtype)
-        g_st, g_c = lax.fori_loop(0, n_models_cubed, _diag_body, (g_st_init, g_c_init))
-
-        g_lik = jnp.zeros(n_models, dtype=dtype)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            sp_d = jnp.sum(sd_last[m_off + per_model_ata_diag_rows[m][local_i],
-                                   m_off + per_model_ata_diag_cols[m][local_i]]
-                           * per_model_ata_diag_vals[m][local_i])
-            sp_a = jnp.sum(sa_last[per_model_ata_arrow_rows[m][local_i],
-                                   m_off + per_model_ata_arrow_cols[m][local_i]]
-                           * per_model_ata_arrow_vals[m][local_i])
-            g_lik = g_lik.at[m].add(sp_d + 2.0 * sp_a)
-            tip_val = jnp.where(rank == comm_size - 1,
-                                jnp.sum(S_tip_arg * per_model_ata_tip[m]), 0.0)
-            g_lik = g_lik.at[m].add(tip_val)
-
-        safe_idx = jnp.minimum(global_i, nt - 2)
-        sl_for_trace = jnp.where(is_global_last, jnp.zeros_like(sl_bnd), sl_bnd)
-
-        def _lower_body(flat_idx, acc):
-            g_st_, g_c_ = acc
-            ii = flat_idx // (n_models * n_models)
-            jj = (flat_idx // n_models) % n_models
-            m_idx = flat_idx % n_models
-            sl_ij = lax.dynamic_slice(sl_for_trace, (ii * ns, jj * ns), (ns, ns))
-            w_ijm = coreg_w_arg[ii, jj, m_idx]
-            base_l = (m0s_a[m_idx, safe_idx] * q3s_a[m_idx]
-                      + exp_gt_a[m_idx] * m1s_a[m_idx, safe_idx] * q2s_a[m_idx]
-                      + exp_gt_a[m_idx]**2 * m2s_a[m_idx, safe_idx] * q1s_a[m_idx])
-            tr_l = jnp.sum(sl_ij * (scale_a[m_idx] * base_l).T)
-            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
-            g_c_ = g_c_ + 2.0 * dw * tr_l
-            partial_gt_l = (m1s_a[m_idx, safe_idx] * q2s_a[m_idx]
-                            + 2.0 * exp_gt_a[m_idx] * m2s_a[m_idx, safe_idx] * q1s_a[m_idx])
-            for k in range(3):
-                dQu_l = (jac_scale_a[m_idx, k] * base_l
-                         + scale_a[m_idx] * (m0s_a[m_idx, safe_idx] * jac_q3s_a[m_idx, :, :, k]
-                                             + exp_gt_a[m_idx] * m1s_a[m_idx, safe_idx] * jac_q2s_a[m_idx, :, :, k]
-                                             + exp_gt_a[m_idx]**2 * m2s_a[m_idx, safe_idx] * jac_q1s_a[m_idx, :, :, k])
-                         + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt_l)
-                g_st_ = g_st_.at[m_idx, k].add(2.0 * w_ijm * jnp.sum(sl_ij * dQu_l.T))
-            return (g_st_, g_c_)
-
-        g_st_l, g_c_l = lax.fori_loop(0, n_models_cubed, _lower_body, (g_st_init, g_c_init))
-        g_st = g_st + jnp.where(is_global_last, jnp.zeros_like(g_st_l), g_st_l)
-        g_c = g_c + jnp.where(is_global_last, jnp.zeros_like(g_c_l), g_c_l)
-
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            sl_lik = jnp.where(
-                is_global_last, 0.0,
-                jnp.sum(sl_bnd[m_off + _padded_lower_rows[m][local_i],
-                               m_off + _padded_lower_cols[m][local_i]]
-                        * _padded_lower_vals[m][local_i]))
-            g_lik = g_lik.at[m].add(2.0 * sl_lik)
-
-        return sd_last, sa_last, g_st, g_lik, g_c
-
-    @jax.jit
-    def _si_inner_block(stored_cs_i, stored_as_i, sd_prev, sa_prev, S_tip_arg,
-                        local_i,
-                        sc_args_tuple, coreg_w_arg, likelihood_precs_arg,
-                        jac_q1s_a, jac_q2s_a, jac_q3s_a,
-                        jac_scale_a, jac_exp_gt_a, jac_coreg_w_arg):
-        """Process an inner block for SI grads (standard, no buffer)."""
-        L_i, L_lower_i, L_arrow_i = _reconstruct_L_at_block(
-            stored_cs_i, stored_as_i, local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg)
-        L_blk_inv = jax.scipy.linalg.solve_triangular(L_i, _chol_eye_bs, lower=True)
-
-        global_i = start_idx + local_i
-        sl_i = (-sd_prev @ L_lower_i - sa_prev.T @ L_arrow_i) @ L_blk_inv
-        sa_i = (-sa_prev @ L_lower_i - S_tip_arg @ L_arrow_i) @ L_blk_inv
-        sd_i = (L_blk_inv.T - sl_i.T @ L_lower_i - sa_i.T @ L_arrow_i) @ L_blk_inv
-
-        (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
-         m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a) = sc_args_tuple
-
-        def _diag_body(flat_idx, acc):
-            g_st_, g_c_ = acc
-            ii = flat_idx // (n_models * n_models)
-            jj = (flat_idx // n_models) % n_models
-            m_idx = flat_idx % n_models
-            sd_ij = lax.dynamic_slice(sd_i, (ii * ns, jj * ns), (ns, ns))
-            w_ijm = coreg_w_arg[ii, jj, m_idx]
-            base_d = (m0d_a[m_idx, global_i] * q3s_a[m_idx]
-                      + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * q2s_a[m_idx]
-                      + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * q1s_a[m_idx])
-            tr_val = jnp.sum(sd_ij * (scale_a[m_idx] * base_d).T)
-            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
-            g_c_ = g_c_ + dw * tr_val
-            partial_gt = (m1d_a[m_idx, global_i] * q2s_a[m_idx]
-                          + 2.0 * exp_gt_a[m_idx] * m2d_a[m_idx, global_i] * q1s_a[m_idx])
-            for k in range(3):
-                dQu = (jac_scale_a[m_idx, k] * base_d
-                       + scale_a[m_idx] * (m0d_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
-                                           + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
-                                           + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
-                       + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt)
-                g_st_ = g_st_.at[m_idx, k].add(w_ijm * jnp.sum(sd_ij * dQu.T))
-            return (g_st_, g_c_)
-
-        g_st_init = jnp.zeros((n_models, 3), dtype=dtype)
-        g_c_init = jnp.zeros(n_coreg, dtype=dtype)
-        g_st, g_c = lax.fori_loop(0, n_models_cubed, _diag_body, (g_st_init, g_c_init))
-
-        def _lower_body(flat_idx, acc):
-            g_st_, g_c_ = acc
-            ii = flat_idx // (n_models * n_models)
-            jj = (flat_idx // n_models) % n_models
-            m_idx = flat_idx % n_models
-            sl_ij = lax.dynamic_slice(sl_i, (ii * ns, jj * ns), (ns, ns))
-            w_ijm = coreg_w_arg[ii, jj, m_idx]
-            base_l = (m0s_a[m_idx, global_i] * q3s_a[m_idx]
-                      + exp_gt_a[m_idx] * m1s_a[m_idx, global_i] * q2s_a[m_idx]
-                      + exp_gt_a[m_idx]**2 * m2s_a[m_idx, global_i] * q1s_a[m_idx])
-            tr_l = jnp.sum(sl_ij * (scale_a[m_idx] * base_l).T)
-            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
-            g_c_ = g_c_ + 2.0 * dw * tr_l
-            partial_gt = (m1s_a[m_idx, global_i] * q2s_a[m_idx]
-                          + 2.0 * exp_gt_a[m_idx] * m2s_a[m_idx, global_i] * q1s_a[m_idx])
-            for k in range(3):
-                dQu_l = (jac_scale_a[m_idx, k] * base_l
-                         + scale_a[m_idx] * (m0s_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
-                                             + exp_gt_a[m_idx] * m1s_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
-                                             + exp_gt_a[m_idx]**2 * m2s_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
-                         + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt)
-                g_st_ = g_st_.at[m_idx, k].add(2.0 * w_ijm * jnp.sum(sl_ij * dQu_l.T))
-            return (g_st_, g_c_)
-
-        g_st_l, g_c_l = lax.fori_loop(0, n_models_cubed, _lower_body, (g_st_init, g_c_init))
-        g_st = g_st + g_st_l
-        g_c = g_c + g_c_l
-
-        g_lik = jnp.zeros(n_models, dtype=dtype)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            sp_d = jnp.sum(sd_i[m_off + per_model_ata_diag_rows[m][local_i],
-                                m_off + per_model_ata_diag_cols[m][local_i]]
-                           * per_model_ata_diag_vals[m][local_i])
-            sp_a = jnp.sum(sa_i[per_model_ata_arrow_rows[m][local_i],
-                                m_off + per_model_ata_arrow_cols[m][local_i]]
-                           * per_model_ata_arrow_vals[m][local_i])
-            sp_l = jnp.sum(sl_i[m_off + _padded_lower_rows[m][local_i],
-                                m_off + _padded_lower_cols[m][local_i]]
-                           * _padded_lower_vals[m][local_i])
-            g_lik = g_lik.at[m].add(sp_d + 2.0 * sp_a + 2.0 * sp_l)
-
-        return sd_i, sa_i, g_st, g_lik, g_c
-
-    @jax.jit
-    def _si_inner_block_permuted(
-            stored_cs_i, stored_as_i, stored_buf_i,
-            sd_prev, sa_prev, buf_X_next,
-            sd_block0, sa_block0, S_tip_arg,
-            local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg,
-            jac_q1s_a, jac_q2s_a, jac_q3s_a,
-            jac_scale_a, jac_exp_gt_a, jac_coreg_w_arg):
-        """Permuted SI step for non-root interior blocks with buffer terms."""
-        L_i, L_lower_i, L_arrow_i = _reconstruct_L_at_block(
-            stored_cs_i, stored_as_i, local_i,
-            sc_args_tuple, coreg_w_arg, likelihood_precs_arg)
-        L_blk_inv = jax.scipy.linalg.solve_triangular(L_i, _chol_eye_bs, lower=True)
-
-        buf_L_i = stored_buf_i
-        sl_i = (-buf_X_next.T @ buf_L_i
-                - sd_prev @ L_lower_i
-                - sa_prev.T @ L_arrow_i) @ L_blk_inv
-        buf_X_i = (-buf_X_next @ L_lower_i
-                   - sd_block0 @ buf_L_i
-                   - sa_block0.T @ L_arrow_i) @ L_blk_inv
-        sa_i = (-sa_prev @ L_lower_i
-                - sa_block0 @ buf_L_i
-                - S_tip_arg @ L_arrow_i) @ L_blk_inv
-        sd_i = (L_blk_inv.T
-                - sl_i.T @ L_lower_i
-                - buf_X_i.T @ buf_L_i
-                - sa_i.T @ L_arrow_i) @ L_blk_inv
-
-        global_i = start_idx + local_i
-        (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
-         m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a) = sc_args_tuple
-
-        def _diag_body(flat_idx, acc):
-            g_st_, g_c_ = acc
-            ii = flat_idx // (n_models * n_models)
-            jj = (flat_idx // n_models) % n_models
-            m_idx = flat_idx % n_models
-            sd_ij = lax.dynamic_slice(sd_i, (ii * ns, jj * ns), (ns, ns))
-            w_ijm = coreg_w_arg[ii, jj, m_idx]
-            base_d = (m0d_a[m_idx, global_i] * q3s_a[m_idx]
-                      + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * q2s_a[m_idx]
-                      + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * q1s_a[m_idx])
-            tr_val = jnp.sum(sd_ij * (scale_a[m_idx] * base_d).T)
-            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
-            g_c_ = g_c_ + dw * tr_val
-            partial_gt = (m1d_a[m_idx, global_i] * q2s_a[m_idx]
-                          + 2.0 * exp_gt_a[m_idx] * m2d_a[m_idx, global_i] * q1s_a[m_idx])
-            for k in range(3):
-                dQu = (jac_scale_a[m_idx, k] * base_d
-                       + scale_a[m_idx] * (m0d_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
-                                           + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
-                                           + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
-                       + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt)
-                g_st_ = g_st_.at[m_idx, k].add(w_ijm * jnp.sum(sd_ij * dQu.T))
-            return (g_st_, g_c_)
-
-        g_st_init = jnp.zeros((n_models, 3), dtype=dtype)
-        g_c_init = jnp.zeros(n_coreg, dtype=dtype)
-        g_st, g_c = lax.fori_loop(0, n_models_cubed, _diag_body, (g_st_init, g_c_init))
-
-        def _lower_body(flat_idx, acc):
-            g_st_, g_c_ = acc
-            ii = flat_idx // (n_models * n_models)
-            jj = (flat_idx // n_models) % n_models
-            m_idx = flat_idx % n_models
-            sl_ij = lax.dynamic_slice(sl_i, (ii * ns, jj * ns), (ns, ns))
-            w_ijm = coreg_w_arg[ii, jj, m_idx]
-            base_l = (m0s_a[m_idx, global_i] * q3s_a[m_idx]
-                      + exp_gt_a[m_idx] * m1s_a[m_idx, global_i] * q2s_a[m_idx]
-                      + exp_gt_a[m_idx]**2 * m2s_a[m_idx, global_i] * q1s_a[m_idx])
-            tr_l = jnp.sum(sl_ij * (scale_a[m_idx] * base_l).T)
-            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
-            g_c_ = g_c_ + 2.0 * dw * tr_l
-            partial_gt = (m1s_a[m_idx, global_i] * q2s_a[m_idx]
-                          + 2.0 * exp_gt_a[m_idx] * m2s_a[m_idx, global_i] * q1s_a[m_idx])
-            for k in range(3):
-                dQu_l = (jac_scale_a[m_idx, k] * base_l
-                         + scale_a[m_idx] * (m0s_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
-                                             + exp_gt_a[m_idx] * m1s_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
-                                             + exp_gt_a[m_idx]**2 * m2s_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
-                         + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt)
-                g_st_ = g_st_.at[m_idx, k].add(2.0 * w_ijm * jnp.sum(sl_ij * dQu_l.T))
-            return (g_st_, g_c_)
-
-        g_st_l, g_c_l = lax.fori_loop(0, n_models_cubed, _lower_body, (g_st_init, g_c_init))
-        g_st = g_st + g_st_l
-        g_c = g_c + g_c_l
-
-        g_lik = jnp.zeros(n_models, dtype=dtype)
-        for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
-            sp_d = jnp.sum(sd_i[m_off + per_model_ata_diag_rows[m][local_i],
-                                m_off + per_model_ata_diag_cols[m][local_i]]
-                           * per_model_ata_diag_vals[m][local_i])
-            sp_a = jnp.sum(sa_i[per_model_ata_arrow_rows[m][local_i],
-                                m_off + per_model_ata_arrow_cols[m][local_i]]
-                           * per_model_ata_arrow_vals[m][local_i])
-            sp_l = jnp.sum(sl_i[m_off + _padded_lower_rows[m][local_i],
-                                m_off + _padded_lower_cols[m][local_i]]
-                           * _padded_lower_vals[m][local_i])
-            g_lik = g_lik.at[m].add(sp_d + 2.0 * sp_a + 2.0 * sp_l)
-
-        return sd_i, sa_i, buf_X_i, g_st, g_lik, g_c
 
     @jax.jit
     def _si_allreduce(g_st, g_lik, g_c):
@@ -6042,10 +5625,287 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
         return g_st, g_lik, g_c
 
-    def _grad_si_fn(theta, stored_cs_host, stored_as_host, stored_buf_host,
-                    L_tip, rs_diag_g, rs_lower_g, rs_arrow_g,
-                    rs_stored_cs, rs_stored_as):
-        """Two-phase SI gradient computation."""
+    # ---- Merged bwd+SI per-block JIT functions ----
+
+    @jax.jit
+    def _bwd_si_block(L_i, L_lower_i, L_arrow_i, y_i, x_next, x_fe,
+                      sd_prev, sa_prev, S_tip_arg, local_i,
+                      sc_args_tuple, coreg_w_arg, likelihood_precs_arg,
+                      jac_q1s_a, jac_q2s_a, jac_q3s_a,
+                      jac_scale_a, jac_exp_gt_a, jac_coreg_w_arg):
+        """Merged backward sub + SI gradient traces (L factors from CPU)."""
+        L_blk_inv = jax.scipy.linalg.solve_triangular(L_i, _chol_eye_bs, lower=True)
+        global_i = start_idx + local_i
+
+        # Backward sub
+        rhs = y_i - L_arrow_i.T @ x_fe
+        rhs = jnp.where(global_i < nt - 1, rhs - L_lower_i.T @ x_next, rhs)
+        x_i = jax.scipy.linalg.solve_triangular(L_i.T, rhs, lower=False)
+
+        # SI recurrence
+        sl_i = (-sd_prev @ L_lower_i - sa_prev.T @ L_arrow_i) @ L_blk_inv
+        sa_i = (-sa_prev @ L_lower_i - S_tip_arg @ L_arrow_i) @ L_blk_inv
+        sd_i = (L_blk_inv.T - sl_i.T @ L_lower_i - sa_i.T @ L_arrow_i) @ L_blk_inv
+
+        # Gradient traces
+        (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
+         m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a) = sc_args_tuple
+
+        def _diag_body(flat_idx, acc):
+            g_st_, g_c_ = acc
+            ii = flat_idx // (n_models * n_models)
+            jj = (flat_idx // n_models) % n_models
+            m_idx = flat_idx % n_models
+            sd_ij = lax.dynamic_slice(sd_i, (ii * ns, jj * ns), (ns, ns))
+            w_ijm = coreg_w_arg[ii, jj, m_idx]
+            base_d = (m0d_a[m_idx, global_i] * q3s_a[m_idx]
+                      + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * q2s_a[m_idx]
+                      + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * q1s_a[m_idx])
+            tr_val = jnp.sum(sd_ij * (scale_a[m_idx] * base_d).T)
+            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
+            g_c_ = g_c_ + dw * tr_val
+            partial_gt = (m1d_a[m_idx, global_i] * q2s_a[m_idx]
+                          + 2.0 * exp_gt_a[m_idx] * m2d_a[m_idx, global_i] * q1s_a[m_idx])
+            for k in range(3):
+                dQu = (jac_scale_a[m_idx, k] * base_d
+                       + scale_a[m_idx] * (m0d_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
+                                           + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
+                                           + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
+                       + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt)
+                g_st_ = g_st_.at[m_idx, k].add(w_ijm * jnp.sum(sd_ij * dQu.T))
+            return (g_st_, g_c_)
+
+        g_st_init = jnp.zeros((n_models, 3), dtype=dtype)
+        g_c_init = jnp.zeros(n_coreg, dtype=dtype)
+        g_st, g_c = lax.fori_loop(0, n_models_cubed, _diag_body, (g_st_init, g_c_init))
+
+        def _lower_body(flat_idx, acc):
+            g_st_, g_c_ = acc
+            ii = flat_idx // (n_models * n_models)
+            jj = (flat_idx // n_models) % n_models
+            m_idx = flat_idx % n_models
+            sl_ij = lax.dynamic_slice(sl_i, (ii * ns, jj * ns), (ns, ns))
+            w_ijm = coreg_w_arg[ii, jj, m_idx]
+            base_l = (m0s_a[m_idx, global_i] * q3s_a[m_idx]
+                      + exp_gt_a[m_idx] * m1s_a[m_idx, global_i] * q2s_a[m_idx]
+                      + exp_gt_a[m_idx]**2 * m2s_a[m_idx, global_i] * q1s_a[m_idx])
+            tr_l = jnp.sum(sl_ij * (scale_a[m_idx] * base_l).T)
+            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
+            g_c_ = g_c_ + 2.0 * dw * tr_l
+            partial_gt = (m1s_a[m_idx, global_i] * q2s_a[m_idx]
+                          + 2.0 * exp_gt_a[m_idx] * m2s_a[m_idx, global_i] * q1s_a[m_idx])
+            for k in range(3):
+                dQu_l = (jac_scale_a[m_idx, k] * base_l
+                         + scale_a[m_idx] * (m0s_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
+                                             + exp_gt_a[m_idx] * m1s_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
+                                             + exp_gt_a[m_idx]**2 * m2s_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
+                         + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt)
+                g_st_ = g_st_.at[m_idx, k].add(2.0 * w_ijm * jnp.sum(sl_ij * dQu_l.T))
+            return (g_st_, g_c_)
+
+        g_st_l, g_c_l = lax.fori_loop(0, n_models_cubed, _lower_body, (g_st_init, g_c_init))
+        g_st = g_st + g_st_l
+        g_c = g_c + g_c_l
+
+        g_lik = jnp.zeros(n_models, dtype=dtype)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            sp_d = jnp.sum(sd_i[m_off + per_model_ata_diag_rows[m][local_i],
+                                m_off + per_model_ata_diag_cols[m][local_i]]
+                           * per_model_ata_diag_vals[m][local_i])
+            sp_a = jnp.sum(sa_i[per_model_ata_arrow_rows[m][local_i],
+                                m_off + per_model_ata_arrow_cols[m][local_i]]
+                           * per_model_ata_arrow_vals[m][local_i])
+            sp_l = jnp.sum(sl_i[m_off + _padded_lower_rows[m][local_i],
+                                m_off + _padded_lower_cols[m][local_i]]
+                           * _padded_lower_vals[m][local_i])
+            g_lik = g_lik.at[m].add(sp_d + 2.0 * sp_a + 2.0 * sp_l)
+
+        return x_i, sd_i, sa_i, g_st, g_lik, g_c
+
+    @jax.jit
+    def _bwd_si_block_permuted(
+            L_i, L_lower_i, L_arrow_i, stored_buf_i,
+            y_i, x_next, x_fe, x_block0,
+            sd_prev, sa_prev, buf_X_next,
+            sd_block0, sa_block0, S_tip_arg, local_i,
+            sc_args_tuple, coreg_w_arg, likelihood_precs_arg,
+            jac_q1s_a, jac_q2s_a, jac_q3s_a,
+            jac_scale_a, jac_exp_gt_a, jac_coreg_w_arg):
+        """Merged backward sub + SI gradient traces for non-root interior blocks."""
+        L_blk_inv = jax.scipy.linalg.solve_triangular(L_i, _chol_eye_bs, lower=True)
+        global_i = start_idx + local_i
+
+        # Backward sub (permuted)
+        rhs = y_i - L_arrow_i.T @ x_fe - stored_buf_i.T @ x_block0
+        rhs = jnp.where(global_i < nt - 1, rhs - L_lower_i.T @ x_next, rhs)
+        x_i = jax.scipy.linalg.solve_triangular(L_i.T, rhs, lower=False)
+
+        # SI recurrence (permuted)
+        buf_L_i = stored_buf_i
+        sl_i = (-buf_X_next.T @ buf_L_i
+                - sd_prev @ L_lower_i
+                - sa_prev.T @ L_arrow_i) @ L_blk_inv
+        buf_X_i = (-buf_X_next @ L_lower_i
+                   - sd_block0 @ buf_L_i
+                   - sa_block0.T @ L_arrow_i) @ L_blk_inv
+        sa_i = (-sa_prev @ L_lower_i
+                - sa_block0 @ buf_L_i
+                - S_tip_arg @ L_arrow_i) @ L_blk_inv
+        sd_i = (L_blk_inv.T
+                - sl_i.T @ L_lower_i
+                - buf_X_i.T @ buf_L_i
+                - sa_i.T @ L_arrow_i) @ L_blk_inv
+
+        # Gradient traces
+        (q1s_a, q2s_a, q3s_a, scale_a, exp_gt_a,
+         m0d_a, m1d_a, m2d_a, m0s_a, m1s_a, m2s_a) = sc_args_tuple
+
+        def _diag_body(flat_idx, acc):
+            g_st_, g_c_ = acc
+            ii = flat_idx // (n_models * n_models)
+            jj = (flat_idx // n_models) % n_models
+            m_idx = flat_idx % n_models
+            sd_ij = lax.dynamic_slice(sd_i, (ii * ns, jj * ns), (ns, ns))
+            w_ijm = coreg_w_arg[ii, jj, m_idx]
+            base_d = (m0d_a[m_idx, global_i] * q3s_a[m_idx]
+                      + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * q2s_a[m_idx]
+                      + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * q1s_a[m_idx])
+            tr_val = jnp.sum(sd_ij * (scale_a[m_idx] * base_d).T)
+            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
+            g_c_ = g_c_ + dw * tr_val
+            partial_gt = (m1d_a[m_idx, global_i] * q2s_a[m_idx]
+                          + 2.0 * exp_gt_a[m_idx] * m2d_a[m_idx, global_i] * q1s_a[m_idx])
+            for k in range(3):
+                dQu = (jac_scale_a[m_idx, k] * base_d
+                       + scale_a[m_idx] * (m0d_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
+                                           + exp_gt_a[m_idx] * m1d_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
+                                           + exp_gt_a[m_idx]**2 * m2d_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
+                       + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt)
+                g_st_ = g_st_.at[m_idx, k].add(w_ijm * jnp.sum(sd_ij * dQu.T))
+            return (g_st_, g_c_)
+
+        g_st_init = jnp.zeros((n_models, 3), dtype=dtype)
+        g_c_init = jnp.zeros(n_coreg, dtype=dtype)
+        g_st, g_c = lax.fori_loop(0, n_models_cubed, _diag_body, (g_st_init, g_c_init))
+
+        def _lower_body(flat_idx, acc):
+            g_st_, g_c_ = acc
+            ii = flat_idx // (n_models * n_models)
+            jj = (flat_idx // n_models) % n_models
+            m_idx = flat_idx % n_models
+            sl_ij = lax.dynamic_slice(sl_i, (ii * ns, jj * ns), (ns, ns))
+            w_ijm = coreg_w_arg[ii, jj, m_idx]
+            base_l = (m0s_a[m_idx, global_i] * q3s_a[m_idx]
+                      + exp_gt_a[m_idx] * m1s_a[m_idx, global_i] * q2s_a[m_idx]
+                      + exp_gt_a[m_idx]**2 * m2s_a[m_idx, global_i] * q1s_a[m_idx])
+            tr_l = jnp.sum(sl_ij * (scale_a[m_idx] * base_l).T)
+            dw = jac_coreg_w_arg[ii, jj, m_idx, :]
+            g_c_ = g_c_ + 2.0 * dw * tr_l
+            partial_gt = (m1s_a[m_idx, global_i] * q2s_a[m_idx]
+                          + 2.0 * exp_gt_a[m_idx] * m2s_a[m_idx, global_i] * q1s_a[m_idx])
+            for k in range(3):
+                dQu_l = (jac_scale_a[m_idx, k] * base_l
+                         + scale_a[m_idx] * (m0s_a[m_idx, global_i] * jac_q3s_a[m_idx, :, :, k]
+                                             + exp_gt_a[m_idx] * m1s_a[m_idx, global_i] * jac_q2s_a[m_idx, :, :, k]
+                                             + exp_gt_a[m_idx]**2 * m2s_a[m_idx, global_i] * jac_q1s_a[m_idx, :, :, k])
+                         + scale_a[m_idx] * jac_exp_gt_a[m_idx, k] * partial_gt)
+                g_st_ = g_st_.at[m_idx, k].add(2.0 * w_ijm * jnp.sum(sl_ij * dQu_l.T))
+            return (g_st_, g_c_)
+
+        g_st_l, g_c_l = lax.fori_loop(0, n_models_cubed, _lower_body, (g_st_init, g_c_init))
+        g_st = g_st + g_st_l
+        g_c = g_c + g_c_l
+
+        g_lik = jnp.zeros(n_models, dtype=dtype)
+        for m in range(n_models):
+            m_off = per_model_offsets[m] * ns
+            sp_d = jnp.sum(sd_i[m_off + per_model_ata_diag_rows[m][local_i],
+                                m_off + per_model_ata_diag_cols[m][local_i]]
+                           * per_model_ata_diag_vals[m][local_i])
+            sp_a = jnp.sum(sa_i[per_model_ata_arrow_rows[m][local_i],
+                                m_off + per_model_ata_arrow_cols[m][local_i]]
+                           * per_model_ata_arrow_vals[m][local_i])
+            sp_l = jnp.sum(sl_i[m_off + _padded_lower_rows[m][local_i],
+                                m_off + _padded_lower_cols[m][local_i]]
+                           * _padded_lower_vals[m][local_i])
+            g_lik = g_lik.at[m].add(sp_d + 2.0 * sp_a + 2.0 * sp_l)
+
+        return x_i, sd_i, sa_i, buf_X_i, g_st, g_lik, g_c
+
+    @jax.jit
+    def _rs_bwd_and_si(rs_diag_g, rs_lower_g, rs_arrow_g,
+                       rs_stored_cs, rs_stored_as,
+                       rs_y, L_tip, y_fe, x_fe, S_tip):
+        """Merged reduced system backward sub + SI."""
+        rs_x = jnp.zeros((n_rs, block_size), dtype=dtype)
+        rs_sd = jnp.zeros((n_rs, block_size, block_size), dtype=dtype)
+        rs_sl = jnp.zeros((n_rs, block_size, block_size), dtype=dtype)
+        rs_sa = jnp.zeros((n_rs, n_fe, block_size), dtype=dtype)
+
+        # Last RS block
+        idx_last = n_rs - 1
+        diag_last = rs_diag_g[idx_last] - rs_stored_cs[idx_last] + _chol_eps_reg * _chol_eye_bs
+        L_last = _jax_cholesky(diag_last)
+        L_inv_last = jax.scipy.linalg.solve_triangular(L_last, _chol_eye_bs, lower=True)
+        lower_last = rs_lower_g[idx_last]
+        L_lower_last = jax.scipy.linalg.solve_triangular(L_last, lower_last.T, lower=True).T
+        arrow_last = rs_arrow_g[idx_last] - rs_stored_as[idx_last]
+        L_arrow_last = jax.scipy.linalg.solve_triangular(L_last, arrow_last.T, lower=True).T
+
+        # Backward sub for last RS block
+        rhs_last = rs_y[idx_last] - L_arrow_last.T @ x_fe
+        x_last = jax.scipy.linalg.solve_triangular(L_last.T, rhs_last, lower=False)
+        rs_x = rs_x.at[idx_last].set(x_last)
+
+        # SI for last RS block
+        sa_last = -S_tip @ L_arrow_last @ L_inv_last
+        sd_last = (L_inv_last.T - sa_last.T @ L_arrow_last) @ L_inv_last
+        rs_sd = rs_sd.at[idx_last].set(sd_last)
+        rs_sa = rs_sa.at[idx_last].set(sa_last)
+
+        def rs_bwd_si_body(j, state):
+            rs_x_a, rs_sd_a, rs_sl_a, rs_sa_a, x_next_rs, sd_p, sa_p = state
+            idx = n_rs - 2 - j
+
+            diag_j = rs_diag_g[idx] - rs_stored_cs[idx] + _chol_eps_reg * _chol_eye_bs
+            L_j = _jax_cholesky(diag_j)
+            L_inv_j = jax.scipy.linalg.solve_triangular(L_j, _chol_eye_bs, lower=True)
+            lower_j = rs_lower_g[idx]
+            L_lower_j = jax.scipy.linalg.solve_triangular(L_j, lower_j.T, lower=True).T
+            arrow_j = rs_arrow_g[idx] - rs_stored_as[idx]
+            L_arrow_j = jax.scipy.linalg.solve_triangular(L_j, arrow_j.T, lower=True).T
+
+            # Backward sub
+            rhs_j = rs_y[idx] - L_arrow_j.T @ x_fe - L_lower_j.T @ x_next_rs
+            x_j = jax.scipy.linalg.solve_triangular(L_j.T, rhs_j, lower=False)
+            rs_x_a = rs_x_a.at[idx].set(x_j)
+
+            # SI recurrence
+            sl_j = (-sd_p @ L_lower_j - sa_p.T @ L_arrow_j) @ L_inv_j
+            sa_j = (-sa_p @ L_lower_j - S_tip @ L_arrow_j) @ L_inv_j
+            sd_j = (L_inv_j.T - sl_j.T @ L_lower_j - sa_j.T @ L_arrow_j) @ L_inv_j
+
+            rs_sd_a = rs_sd_a.at[idx].set(sd_j)
+            rs_sl_a = rs_sl_a.at[idx].set(sl_j)
+            rs_sa_a = rs_sa_a.at[idx].set(sa_j)
+            return rs_x_a, rs_sd_a, rs_sl_a, rs_sa_a, x_j, sd_j, sa_j
+
+        n_rs_blocks = n_rs - 2
+        rs_x, rs_sd, rs_sl, rs_sa, _, _, _ = lax.fori_loop(
+            0, n_rs_blocks, rs_bwd_si_body,
+            (rs_x, rs_sd, rs_sl, rs_sa, x_last, sd_last, sa_last))
+
+        return rs_x, rs_sd, rs_sl, rs_sa
+
+    # ---- Merged bwd+SI orchestrator ----
+
+    def _bwd_and_si_fn(theta, stored_L_host, stored_Ll_host, stored_La_host,
+                       stored_buf_host,
+                       L_tip, y_st_local, arrow_rhs_total,
+                       rs_diag_g, rs_lower_g, rs_arrow_g,
+                       rs_stored_cs, rs_stored_as, rs_y):
+        """Merged backward sub + SI gradient computation in a single pass."""
         likelihood_precs = _theta_to_likelihood_precs(theta)
         sc_list, coreg_w = _theta_to_sc_coreg(theta)
         sc_padded = _pad_subdiags(sc_list)
@@ -6072,13 +5932,25 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         jac_scale_a = jnp.stack([jac_sc_list[m]['scale'] for m in range(n_models)])
         jac_exp_gt_a = jnp.stack([jac_sc_list[m]['exp_gt'] for m in range(n_models)])
 
+        # Forward solve for arrow block
+        y_fe = jax.scipy.linalg.solve_triangular(L_tip, arrow_rhs_total, lower=True)
+        local_quad = jnp.sum(y_st_local ** 2)
+        y_fe_quad = jnp.where(rank == comm_size - 1, jnp.sum(y_fe ** 2), 0.0)
+        local_quad = local_quad + y_fe_quad
+        x_fe = jax.scipy.linalg.solve_triangular(L_tip.T, y_fe, lower=False)
+
+        # Tip inverse for SI
         L_tip_inv = jax.scipy.linalg.solve_triangular(L_tip, _chol_eye_nfe, lower=True)
         S_tip = L_tip_inv.T @ L_tip_inv
 
-        # Reduced system SI
-        rs_sd, rs_sl, rs_sa = _rs_si(
+        # Merged RS backward sub + SI
+        rs_x, rs_sd, rs_sl, rs_sa = _rs_bwd_and_si(
             rs_diag_g, rs_lower_g, rs_arrow_g,
-            rs_stored_cs, rs_stored_as, S_tip)
+            rs_stored_cs, rs_stored_as,
+            rs_y, L_tip, y_fe, x_fe, S_tip)
+
+        max_n_local = (nt + comm_size - 1) // comm_size
+        local_x_host = np.zeros((max_n_local, block_size), dtype=np_dtype)
 
         g_st_acc = jnp.zeros((n_models, 3), dtype=dtype)
         g_lik_acc = jnp.zeros(n_models, dtype=dtype)
@@ -6088,7 +5960,11 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         is_last_global = jnp.array(start_idx + last_local == nt - 1)
 
         if rank == 0:
-            # Trace for root's last block (from reduced system)
+            # Root: last block from RS
+            x_last = rs_x[1]
+            local_x_host[n_local - 1] = np.asarray(x_last)
+
+            # SI traces for last block (from RS)
             sd_last = rs_sd[1]
             sa_last = rs_sa[1]
             sl_last = rs_sl[1]
@@ -6102,24 +5978,35 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             g_lik_acc = g_lik_acc + g_lik_b
             g_c_acc = g_c_acc + g_c_b
 
-            # Standard backward SI on [n_local-2 .. 0]
+            # Merged backward pass on [n_local-2 .. 0]
+            x_next = x_last
             sd_prev = sd_last
             sa_prev = sa_last
             for local_i_py in range(n_local - 2, -1, -1):
-                cs_i = jnp.array(stored_cs_host[local_i_py])
-                as_i = jnp.array(stored_as_host[local_i_py])
+                Li = jnp.array(stored_L_host[local_i_py])
+                Lli = jnp.array(stored_Ll_host[local_i_py])
+                Lai = jnp.array(stored_La_host[local_i_py])
                 local_i_jax = jnp.array(local_i_py, dtype=jnp.int32)
-                sd_prev, sa_prev, g_st_i, g_lik_i, g_c_i = _si_inner_block(
-                    cs_i, as_i, sd_prev, sa_prev, S_tip,
-                    local_i_jax, sc_args_t, coreg_w, likelihood_precs,
+                x_i, sd_prev, sa_prev, g_st_i, g_lik_i, g_c_i = _bwd_si_block(
+                    Li, Lli, Lai, y_st_local[local_i_py], x_next, x_fe,
+                    sd_prev, sa_prev, S_tip, local_i_jax,
+                    sc_args_t, coreg_w, likelihood_precs,
                     jac_q1s_a, jac_q2s_a, jac_q3s_a, jac_scale_a, jac_exp_gt_a,
                     jac_coreg_w)
+                local_x_host[local_i_py] = np.asarray(x_i)
+                x_next = x_i
                 g_st_acc = g_st_acc + g_st_i
                 g_lik_acc = g_lik_acc + g_lik_i
                 g_c_acc = g_c_acc + g_c_i
-                del cs_i, as_i
+                del Li, Lli, Lai
         else:
-            # Trace for non-root's last block (from reduced system)
+            # Non-root: boundary blocks from RS
+            x_block0 = rs_x[2 * rank]
+            x_last = rs_x[2 * rank + 1]
+            local_x_host[0] = np.asarray(x_block0)
+            local_x_host[n_local - 1] = np.asarray(x_last)
+
+            # SI traces for last block (from RS)
             sd_last = rs_sd[2 * rank + 1]
             sa_last = rs_sa[2 * rank + 1]
             sl_last = rs_sl[2 * rank + 1]
@@ -6133,32 +6020,38 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             g_lik_acc = g_lik_acc + g_lik_b
             g_c_acc = g_c_acc + g_c_b
 
-            # Permuted backward SI on [n_local-2 .. 1]
-            sd_prev = sd_last
-            sa_prev = sa_last
+            # SI data for block[0] from RS
             sd_block0 = rs_sd[2 * rank]
             sa_block0 = rs_sa[2 * rank]
             buf_X_next = rs_sl[2 * rank].T
 
+            # Merged backward pass on [n_local-2 .. 1]
+            x_next = x_last
+            sd_prev = sd_last
+            sa_prev = sa_last
             for local_i_py in range(n_local - 2, 0, -1):
-                cs_i = jnp.array(stored_cs_host[local_i_py])
-                as_i = jnp.array(stored_as_host[local_i_py])
+                Li = jnp.array(stored_L_host[local_i_py])
+                Lli = jnp.array(stored_Ll_host[local_i_py])
+                Lai = jnp.array(stored_La_host[local_i_py])
                 buf_i = jnp.array(stored_buf_host[local_i_py])
                 local_i_jax = jnp.array(local_i_py, dtype=jnp.int32)
-                sd_prev, sa_prev, buf_X_next, g_st_i, g_lik_i, g_c_i = \
-                    _si_inner_block_permuted(
-                        cs_i, as_i, buf_i,
+                x_i, sd_prev, sa_prev, buf_X_next, g_st_i, g_lik_i, g_c_i = \
+                    _bwd_si_block_permuted(
+                        Li, Lli, Lai, buf_i,
+                        y_st_local[local_i_py], x_next, x_fe, x_block0,
                         sd_prev, sa_prev, buf_X_next,
-                        sd_block0, sa_block0, S_tip,
-                        local_i_jax, sc_args_t, coreg_w, likelihood_precs,
+                        sd_block0, sa_block0, S_tip, local_i_jax,
+                        sc_args_t, coreg_w, likelihood_precs,
                         jac_q1s_a, jac_q2s_a, jac_q3s_a, jac_scale_a, jac_exp_gt_a,
                         jac_coreg_w)
+                local_x_host[local_i_py] = np.asarray(x_i)
+                x_next = x_i
                 g_st_acc = g_st_acc + g_st_i
                 g_lik_acc = g_lik_acc + g_lik_i
                 g_c_acc = g_c_acc + g_c_i
-                del cs_i, as_i, buf_i
+                del Li, Lli, Lai, buf_i
 
-            # Block[0]: sl = buf_X[1].T (last buf_X_next from loop = buf_X at block 1)
+            # Block[0]: sl = buf_X[1].T
             sl_block0 = buf_X_next.T
             local_i_zero = jnp.array(0, dtype=jnp.int32)
             g_st_0, g_lik_0, g_c_0 = _trace_at_block(
@@ -6170,9 +6063,16 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             g_lik_acc = g_lik_acc + g_lik_0
             g_c_acc = g_c_acc + g_c_0
 
+        # Allreduce for x and quad
+        local_x_st = jnp.array(local_x_host)
+        x_st_global, quad_global = _bwd_allgather_reduce(local_x_st, local_quad)
+        x = jnp.concatenate([x_st_global.reshape(-1), x_fe])
+
+        # Allreduce for SI gradients
         g_st_acc, g_lik_acc, g_c_acc = _si_allreduce(g_st_acc, g_lik_acc, g_c_acc)
         grad_lik = likelihood_precs * g_lik_acc
-        return g_st_acc, grad_lik, g_c_acc
+
+        return quad_global, x, g_st_acc, grad_lik, g_c_acc
 
     # ---- Stage 3: logdet Q_prior gradients (pipeline send/recv) ----
 
@@ -6183,13 +6083,14 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         jac_sc_list_padded = _theta_to_jac_sc_padded(theta)
         jac_coreg_w = _theta_to_jac_coreg_w(theta)
 
-        grad_prior_st, grad_prior_coreg = pipeline_logdet_Q_prior_coregional_grad(
-            sc_padded, jac_sc_list_padded, coreg_w, jac_coreg_w,
-            n_models, ns, nt, dtype,
-            rank, comm_size, n_local, start_idx, comm)
+        logdet_prior, grad_prior_st, grad_prior_coreg = \
+            pipeline_logdet_Q_prior_coregional_grad(
+                sc_padded, jac_sc_list_padded, coreg_w, jac_coreg_w,
+                n_models, ns, nt, dtype,
+                rank, comm_size, n_local, start_idx, comm)
 
         grad_prior_st_arr = jnp.stack(grad_prior_st)
-        return grad_prior_st_arr, grad_prior_coreg
+        return logdet_prior, grad_prior_st_arr, grad_prior_coreg
 
     # ---- Stage 4: Quadratic form gradients ----
 
@@ -6296,44 +6197,31 @@ def create_pure_jax_objective_distributed_coregional_twophase(
     def objective_with_grad(theta):
         theta_jax = jnp.asarray(theta, dtype=dtype)
 
-        # Stage 1a: Two-phase Cholesky + forward sub
-        (cs_host, as_host, buf_host,
+        (L_host, Ll_host, La_host,
+         cs_host, as_host, buf_host,
          y_st_local, L_tip, arrow_rhs_total, logdet_cond,
          rs_diag_g, rs_lower_g, rs_arrow_g,
          rs_stored_cs, rs_stored_as, rs_y) = _chol_fn(theta_jax)
 
-        # Stage 1b: Backward sub
-        quad, x_val = _bwd_fn(
-            theta_jax, cs_host, as_host, buf_host,
-            L_tip, y_st_local, arrow_rhs_total,
-            rs_diag_g, rs_lower_g, rs_arrow_g,
-            rs_stored_cs, rs_stored_as, rs_y)
+        quad, x_val, grad_cond_st, grad_cond_lik, grad_cond_coreg = \
+            _bwd_and_si_fn(
+                theta_jax, L_host, Ll_host, La_host, buf_host,
+                L_tip, y_st_local, arrow_rhs_total,
+                rs_diag_g, rs_lower_g, rs_arrow_g,
+                rs_stored_cs, rs_stored_as, rs_y)
         del y_st_local, arrow_rhs_total, rs_y
+        del L_host, Ll_host, La_host, cs_host, as_host, buf_host, L_tip
+        del rs_diag_g, rs_lower_g, rs_arrow_g, rs_stored_cs, rs_stored_as
 
-        # Stage 1c: logdet prior
-        logdet_prior = _logdet_prior_fn(theta_jax)
+        logdet_prior, grad_prior_st, grad_prior_coreg = _grad_prior_fn(theta_jax)
 
         f_val = _compute_objective(theta_jax, logdet_cond, quad, logdet_prior)
 
-        # Stage 2: SI gradients
-        grad_cond_st, grad_cond_lik, grad_cond_coreg = _grad_si_fn(
-            theta_jax, cs_host, as_host, buf_host,
-            L_tip, rs_diag_g, rs_lower_g, rs_arrow_g,
-            rs_stored_cs, rs_stored_as)
-        del cs_host, as_host, buf_host, L_tip
-        del rs_diag_g, rs_lower_g, rs_arrow_g, rs_stored_cs, rs_stored_as
-
-        # Stage 3: logdet prior gradients
-        grad_prior_st, grad_prior_coreg = _grad_prior_fn(theta_jax)
-
-        # Stage 4: Quad gradients
         grad_quad_st, grad_quad_lik, grad_quad_coreg = _grad_quad_fn(
             theta_jax, x_val)
 
-        # Stage 5: Scalar term gradients
         grad_scalar = _grad_scalar_fn(theta_jax)
 
-        # Combine
         grad_val = _combine_gradients(
             theta_jax,
             grad_cond_st, grad_cond_lik, grad_cond_coreg,
@@ -6345,12 +6233,13 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
     def objective_fn(theta):
         theta_jax = jnp.asarray(theta, dtype=dtype)
-        (cs_host, as_host, buf_host,
+        (L_h, Ll_h, La_h,
+         cs_host, as_host, buf_host,
          y_st_local, L_tip, arrow_rhs_total, logdet_cond,
          rs_diag_g, rs_lower_g, rs_arrow_g,
          rs_stored_cs, rs_stored_as, rs_y) = _chol_fn(theta_jax)
         quad, x_val = _bwd_fn(
-            theta_jax, cs_host, as_host, buf_host,
+            theta_jax, L_h, Ll_h, La_h, buf_host,
             L_tip, y_st_local, arrow_rhs_total,
             rs_diag_g, rs_lower_g, rs_arrow_g,
             rs_stored_cs, rs_stored_as, rs_y)
@@ -6362,19 +6251,15 @@ def create_pure_jax_objective_distributed_coregional_twophase(
     theta_init = jnp.ones(n_hyperparameters, dtype=dtype)
     from dalia.utils import print_msg
     print_msg("Two-phase: compiling Cholesky + forward sub...")
-    (cs0, as0, buf0, yst0, lt0, arr0, logdet0,
+    (L0, Ll0, La0, cs0, as0, buf0, yst0, lt0, arr0, logdet0,
      rsd0, rsl0, rsa0, rscs0, rsas0, rsy0) = _chol_fn(theta_init)
-    print_msg("Two-phase: compiling backward sub...")
-    quad0, x0 = _bwd_fn(theta_init, cs0, as0, buf0, lt0, yst0, arr0,
-                         rsd0, rsl0, rsa0, rscs0, rsas0, rsy0)
+    print_msg("Two-phase: compiling merged bwd+SI...")
+    quad0, x0, _, _, _ = _bwd_and_si_fn(
+        theta_init, L0, Ll0, La0, buf0, lt0, yst0, arr0,
+        rsd0, rsl0, rsa0, rscs0, rsas0, rsy0)
     del yst0, arr0, rsy0
-    print_msg("Two-phase: compiling logdet prior...")
-    _ = _logdet_prior_fn(theta_init)
-    print_msg("Two-phase: compiling SI gradient...")
-    _ = _grad_si_fn(theta_init, cs0, as0, buf0, lt0,
-                     rsd0, rsl0, rsa0, rscs0, rsas0)
-    del cs0, as0, buf0, lt0, rsd0, rsl0, rsa0, rscs0, rsas0
-    print_msg("Two-phase: compiling prior gradient...")
+    del L0, Ll0, La0, cs0, as0, buf0, lt0, rsd0, rsl0, rsa0, rscs0, rsas0
+    print_msg("Two-phase: compiling prior logdet + gradient...")
     _ = _grad_prior_fn(theta_init)
     print_msg("Two-phase: compiling quad gradient...")
     _ = _grad_quad_fn(theta_init, x0)

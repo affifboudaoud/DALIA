@@ -5148,6 +5148,8 @@ def pipeline_logdet_Q_prior_coregional_grad(
 
     Returns
     -------
+    logdet_prior : scalar
+        logdet(Q_prior) — accumulated as a byproduct of the forward Cholesky.
     grad_per_model_st : list of (n_theta_st_m,) arrays
     grad_coreg : (n_coreg_params,)
     """
@@ -5155,6 +5157,7 @@ def pipeline_logdet_Q_prior_coregional_grad(
 
     block_size = n_models * ns
     eye_bs = jnp.eye(block_size, dtype=dtype)
+    eps = jnp.finfo(dtype).eps
     n_coreg = jac_coreg_w.shape[-1]
     n_models_cubed = n_models * n_models * n_models
 
@@ -5176,22 +5179,26 @@ def pipeline_logdet_Q_prior_coregional_grad(
     jac_scale_all = jnp.stack([jac_sc_list[m]['scale'] for m in range(n_models)])
     jac_exp_gt_all = jnp.stack([jac_sc_list[m]['exp_gt'] for m in range(n_models)])
 
-    # --- Forward BT Cholesky, store incoming Schurs ---
-    # Use fori_loop instead of lax.scan to reduce XLA memory pressure.
+    # --- Forward BT Cholesky, store incoming Schurs + accumulate logdet ---
     global_indices = jnp.arange(start_idx, start_idx + n_local)
     stored_schurs_buf = jnp.zeros((n_local, block_size, block_size), dtype=dtype)
 
     init_schur = jnp.zeros((block_size, block_size), dtype=dtype)
+    init_logdet = jnp.array(0.0, dtype=dtype)
     if rank > 0:
         init_schur = mpi4jax.recv(init_schur, source=rank - 1, tag=30, comm=comm)
+        init_logdet = mpi4jax.recv(init_logdet, source=rank - 1, tag=33, comm=comm)
 
     def fwd_fori_body(j, state):
-        schur, stored_ = state
+        schur, stored_, logdet_acc = state
         stored_ = stored_.at[j].set(schur)
         global_i = global_indices[j]
         q_diag = _reconstruct_coregional_diag_block(
             sc_list, coreg_w, n_models, ns, global_i) - schur
         L_i = _jax_cholesky(q_diag)
+        diag_vals = jnp.diag(L_i)
+        safe_vals = jnp.maximum(diag_vals, eps)
+        logdet_acc = logdet_acc + 2.0 * jnp.sum(jnp.log(safe_vals))
         q_lower = _reconstruct_coregional_lower_block(
             sc_list, coreg_w, n_models, ns, global_i)
         L_lower_i = jax.scipy.linalg.solve_triangular(
@@ -5199,13 +5206,16 @@ def pipeline_logdet_Q_prior_coregional_grad(
         new_schur = L_lower_i @ L_lower_i.T
         new_schur = jnp.where(global_i < nt_global - 1, new_schur,
                               jnp.zeros_like(new_schur))
-        return new_schur, stored_
+        return new_schur, stored_, logdet_acc
 
-    final_schur, local_stored_schurs = lax.fori_loop(
-        0, n_local, fwd_fori_body, (init_schur, stored_schurs_buf))
+    final_schur, local_stored_schurs, local_logdet = lax.fori_loop(
+        0, n_local, fwd_fori_body, (init_schur, stored_schurs_buf, init_logdet))
 
     if rank < comm_size - 1:
         mpi4jax.send(final_schur, dest=rank + 1, tag=30, comm=comm)
+        mpi4jax.send(local_logdet, dest=rank + 1, tag=33, comm=comm)
+
+    logdet_prior = mpi4jax.bcast(local_logdet, root=comm_size - 1, comm=comm)
 
     def _reconstruct_L_local(local_i):
         global_i = start_idx + local_i
@@ -5370,7 +5380,7 @@ def pipeline_logdet_Q_prior_coregional_grad(
     grad_per_model_st = mpi4jax.allreduce(grad_per_model_st, op=MPI.SUM, comm=comm)
     grad_coreg = mpi4jax.allreduce(grad_coreg, op=MPI.SUM, comm=comm)
 
-    return [grad_per_model_st[m] for m in range(n_models)], grad_coreg
+    return logdet_prior, [grad_per_model_st[m] for m in range(n_models)], grad_coreg
 
 
 def pipeline_selected_inversion_grads_from_carries_coregional(

@@ -253,6 +253,8 @@ class DALIA:
         self.objective_function_time: ArrayLike = []
         self.solver_time: ArrayLike = []
         self.construction_time: ArrayLike = []
+        self.objective_function_energy: ArrayLike = []
+        self.energy_monitor = None
         
         # --- Timers
         self.t_construction_qprior = 0.0
@@ -287,10 +289,10 @@ class DALIA:
                     if self.config.solver.type != "serinv":
                         raise NotImplementedError(
                             "Distributed JAX autodiff for CoregionalModel requires serinv solver.")
-                    print_msg(f"Using distributed JAX autodiff (two-phase) with {comm_size} ranks "
+                    print_msg(f"Using distributed JAX autodiff (split-JIT) with {comm_size} ranks "
                               f"(CoregionalModel, {self.model.n_models} variates)")
                     self.jax_objective, self.jax_grad_func = \
-                        create_pure_jax_objective_distributed_coregional_twophase(
+                        create_pure_jax_objective_distributed_coregional_splitjit(
                             dalia_instance=self, comm=self.comm_qeval)
                 else:
                     print_msg(f"Using JAX automatic differentiation with JIT compilation "
@@ -679,6 +681,18 @@ class DALIA:
             print(
                 f"rank {comm_rank} | objective function time: {self.objective_function_time[1:]}"
             )
+            if self.objective_function_energy:
+                node_j = [s["node_joules"] for s in self.objective_function_energy[1:]]
+                gpu_j = [s["gpu_joules"] for s in self.objective_function_energy[1:]]
+                if node_j:
+                    import numpy as _np
+                    print(
+                        f"rank {comm_rank} | energy per gradient (node): "
+                        f"mean={_np.mean(node_j):.0f}J std={_np.std(node_j):.0f}J "
+                        f"total={_np.sum(node_j):.0f}J | "
+                        f"gpu: mean={_np.mean(gpu_j):.0f}J",
+                        flush=True,
+                    )
 
             # MEMO:
             # From here rank 0 own the optimized theta_star and the
@@ -737,6 +751,8 @@ class DALIA:
         self.solver.t_solve = 0.0
 
         synchronize(comm=self.comm_world)
+        if self.energy_monitor is not None:
+            self.energy_monitor.mark_start()
         tic = time.perf_counter()
         # Generate theta matrix with different theta's to evaluate
         # currently central difference scheme is used for gradient
@@ -794,10 +810,18 @@ class DALIA:
         self.construction_time.append(
             self.t_construction_qprior + self.t_construction_qconditional
         )
+        if self.energy_monitor is not None:
+            esample = self.energy_monitor.mark_end(label=f"iter_{self.iter}")
+            if esample is not None:
+                self.objective_function_energy.append(esample)
 
         if self.iter > 0:
+            energy_str = ""
+            if self.objective_function_energy:
+                e = self.objective_function_energy[-1]
+                energy_str = f" | energy: node={e['node_joules']}J gpu={e['gpu_joules']}J cpu={e['cpu_joules']}J ({e['node_watts_avg']:.0f}W)"
             print(
-                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]} | solver_time: {self.solver_time[1:]} | construction_time: {self.construction_time[1:]}",
+                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]} | solver_time: {self.solver_time[1:]} | construction_time: {self.construction_time[1:]}{energy_str}",
                 flush=True,
             )
         self.iter += 1
@@ -825,6 +849,8 @@ class DALIA:
         self.model.theta[:] = xp.asarray(theta_i)
 
         synchronize(comm=self.comm_world)
+        if self.energy_monitor is not None:
+            self.energy_monitor.mark_start()
         tic = time.perf_counter()
 
         f_0, grad_f, x = self.jax_grad_func(theta_i)
@@ -839,13 +865,21 @@ class DALIA:
         self.construction_time.append(
             self.t_construction_qprior + self.t_construction_qconditional
         )
+        if self.energy_monitor is not None:
+            esample = self.energy_monitor.mark_end(label=f"iter_{self.iter}")
+            if esample is not None:
+                self.objective_function_energy.append(esample)
 
         # Store gradient for callback display
         self.gradient_f[:] = xp.asarray(grad_f)
 
         if self.iter > 0:
+            energy_str = ""
+            if self.objective_function_energy:
+                e = self.objective_function_energy[-1]
+                energy_str = f" | energy: node={e['node_joules']}J gpu={e['gpu_joules']}J cpu={e['cpu_joules']}J ({e['node_watts_avg']:.0f}W)"
             print(
-                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]}",
+                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]}{energy_str}",
                 flush=True,
             )
         self.iter += 1
