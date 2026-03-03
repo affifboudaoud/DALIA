@@ -996,7 +996,7 @@ def lazy_bta_cholesky(
     ata_diag_rows, ata_diag_cols, ata_diag_vals,
     ata_lower_rows, ata_lower_cols, ata_lower_vals,
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
-    ata_tip, dtype,
+    ata_tip, dtype, checkpoint=False,
 ):
     """Q_cond BTA Cholesky via ``lax.scan`` with lazy block reconstruction.
 
@@ -1023,6 +1023,10 @@ def lazy_bta_cholesky(
         Arrow tip AtA block, shape (n_fe, n_fe).
     dtype : jnp.dtype
         Working dtype.
+    checkpoint : bool, optional
+        If True, wrap scan body with ``jax.checkpoint`` to trade compute
+        for memory — JAX will recompute the forward pass during backward
+        instead of storing the full carry trajectory. Default False.
 
     Returns
     -------
@@ -1119,9 +1123,14 @@ def lazy_bta_cholesky(
         ata_arrow_vals,
     )
 
+    scan_fn = scan_body
+    if checkpoint:
+        from functools import partial
+        scan_fn = jax.checkpoint(scan_body, prevent_cse=True)
+
     (_, arrow_tip_final, _, logdet_cond), \
         (L_diag_all, L_lower_all, L_arrow_all) = lax.scan(
-            scan_body, init_carry, scan_inputs
+            scan_fn, init_carry, scan_inputs
         )
 
     L_lower = L_lower_all[:nt - 1]

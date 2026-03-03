@@ -225,14 +225,26 @@ class DALIA:
                     )
                     synchronize(comm=self.comm_world)
 
-                self.solver = DistSerinvSolver(
-                    config=self.config.solver,
-                    diagonal_blocksize=diagonal_blocksize,
-                    arrowhead_blocksize=arrowhead_blocksize,
-                    n_diag_blocks=n_diag_blocks,
-                    comm=self.comm_qeval,
-                    nccl_comm=self.nccl_comm,
-                )
+                if self.config.gradient_method == "jax_autodiff":
+                    self._deferred_solver_params = {
+                        "config": self.config.solver,
+                        "diagonal_blocksize": diagonal_blocksize,
+                        "arrowhead_blocksize": arrowhead_blocksize,
+                        "n_diag_blocks": n_diag_blocks,
+                        "comm": self.comm_qeval,
+                        "nccl_comm": self.nccl_comm,
+                        "distributed": True,
+                    }
+                    self.solver = _SolverStub()
+                else:
+                    self.solver = DistSerinvSolver(
+                        config=self.config.solver,
+                        diagonal_blocksize=diagonal_blocksize,
+                        arrowhead_blocksize=arrowhead_blocksize,
+                        n_diag_blocks=n_diag_blocks,
+                        comm=self.comm_qeval,
+                        nccl_comm=self.nccl_comm,
+                    )
 
         # --- Set up recurrent variables
         self.gradient_f = xp.zeros(self.model.n_hyperparameters, dtype=xp.float64)
@@ -451,12 +463,22 @@ class DALIA:
             return
         params = self._deferred_solver_params
         free_unused_gpu_memory()
-        self.solver = SerinvSolver(
-            config=params["config"],
-            diagonal_blocksize=params["diagonal_blocksize"],
-            arrowhead_blocksize=params["arrowhead_blocksize"],
-            n_diag_blocks=params["n_diag_blocks"],
-        )
+        if params.get("distributed", False):
+            self.solver = DistSerinvSolver(
+                config=params["config"],
+                diagonal_blocksize=params["diagonal_blocksize"],
+                arrowhead_blocksize=params["arrowhead_blocksize"],
+                n_diag_blocks=params["n_diag_blocks"],
+                comm=params["comm"],
+                nccl_comm=params["nccl_comm"],
+            )
+        else:
+            self.solver = SerinvSolver(
+                config=params["config"],
+                diagonal_blocksize=params["diagonal_blocksize"],
+                arrowhead_blocksize=params["arrowhead_blocksize"],
+                n_diag_blocks=params["n_diag_blocks"],
+            )
         self._deferred_solver_params = None
 
     def run(self) -> dict:

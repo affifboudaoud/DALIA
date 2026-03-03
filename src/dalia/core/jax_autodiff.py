@@ -115,7 +115,7 @@ def _scipy_sparse_to_jax_bcoo(sp_matrix, dtype=None):
     return jax_sparse.BCOO((data, indices), shape=coo.shape)
 
 
-def create_pure_jax_objective(dalia_instance, dtype=None) -> Tuple[Callable, Callable]:
+def create_pure_jax_objective(dalia_instance, dtype=None, ad_mode="default") -> Tuple[Callable, Callable]:
     """Create pure JAX objective function with automatic differentiation.
 
     Supports:
@@ -130,6 +130,10 @@ def create_pure_jax_objective(dalia_instance, dtype=None) -> Tuple[Callable, Cal
         DALIA instance.
     dtype : jnp.dtype, optional
         JAX dtype to use. If None, uses the configured dtype from get_jax_dtype().
+    ad_mode : str, optional
+        AD strategy. ``"default"`` uses custom VJP for sparse solver.
+        ``"scan"`` uses naive ``lax.scan`` AD (no custom VJP).
+        ``"scan_ckpt"`` uses ``lax.scan`` AD with ``jax.checkpoint``.
 
     Returns
     -------
@@ -193,6 +197,10 @@ def create_pure_jax_objective(dalia_instance, dtype=None) -> Tuple[Callable, Cal
         """
         if use_sparse:
             if likelihood_type == 'gaussian':
+                if ad_mode == "scan":
+                    return _objective_gaussian_scan_baseline(theta, static_data, checkpoint=False)
+                elif ad_mode == "scan_ckpt":
+                    return _objective_gaussian_scan_baseline(theta, static_data, checkpoint=True)
                 return _objective_gaussian_sparse(theta, static_data)
             else:
                 raise ValueError(f"Sparse solver only supports Gaussian likelihood, got {likelihood_type}")
@@ -2140,6 +2148,210 @@ def _objective_gaussian_sparse(theta, static_data):
     return objective, x
 
 
+def _objective_gaussian_scan_baseline(theta, static_data, checkpoint=False):
+    """Pure JAX objective using ``lax.scan`` BTA Cholesky — no custom VJP.
+
+    JAX AD differentiates through the scan directly, storing the full carry
+    trajectory in the backward pass.  This serves as a baseline to measure
+    the memory cost avoided by our ``custom_vjp`` approach.
+
+    Parameters
+    ----------
+    theta : jnp.ndarray
+        Hyperparameters ``[r_s, r_t, sigma_st, theta_likelihood]``.
+    static_data : dict
+        Static data from :func:`_extract_static_data`.
+    checkpoint : bool
+        If True, wrap the scan body with ``jax.checkpoint``.
+
+    Returns
+    -------
+    objective : scalar
+    x : jnp.ndarray
+    """
+    nt = static_data['nt']
+    ns = static_data['ns']
+    n_fe = static_data['n_fixed_effects']
+    fe_prec = static_data['fixed_effects_precision']
+    spatial_matrices = static_data['spatial_matrices']
+    temporal_matrices = static_data['temporal_matrices']
+    manifold = static_data['manifold']
+    y = static_data['y']
+    a_sparse = static_data['a_sparse']
+    prior_configs = static_data['prior_configs']
+
+    ata_diag_rows = static_data['ata_diag_rows']
+    ata_diag_cols = static_data['ata_diag_cols']
+    ata_diag_vals = static_data['ata_diag_vals']
+    ata_lower_rows = static_data['ata_lower_rows']
+    ata_lower_cols = static_data['ata_lower_cols']
+    ata_lower_vals = static_data['ata_lower_vals']
+    ata_arrow_rows = static_data['ata_arrow_rows']
+    ata_arrow_cols = static_data['ata_arrow_cols']
+    ata_arrow_vals = static_data['ata_arrow_vals']
+    ata_tip = static_data['ata_tip']
+
+    dtype = y.dtype
+
+    theta_st = theta[:-1]
+    theta_likelihood = theta[-1]
+    lik_prec = jnp.exp(theta_likelihood)
+
+    sc = precompute_spatial_components(
+        theta_st, spatial_matrices, temporal_matrices, manifold)
+
+    L_diag, L_lower, L_arrow, L_tip, logdet_Q_cond = lazy_bta_cholesky(
+        sc, nt, ns, n_fe, fe_prec, lik_prec,
+        ata_diag_rows, ata_diag_cols, ata_diag_vals,
+        ata_lower_rows, ata_lower_cols, ata_lower_vals,
+        ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
+        ata_tip, dtype, checkpoint=checkpoint,
+    )
+
+    rhs = lik_prec * (a_sparse.T @ y)
+    x = solve_bta_system_jax(L_diag, L_lower, L_arrow, L_tip, rhs)
+
+    logdet_Q_st = logdet_Q_st_scan(
+        theta_st, spatial_matrices, temporal_matrices, manifold, nt, ns, dtype)
+
+    quad_form = quadratic_form_bta_jax(
+        L_diag, L_lower, L_arrow, L_tip, x, nt, ns)
+
+    log_prior_hp = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
+    eta = jnp.zeros_like(y)
+    log_lik = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
+
+    objective = -(
+        log_prior_hp
+        + log_lik
+        + 0.5 * logdet_Q_st
+        - 0.5 * logdet_Q_cond
+        + 0.5 * quad_form
+    )
+
+    return objective, x
+
+
+def _objective_gaussian_coregional_scan_baseline(theta, static_data, checkpoint=False):
+    """Pure JAX objective for coregional Gaussian — no custom VJP.
+
+    Uses ``_pobtaf_impl`` (``lax.fori_loop``) instead of
+    ``pobtaf_jax_optimized`` (which has a ``custom_vjp``), so JAX AD
+    differentiates through the loop body directly.
+
+    Parameters
+    ----------
+    theta : jnp.ndarray
+        Full hyperparameter vector.
+    static_data : dict
+        Static data from :func:`_extract_static_data_coregional`.
+    checkpoint : bool
+        If True, wrap the fori_loop body with ``jax.checkpoint``.
+
+    Returns
+    -------
+    objective : scalar
+    x : jnp.ndarray
+    """
+    from serinv.algs.pobtaf_jax import _pobtaf_impl
+
+    n_models = static_data['n_models']
+    nt = static_data['nt']
+    ns = static_data['ns']
+    block_size = static_data['block_size']
+    n_fixed_effects_total = static_data['n_fixed_effects_total']
+    fixed_effects_precision = static_data['fixed_effects_precision']
+    models_data = static_data['models_data']
+    y = static_data['y']
+    a_sparse = static_data['a_sparse']
+    prior_configs = static_data['prior_configs']
+    hyperparameters_idx = static_data['hyperparameters_idx']
+    theta_keys = static_data['theta_keys']
+    n_observations_idx = static_data['n_observations_idx']
+
+    ata_diag_per_model = static_data['ata_diag_per_model']
+    ata_lower_per_model = static_data['ata_lower_per_model']
+    ata_arrow_per_model = static_data['ata_arrow_per_model']
+    ata_tip_per_model = static_data['ata_tip_per_model']
+
+    q_prior_diag, q_prior_lower = build_coregional_Q_bta_jax(
+        theta, n_models, ns, nt, models_data, hyperparameters_idx, theta_keys
+    )
+
+    likelihood_precisions = jnp.zeros(n_models, dtype=y.dtype)
+    for i in range(n_models):
+        prec_idx = hyperparameters_idx[i + 1] - 1
+        likelihood_precisions = likelihood_precisions.at[i].set(jnp.exp(theta[prec_idx]))
+
+    weighted_ata_diag = jnp.einsum('m,mbij->bij', likelihood_precisions, ata_diag_per_model)
+    weighted_ata_lower = jnp.einsum('m,mbij->bij', likelihood_precisions, ata_lower_per_model)
+    weighted_ata_arrow = jnp.einsum('m,mbij->bij', likelihood_precisions, ata_arrow_per_model)
+    weighted_ata_tip = jnp.einsum('m,mij->ij', likelihood_precisions, ata_tip_per_model)
+
+    q_cond_diag = q_prior_diag + weighted_ata_diag
+    q_cond_lower = q_prior_lower + weighted_ata_lower
+    q_cond_arrow = weighted_ata_arrow
+    q_cond_tip = fixed_effects_precision * jnp.eye(n_fixed_effects_total, dtype=y.dtype) + weighted_ata_tip
+
+    if q_cond_diag.dtype == jnp.float32:
+        eps_reg = 1e-4
+        identity_block = jnp.eye(q_cond_diag.shape[-1], dtype=q_cond_diag.dtype)
+        q_cond_diag = q_cond_diag + eps_reg * identity_block[None, :, :]
+        q_cond_tip = q_cond_tip + eps_reg * jnp.eye(n_fixed_effects_total, dtype=q_cond_tip.dtype)
+
+    if checkpoint:
+        from serinv.algs.pobtaf_jax import _pobtaf_impl as _pobtaf_base
+        L_diag, L_lower, L_arrow, L_tip = jax.checkpoint(
+            _pobtaf_base, prevent_cse=True)(
+            q_cond_diag, q_cond_lower, q_cond_arrow, q_cond_tip)
+    else:
+        L_diag, L_lower, L_arrow, L_tip = _pobtaf_impl(
+            q_cond_diag, q_cond_lower, q_cond_arrow, q_cond_tip)
+
+    logdet_Q_conditional = compute_logdet_from_cholesky_bta_jax(L_diag, L_tip)
+
+    gradient_likelihood = jnp.zeros_like(y)
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        gradient_likelihood = gradient_likelihood.at[obs_start:obs_end].set(
+            likelihood_precisions[i] * y[obs_start:obs_end]
+        )
+    rhs = a_sparse.T @ gradient_likelihood
+
+    x = solve_bta_system_jax(L_diag, L_lower, L_arrow, L_tip, rhs)
+
+    log_prior_hyperparameters = _evaluate_log_prior_hyperparameters_jax(theta, prior_configs)
+
+    eta = jnp.zeros_like(y)
+    log_likelihood = 0.0
+    for i in range(n_models):
+        obs_start = n_observations_idx[i]
+        obs_end = n_observations_idx[i + 1]
+        y_i = y[obs_start:obs_end]
+        eta_i = eta[obs_start:obs_end]
+        prec_idx = hyperparameters_idx[i + 1] - 1
+        theta_lik_i = theta[prec_idx]
+        log_likelihood += _evaluate_gaussian_likelihood_jax(eta_i, y_i, theta_lik_i)
+
+    logdet_Q_prior_st = pobtf_logdet_jax(q_prior_diag, q_prior_lower)
+    log_prior_latent = 0.5 * logdet_Q_prior_st
+
+    quad_form = quadratic_form_bta_jax(
+        L_diag, L_lower, L_arrow, L_tip, x, nt, block_size)
+
+    log_conditional = 0.5 * logdet_Q_conditional - 0.5 * quad_form
+
+    objective = -(
+        log_prior_hyperparameters
+        + log_likelihood
+        + log_prior_latent
+        - log_conditional
+    )
+
+    return objective, x
+
+
 def _objective_gaussian_coregional_sparse(theta, static_data):
     """Pure JAX objective function for Gaussian CoregionalModel with sparse serinv solver.
 
@@ -3053,7 +3265,7 @@ def _objective_gaussian_coregional_sparse_fused(theta, static_data):
     return objective, x
 
 
-def create_pure_jax_objective_coregional(dalia_instance, dtype=None) -> Tuple[Callable, Callable]:
+def create_pure_jax_objective_coregional(dalia_instance, dtype=None, ad_mode="default") -> Tuple[Callable, Callable]:
     """Create pure JAX objective function for CoregionalModel with automatic differentiation.
 
     Parameters
@@ -3062,6 +3274,10 @@ def create_pure_jax_objective_coregional(dalia_instance, dtype=None) -> Tuple[Ca
         DALIA instance with CoregionalModel.
     dtype : jnp.dtype, optional
         JAX dtype to use. If None, uses the configured dtype from get_jax_dtype().
+    ad_mode : str, optional
+        AD strategy. ``"default"`` uses custom VJP for sparse solver.
+        ``"scan"`` uses naive ``lax.fori_loop`` AD (no custom VJP).
+        ``"scan_ckpt"`` uses ``lax.fori_loop`` AD with ``jax.checkpoint``.
 
     Returns
     -------
@@ -3073,7 +3289,9 @@ def create_pure_jax_objective_coregional(dalia_instance, dtype=None) -> Tuple[Ca
     if dtype is None:
         dtype = get_jax_dtype()
     np_dtype = np.float64 if dtype == jnp.float64 else np.float32
-    static_data = _extract_static_data_coregional(dalia_instance, dtype=dtype)
+    need_dense_ata = ad_mode in ("scan", "scan_ckpt")
+    static_data = _extract_static_data_coregional(
+        dalia_instance, dtype=dtype, include_dense_ata=need_dense_ata)
     n_hyperparameters = dalia_instance.model.n_hyperparameters
 
     # Verify all likelihoods are Gaussian
@@ -3089,7 +3307,10 @@ def create_pure_jax_objective_coregional(dalia_instance, dtype=None) -> Tuple[Ca
     use_fused = use_sparse and static_data.get('use_fused', True)
 
     def objective_pure_jax(theta):
-        if use_fused:
+        if ad_mode in ("scan", "scan_ckpt"):
+            ckpt = (ad_mode == "scan_ckpt")
+            return _objective_gaussian_coregional_scan_baseline(theta, static_data, checkpoint=ckpt)
+        elif use_fused:
             return _objective_gaussian_coregional_sparse_fused(theta, static_data)
         elif use_sparse:
             return _objective_gaussian_coregional_sparse(theta, static_data)
@@ -3845,6 +4066,9 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         return logdet_global + logdet_tip, L_tip, arr_global
 
     def _chol_fn(theta):
+        import time as _time
+        _profiling = _profile_detail_flag[0]
+
         likelihood_precs = _theta_to_likelihood_precs(theta)
         sc_list, coreg_w = _theta_to_sc_coreg(theta)
         sc_padded = _pad_subdiags(sc_list)
@@ -3879,10 +4103,16 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
 
         # MPI recv carries from previous rank
         if rank > 0:
+            if _profiling:
+                jax.block_until_ready(cond_schur)
+                _t0 = _time.perf_counter()
             cond_schur, arrow_tip_acc, arrow_schur, logdet_cond, \
                 prev_lower_y, arrow_rhs_acc = _chol_recv_carries(
                     cond_schur, arrow_tip_acc, arrow_schur,
                     logdet_cond, prev_lower_y, arrow_rhs_acc)
+            if _profiling:
+                jax.block_until_ready((cond_schur, arrow_rhs_acc))
+                _detail_timing['chol_mpi_recv'] = _time.perf_counter() - _t0
 
         # Python loop over local blocks — each block is a separate JIT call.
         # Accumulate results in CPU (host) memory to avoid GPU OOM when
@@ -3895,8 +4125,16 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
                    m0_diag_all, m1_diag_all, m2_diag_all,
                    m0_sub_all, m1_sub_all, m2_sub_all)
 
+        _gpu_to_cpu_acc = 0.0
+        _compute_acc = 0.0
+        if _profiling:
+            import cupy as _cp
+            _gpu_sync = _cp.cuda.Device().synchronize
         for j_py in range(n_local):
             j_jax = jnp.array(j_py, dtype=jnp.int32)
+            if _profiling:
+                _gpu_sync()
+                _t0 = _time.perf_counter()
             (cond_schur, arrow_tip_acc, arrow_schur, logdet_cond,
              prev_lower_y, arrow_rhs_acc,
              cs_out, as_out, y_out,
@@ -3906,11 +4144,22 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
                 j_jax, rhs_st_local,
                 *sc_args,
                 coreg_w, likelihood_precs)
+            if _profiling:
+                jax.block_until_ready((L_out, Ll_out, La_out))
+                _gpu_sync()
+                _compute_acc += _time.perf_counter() - _t0
+                _t0 = _time.perf_counter()
             stored_L_host[j_py] = np.asarray(L_out)
             stored_Ll_host[j_py] = np.asarray(Ll_out)
             stored_La_host[j_py] = np.asarray(La_out)
             y_st_host[j_py] = np.asarray(y_out)
+            if _profiling:
+                _gpu_to_cpu_acc += _time.perf_counter() - _t0
             del cs_out, as_out, y_out, L_out, Ll_out, La_out
+
+        if _profiling:
+            _detail_timing['chol_compute'] = _compute_acc
+            _detail_timing['chol_gpu_to_cpu'] = _gpu_to_cpu_acc
 
         # y_st is small — transfer to GPU; stored L factors stay on CPU
         y_st_local = jnp.array(y_st_host)
@@ -3918,12 +4167,24 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
 
         # MPI send carries to next rank
         if rank < comm_size - 1:
+            if _profiling:
+                jax.block_until_ready(logdet_cond)
+                _t0 = _time.perf_counter()
             _chol_send_carries(cond_schur, arrow_tip_acc, arrow_schur,
                                logdet_cond, prev_lower_y, arrow_rhs_acc)
+            if _profiling:
+                jax.effects_barrier()
+                _detail_timing['chol_mpi_send'] = _time.perf_counter() - _t0
 
         # Finalize: bcast logdet, L_tip, arrow_rhs
+        if _profiling:
+            jax.effects_barrier()
+            _t0 = _time.perf_counter()
         logdet_cond_final, L_tip, arrow_rhs_global = _chol_finalize(
             logdet_cond, arrow_tip_acc, arrow_rhs_acc)
+        if _profiling:
+            jax.block_until_ready((logdet_cond_final, L_tip, arrow_rhs_global))
+            _detail_timing['chol_mpi_bcast'] = _time.perf_counter() - _t0
 
         return (stored_L_host, stored_Ll_host, stored_La_host,
                 y_st_local, L_tip, arrow_rhs_global, logdet_cond_final)
@@ -4001,6 +4262,11 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
 
     n_coreg = n_sigmas + n_lambdas
     n_models_cubed = n_models * n_models * n_models
+
+    # Detailed profiling state: when _profile_detail_flag[0] is True,
+    # _chol_fn and _bwd_and_si_fn accumulate transfer/MPI sub-timings.
+    _profile_detail_flag = [False]
+    _detail_timing = {}
 
     @jax.jit
     def _si_last_block(L_i, L_lower_i, L_arrow_i, sd_boundary, sa_boundary,
@@ -4235,6 +4501,9 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
     def _bwd_and_si_fn(theta, stored_L_host, stored_Ll_host, stored_La_host,
                        L_tip, y_st_local, arrow_rhs_acc):
         """Merged backward sub + SI gradient computation in a single pass (pipeline)."""
+        import time as _time
+        _profiling = _profile_detail_flag[0]
+
         likelihood_precs = _theta_to_likelihood_precs(theta)
         sc_list, coreg_w = _theta_to_sc_coreg(theta)
         sc_padded = _pad_subdiags(sc_list)
@@ -4276,8 +4545,14 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         sd_boundary = jnp.zeros((block_size, block_size), dtype=dtype)
         sa_boundary = jnp.zeros((n_fe, block_size), dtype=dtype)
         if rank < comm_size - 1:
+            if _profiling:
+                jax.block_until_ready(x_next)
+                _t0 = _time.perf_counter()
             x_next, sd_boundary, sa_boundary = _bwd_si_recv(
                 x_next, sd_boundary, sa_boundary)
+            if _profiling:
+                jax.block_until_ready((x_next, sd_boundary, sa_boundary))
+                _detail_timing['bwd_mpi_recv'] = _time.perf_counter() - _t0
 
         max_n_local = (nt + comm_size - 1) // comm_size
         local_x_host = np.zeros((max_n_local, block_size), dtype=np_dtype)
@@ -4286,24 +4561,47 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
         g_lik_acc = jnp.zeros(n_models, dtype=dtype)
         g_c_acc = jnp.zeros(n_coreg, dtype=dtype)
 
+        _cpu_to_gpu_acc = 0.0
+        _gpu_to_cpu_acc = 0.0
+        _compute_acc = 0.0
+        if _profiling:
+            import cupy as _cp
+            _gpu_sync = _cp.cuda.Device().synchronize
+
         # Process last block (has special SI initialization)
         last_local = n_local - 1
+        if _profiling:
+            _gpu_sync()
+            _t0 = _time.perf_counter()
         L_last = jnp.array(stored_L_host[last_local])
         Ll_last = jnp.array(stored_Ll_host[last_local])
         La_last = jnp.array(stored_La_host[last_local])
+        if _profiling:
+            jax.block_until_ready((L_last, Ll_last, La_last))
+            _gpu_sync()
+            _cpu_to_gpu_acc += _time.perf_counter() - _t0
         local_i_last = jnp.array(last_local, dtype=jnp.int32)
 
         # Last block: backward sub + SI init
+        if _profiling:
+            _gpu_sync()
+            _tc0 = _time.perf_counter()
         sd_prev, sa_prev, g_st_b, g_lik_b, g_c_b = _si_last_block(
             L_last, Ll_last, La_last, sd_boundary, sa_boundary, S_tip, L_tip,
             local_i_last, sc_args_t, coreg_w, likelihood_precs,
             jac_q1s_a, jac_q2s_a, jac_q3s_a, jac_scale_a, jac_exp_gt_a,
             jac_coreg_w)
-        # Also do backward sub for last block
         x_last = _bwd_one_block(L_last, Ll_last, La_last,
                                 y_st_local[last_local],
                                 x_next, x_fe, local_i_last)
+        if _profiling:
+            jax.block_until_ready(x_last)
+            _gpu_sync()
+            _compute_acc += _time.perf_counter() - _tc0
+            _t0 = _time.perf_counter()
         local_x_host[last_local] = np.asarray(x_last)
+        if _profiling:
+            _gpu_to_cpu_acc += _time.perf_counter() - _t0
         x_next = x_last
         g_st_acc = g_st_acc + g_st_b
         g_lik_acc = g_lik_acc + g_lik_b
@@ -4312,35 +4610,75 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
 
         # Inner blocks: merged backward sub + SI
         for local_i_py in range(n_local - 2, -1, -1):
+            if _profiling:
+                _gpu_sync()
+                _t0 = _time.perf_counter()
             Li = jnp.array(stored_L_host[local_i_py])
             Lli = jnp.array(stored_Ll_host[local_i_py])
             Lai = jnp.array(stored_La_host[local_i_py])
-            local_i_jax = jnp.array(local_i_py, dtype=jnp.int32)
+            if _profiling:
+                jax.block_until_ready((Li, Lli, Lai))
+                _gpu_sync()
+                _cpu_to_gpu_acc += _time.perf_counter() - _t0
 
+            local_i_jax = jnp.array(local_i_py, dtype=jnp.int32)
+            if _profiling:
+                _gpu_sync()
+                _tc0 = _time.perf_counter()
             x_i, sd_prev, sa_prev, g_st_i, g_lik_i, g_c_i = _bwd_si_block(
                 Li, Lli, Lai, y_st_local[local_i_py], x_next, x_fe,
                 sd_prev, sa_prev, S_tip, local_i_jax,
                 sc_args_t, coreg_w, likelihood_precs,
                 jac_q1s_a, jac_q2s_a, jac_q3s_a, jac_scale_a, jac_exp_gt_a,
                 jac_coreg_w)
+            if _profiling:
+                jax.block_until_ready(x_i)
+                _gpu_sync()
+                _compute_acc += _time.perf_counter() - _tc0
+                _t0 = _time.perf_counter()
             local_x_host[local_i_py] = np.asarray(x_i)
+            if _profiling:
+                _gpu_to_cpu_acc += _time.perf_counter() - _t0
             x_next = x_i
             g_st_acc = g_st_acc + g_st_i
             g_lik_acc = g_lik_acc + g_lik_i
             g_c_acc = g_c_acc + g_c_i
             del Li, Lli, Lai
 
+        if _profiling:
+            _detail_timing['bwd_compute'] = _compute_acc
+            _detail_timing['bwd_cpu_to_gpu'] = _cpu_to_gpu_acc
+            _detail_timing['bwd_gpu_to_cpu'] = _gpu_to_cpu_acc
+
         # Send both x and SI boundary to previous rank
         if rank > 0:
+            if _profiling:
+                jax.block_until_ready((x_next, sd_prev))
+                _t0 = _time.perf_counter()
             _bwd_si_send(x_next, sd_prev, sa_prev)
+            if _profiling:
+                jax.effects_barrier()
+                _detail_timing['bwd_mpi_send'] = _time.perf_counter() - _t0
 
         # Allreduce for x and quad
         local_x_st = jnp.array(local_x_host)
+        if _profiling:
+            jax.effects_barrier()
+            _t0 = _time.perf_counter()
         x_st_global, quad_global = _bwd_allgather_reduce(local_x_st, local_quad)
+        if _profiling:
+            jax.block_until_ready((x_st_global, quad_global))
+            _detail_timing['bwd_mpi_allgather'] = _time.perf_counter() - _t0
         x = jnp.concatenate([x_st_global.reshape(-1), x_fe])
 
         # Allreduce for SI gradients
+        if _profiling:
+            jax.block_until_ready(g_st_acc)
+            _t0 = _time.perf_counter()
         g_st_acc, g_lik_acc, g_c_acc = _si_allreduce(g_st_acc, g_lik_acc, g_c_acc)
+        if _profiling:
+            jax.block_until_ready((g_st_acc, g_lik_acc, g_c_acc))
+            _detail_timing['bwd_mpi_allreduce'] = _time.perf_counter() - _t0
         grad_lik = likelihood_precs * g_lik_acc
 
         return quad_global, x, g_st_acc, grad_lik, g_c_acc
@@ -4496,6 +4834,90 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
 
         return float(f_val), np.asarray(grad_val, dtype=np_dtype), np.asarray(x_val, dtype=np_dtype)
 
+    def timed_objective_with_grad(theta):
+        """Like objective_with_grad but returns per-stage timing breakdown.
+
+        Returns
+        -------
+        f_val : float
+        grad_val : ndarray
+        x_val : ndarray
+        timing : dict
+            Stage name to elapsed seconds.
+        """
+        import time as _time
+        timing = {}
+        theta_jax = jnp.asarray(theta, dtype=dtype)
+
+        t0 = _time.perf_counter()
+        L_host, Ll_host, La_host, y_st_local, L_tip, arrow_rhs_acc, logdet_cond = \
+            _chol_fn(theta_jax)
+        jax.block_until_ready(logdet_cond)
+        timing["chol_fwd_sub"] = _time.perf_counter() - t0
+
+        t0 = _time.perf_counter()
+        quad, x_val, grad_cond_st, grad_cond_lik, grad_cond_coreg = \
+            _bwd_and_si_fn(theta_jax, L_host, Ll_host, La_host, L_tip,
+                           y_st_local, arrow_rhs_acc)
+        jax.block_until_ready((quad, x_val))
+        timing["bwd_si"] = _time.perf_counter() - t0
+        del y_st_local, arrow_rhs_acc, L_host, Ll_host, La_host, L_tip
+
+        t0 = _time.perf_counter()
+        logdet_prior, grad_prior_st, grad_prior_coreg = _grad_prior_fn(theta_jax)
+        jax.block_until_ready(logdet_prior)
+        timing["grad_prior"] = _time.perf_counter() - t0
+
+        t0 = _time.perf_counter()
+        f_val = _compute_objective(theta_jax, logdet_cond, quad, logdet_prior)
+        jax.block_until_ready(f_val)
+        timing["compute_f"] = _time.perf_counter() - t0
+
+        t0 = _time.perf_counter()
+        grad_quad_st, grad_quad_lik, grad_quad_coreg = _grad_quad_fn(
+            theta_jax, x_val)
+        jax.block_until_ready((grad_quad_st, grad_quad_lik))
+        timing["grad_quad"] = _time.perf_counter() - t0
+
+        t0 = _time.perf_counter()
+        grad_scalar = _grad_scalar_fn(theta_jax)
+        jax.block_until_ready(grad_scalar)
+        timing["grad_scalar"] = _time.perf_counter() - t0
+
+        grad_val = _combine_gradients(
+            theta_jax,
+            grad_cond_st, grad_cond_lik, grad_cond_coreg,
+            grad_prior_st, grad_prior_coreg,
+            grad_quad_st, grad_quad_lik, grad_quad_coreg,
+            grad_scalar)
+
+        return float(f_val), np.asarray(grad_val, dtype=np_dtype), \
+            np.asarray(x_val, dtype=np_dtype), timing
+
+    def timed_detailed_objective_with_grad(theta):
+        """Like timed_objective_with_grad but with sub-stage transfer/MPI breakdown.
+
+        Returns
+        -------
+        f_val : float
+        grad_val : ndarray
+        x_val : ndarray
+        timing : dict
+            Stage name to elapsed seconds.
+        detail : dict
+            Sub-stage transfer/MPI times (e.g. chol_gpu_to_cpu, bwd_mpi_recv).
+        """
+        _detail_timing.clear()
+        _profile_detail_flag[0] = True
+        try:
+            f_val, grad_val, x_val, timing = timed_objective_with_grad(theta)
+        finally:
+            _profile_detail_flag[0] = False
+        return f_val, grad_val, x_val, timing, dict(_detail_timing)
+
+    objective_with_grad.timed = timed_objective_with_grad
+    objective_with_grad.timed_detailed = timed_detailed_objective_with_grad
+
     def objective_fn(theta):
         theta_jax = jnp.asarray(theta, dtype=dtype)
         L_h, Ll_h, La_h, y_st_local, L_tip, arrow_rhs_acc, logdet_cond = \
@@ -4509,15 +4931,17 @@ def create_pure_jax_objective_distributed_coregional_splitjit(
     # Warmup: compile each stage
     theta_init = jnp.ones(n_hyperparameters, dtype=dtype)
     from dalia.utils import print_msg
+
     print_msg("Split-JIT: compiling Cholesky + forward sub...")
     L0, Ll0, La0, yst0, lt0, arr0, logdet0 = _chol_fn(theta_init)
     print_msg("Split-JIT: compiling merged bwd+SI...")
     quad0, x0, _, _, _ = _bwd_and_si_fn(theta_init, L0, Ll0, La0, lt0, yst0, arr0)
-    del yst0, arr0, L0, Ll0, La0, lt0
+    del yst0, arr0, L0, Ll0, La0, lt0, logdet0, quad0
     print_msg("Split-JIT: compiling prior logdet + gradient...")
     _ = _grad_prior_fn(theta_init)
     print_msg("Split-JIT: compiling quad gradient...")
     _ = _grad_quad_fn(theta_init, x0)
+    del x0
     print_msg("Split-JIT: compiling scalar gradient...")
     _ = _grad_scalar_fn(theta_init)
     print_msg("Split-JIT: all stages compiled.")
