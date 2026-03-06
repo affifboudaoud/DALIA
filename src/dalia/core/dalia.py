@@ -490,12 +490,18 @@ class DALIA:
         theta_star = get_device(minimization_result["theta"])
         x_star = get_device(minimization_result["x"])
 
-        # Release JAX GPU memory before CuPy-based post-processing
-        if self.config.gradient_method == "jax_autodiff":
+        # Compute Hessian before releasing JAX so jax_grad_func is still available
+        t_hess_start = time.perf_counter()
+        if self.config.gradient_method == "jax_autodiff" and self.jax_grad_func is not None:
+            cov_theta = self.compute_covariance_hp(theta_star)
+            self.t_hessian = time.perf_counter() - t_hess_start
             self._release_jax_gpu_memory()
-
-        # compute covariance of the hyperparameters theta at the mode
-        cov_theta = self.compute_covariance_hp(theta_star)
+            # Rebuild model state (Q_prior etc.) via a single CuPy forward eval
+            # so that marginal variances can access Q_conditional
+            self._evaluate_f(theta_star)
+        else:
+            cov_theta = self.compute_covariance_hp(theta_star)
+            self.t_hessian = time.perf_counter() - t_hess_start
 
         # compute marginal variances of the latent parameters
         marginal_variances_latent = self.get_marginal_variances_latent_parameters(
@@ -514,6 +520,7 @@ class DALIA:
             "x": minimization_result["x"],
             "f": minimization_result["f"],
             "cov_theta": cov_theta,
+            "t_hessian": self.t_hessian,
             "marginal_variances_latent": marginal_variances_latent,
             # "marginal_variances_observations": get_host(
             #     marginal_variances_observations
@@ -1068,7 +1075,10 @@ class DALIA:
         """
         self.model.theta[:] = xp.asarray(theta_i)
 
-        hess_theta = self._evaluate_hessian_f(theta_i)
+        if self.jax_grad_func is not None:
+            hess_theta = self._evaluate_hessian_f_from_gradients(theta_i)
+        else:
+            hess_theta = self._evaluate_hessian_f(theta_i)
         cov_theta = xp.linalg.inv(hess_theta)
 
         return cov_theta
@@ -1217,6 +1227,56 @@ class DALIA:
             print_msg(f"Negative eigenvalues detected: {eigvals}")
 
         return hess
+
+    def _evaluate_hessian_f_from_gradients(
+        self,
+        theta_i: NDArray,
+    ) -> NDArray:
+        """Approximate the Hessian of f(theta) via finite differences of gradients.
+
+        Parameters
+        ----------
+        theta_i : NDArray
+            Hyperparameters theta.
+
+        Returns
+        -------
+        hessian_f : NDArray[dim_theta, dim_theta]
+
+        Notes
+        -----
+        Uses central differences of the JAX gradient function:
+        H[:,i] = (grad(theta + h*e_i) - grad(theta - h*e_i)) / (2h).
+        Requires 2*d gradient evaluations instead of O(d^2) function evaluations.
+        """
+        import numpy as np
+
+        dim_theta = self.model.n_hyperparameters
+        h = self.eps_hessian_f
+        theta = np.asarray(get_host(theta_i), dtype=np.float64)
+
+        hess = np.zeros((dim_theta, dim_theta), dtype=np.float64)
+
+        for i in range(dim_theta):
+            e_i = np.zeros(dim_theta, dtype=np.float64)
+            e_i[i] = h
+
+            _, grad_plus, _ = self.jax_grad_func(theta + e_i)
+            _, grad_minus, _ = self.jax_grad_func(theta - e_i)
+
+            grad_plus = np.asarray(grad_plus, dtype=np.float64)
+            grad_minus = np.asarray(grad_minus, dtype=np.float64)
+
+            hess[:, i] = (grad_plus - grad_minus) / (2.0 * h)
+
+        # Symmetrize
+        hess = 0.5 * (hess + hess.T)
+
+        eigvals = np.linalg.eigvalsh(hess)
+        if np.any(eigvals < 0):
+            print_msg(f"Negative eigenvalues detected: {eigvals}")
+
+        return xp.asarray(hess)
 
     def _compute_covariance_latent_parameters(
         self, theta: NDArray, x_star: NDArray
