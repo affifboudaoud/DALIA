@@ -53,6 +53,7 @@ class DaliaConfig(BaseModel):
 
     # --- Gradient computation method ------------------------------------------
     gradient_method: Literal["finite_diff", "jax_autodiff"] = "finite_diff"
+    distributed_method: Literal["split_jit", "two_phase"] = "split_jit"
 
     # --- Directory paths ------------------------------------------------------
     simulation_dir: Path = Path("./dalia/")

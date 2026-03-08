@@ -301,11 +301,17 @@ class DALIA:
                     if self.config.solver.type != "serinv":
                         raise NotImplementedError(
                             "Distributed JAX autodiff for CoregionalModel requires serinv solver.")
-                    print_msg(f"Using distributed JAX autodiff (split-JIT) with {comm_size} ranks "
+                    dist_method = self.config.distributed_method
+                    print_msg(f"Using distributed JAX autodiff ({dist_method}) with {comm_size} ranks "
                               f"(CoregionalModel, {self.model.n_models} variates)")
-                    self.jax_objective, self.jax_grad_func = \
-                        create_pure_jax_objective_distributed_coregional_splitjit(
-                            dalia_instance=self, comm=self.comm_qeval)
+                    if dist_method == "two_phase":
+                        self.jax_objective, self.jax_grad_func = \
+                            create_pure_jax_objective_distributed_coregional_twophase(
+                                dalia_instance=self, comm=self.comm_qeval)
+                    else:
+                        self.jax_objective, self.jax_grad_func = \
+                            create_pure_jax_objective_distributed_coregional_splitjit(
+                                dalia_instance=self, comm=self.comm_qeval)
                 else:
                     print_msg(f"Using JAX automatic differentiation with JIT compilation "
                               f"(CoregionalModel, {self.model.n_models} variates)")
@@ -491,19 +497,24 @@ class DALIA:
         x_star = get_device(minimization_result["x"])
 
         # Compute Hessian before releasing JAX so jax_grad_func is still available
+        print_msg("Starting Hessian computation...", flush=True)
         t_hess_start = time.perf_counter()
         if self.config.gradient_method == "jax_autodiff" and self.jax_grad_func is not None:
             cov_theta = self.compute_covariance_hp(theta_star)
             self.t_hessian = time.perf_counter() - t_hess_start
+            print_msg(f"Hessian computed in {self.t_hessian:.2f}s", flush=True)
             self._release_jax_gpu_memory()
             # Rebuild model state (Q_prior etc.) via a single CuPy forward eval
             # so that marginal variances can access Q_conditional
+            print_msg("Rebuilding model state for marginal variances...", flush=True)
             self._evaluate_f(theta_star)
         else:
             cov_theta = self.compute_covariance_hp(theta_star)
             self.t_hessian = time.perf_counter() - t_hess_start
+            print_msg(f"Hessian computed in {self.t_hessian:.2f}s", flush=True)
 
         # compute marginal variances of the latent parameters
+        print_msg("Computing marginal variances...", flush=True)
         marginal_variances_latent = self.get_marginal_variances_latent_parameters(
             theta_star, x_star
         )
@@ -705,10 +716,34 @@ class DALIA:
                     callback=callback,
                 )
             except OptimizationConvergedEarlyExit:
+                print(
+                    f"rank {comm_rank} | objfunc_time: "
+                    f"{self.objective_function_time[1:]}",
+                    flush=True,
+                )
+                if self.objective_function_energy:
+                    node_j = [s["node_joules"] for s in self.objective_function_energy[1:]]
+                    gpu_j = [s["gpu_joules"] for s in self.objective_function_energy[1:]]
+                    other_j = [s.get("other_joules", 0) for s in self.objective_function_energy[1:]]
+                    if node_j:
+                        import numpy as _np
+                        print(
+                            f"rank {comm_rank} | energy per gradient (node): "
+                            f"mean={_np.mean(node_j):.0f}J std={_np.std(node_j):.0f}J "
+                            f"total={_np.sum(node_j):.0f}J | "
+                            f"gpu: mean={_np.mean(gpu_j):.0f}J | "
+                            f"other: mean={_np.mean(other_j):.0f}J "
+                            f"({_np.mean(other_j) / _np.mean(node_j) * 100:.0f}%)"
+                            f" | energy: node={_np.mean(node_j):.0f}J "
+                            f"gpu={_np.mean(gpu_j):.0f}J "
+                            f"cpu={_np.mean(other_j):.0f}J "
+                            f"({_np.mean(node_j) / self.objective_function_time[-1]:.0f}W)",
+                            flush=True,
+                        )
                 return self.minimization_result
 
             print(
-                f"rank {comm_rank} | objective function time: {self.objective_function_time[1:]}"
+                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]}"
             )
             if self.objective_function_energy:
                 node_j = [s["node_joules"] for s in self.objective_function_energy[1:]]
@@ -1261,6 +1296,7 @@ class DALIA:
             e_i = np.zeros(dim_theta, dtype=np.float64)
             e_i[i] = h
 
+            t_col = time.perf_counter()
             _, grad_plus, _ = self.jax_grad_func(theta + e_i)
             _, grad_minus, _ = self.jax_grad_func(theta - e_i)
 
@@ -1268,6 +1304,11 @@ class DALIA:
             grad_minus = np.asarray(grad_minus, dtype=np.float64)
 
             hess[:, i] = (grad_plus - grad_minus) / (2.0 * h)
+            print(
+                f"comm_rank: {comm_rank} | Hessian column {i+1}/{dim_theta} "
+                f"({time.perf_counter() - t_col:.2f}s)",
+                flush=True,
+            )
 
         # Symmetrize
         hess = 0.5 * (hess + hess.T)
