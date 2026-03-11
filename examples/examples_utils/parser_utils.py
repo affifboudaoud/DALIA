@@ -82,6 +82,20 @@ def parse_args():
         action="store_true",
         help="Skip JAX autodiff run (FD only).",
     )
+    parser.add_argument(
+        "--distributed_method",
+        type=str,
+        choices=["split_jit", "two_phase"],
+        default="split_jit",
+        help="Distributed AD method for coregional models.",
+    )
+    parser.add_argument(
+        "--theta_initial",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Initial theta values for warm-starting optimization.",
+    )
     args = parser.parse_args()
     print("Parsed parameters:")
     print(f"  max_iter: {args.max_iter}")

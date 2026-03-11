@@ -711,7 +711,7 @@ class DALIA:
                         "maxls": self.config.minimize.maxls,
                         "gtol": self.config.minimize.gtol,
                         "disp": self.config.minimize.disp,
-                        "ftol": 1e-22,
+                        "ftol": self.config.minimize.ftol,
                     },
                     callback=callback,
                 )

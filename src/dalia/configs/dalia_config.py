@@ -25,6 +25,7 @@ class BFGSConfig(BaseModel):
     maxls: PositiveInt = 20 # maximum number of line search iterations
 
     gtol: float = 1e-1
+    ftol: float = 1e-22
     # c1: float = 1e-4  # only relevant for BFGS not for L-BFGS-B
     # c2: float = 0.9  # only relevant for BFGS not for L-BFGS-B
     disp: bool = False
