@@ -33,9 +33,6 @@ from dalia.utils import (
 from dalia.core.jax_autodiff import (
     create_pure_jax_objective,
     create_pure_jax_objective_coregional,
-    create_pure_jax_objective_distributed,
-    create_pure_jax_objective_distributed_coregional,
-    create_pure_jax_objective_distributed_coregional_splitjit,
     create_pure_jax_objective_distributed_coregional_twophase,
 )
 
@@ -300,18 +297,13 @@ class DALIA:
                 if backend_flags["mpi_avail"] and comm_size > 1:
                     if self.config.solver.type != "serinv":
                         raise NotImplementedError(
-                            "Distributed JAX autodiff for CoregionalModel requires serinv solver.")
-                    dist_method = self.config.distributed_method
-                    print_msg(f"Using distributed JAX autodiff ({dist_method}) with {comm_size} ranks "
+                            "Distributed JAX autodiff for CoregionalModel requires the serinv solver "
+                            "(block-tridiagonal-arrowhead sparsity is needed for distributed partitioning).")
+                    print_msg(f"Using distributed JAX autodiff (two-phase) with {comm_size} ranks "
                               f"(CoregionalModel, {self.model.n_models} variates)")
-                    if dist_method == "two_phase":
-                        self.jax_objective, self.jax_grad_func = \
-                            create_pure_jax_objective_distributed_coregional_twophase(
-                                dalia_instance=self, comm=self.comm_qeval)
-                    else:
-                        self.jax_objective, self.jax_grad_func = \
-                            create_pure_jax_objective_distributed_coregional_splitjit(
-                                dalia_instance=self, comm=self.comm_qeval)
+                    self.jax_objective, self.jax_grad_func = \
+                        create_pure_jax_objective_distributed_coregional_twophase(
+                            dalia_instance=self, comm=self.comm_qeval)
                 else:
                     print_msg(f"Using JAX automatic differentiation with JIT compilation "
                               f"(CoregionalModel, {self.model.n_models} variates)")
@@ -319,32 +311,23 @@ class DALIA:
                         dalia_instance=self,
                     )
             else:
-                # Regular Model
+                # Regular Model (single-process only)
                 likelihood_type = self.model.likelihood_config.type
                 all_supported = likelihood_type in supported_likelihoods
                 likelihood_name = likelihood_type.capitalize()
 
-                can_use_distributed_jax = (
-                    all_supported
-                    and likelihood_type == 'gaussian'
-                    and self.config.solver.type == "serinv"
-                    and backend_flags["mpi_avail"]
-                    and comm_size > 1
-                )
+                if backend_flags["mpi_avail"] and comm_size > 1:
+                    raise NotImplementedError(
+                        "Distributed JAX autodiff is only supported for CoregionalModel. "
+                        "For univariate distributed models, use gradient_method='finite_diff'."
+                    )
 
                 can_use_pure_jax = (
                     all_supported
                     and self.config.solver.type in ["dense", "serinv"]
-                    and (not backend_flags["mpi_avail"] or comm_size == 1)
                 )
 
-                if can_use_distributed_jax:
-                    print_msg(f"Using distributed JAX autodiff with {comm_size} ranks ({likelihood_name} likelihood)")
-                    self.jax_objective, self.jax_grad_func = create_pure_jax_objective_distributed(
-                        dalia_instance=self,
-                        comm=self.comm_qeval,
-                    )
-                elif can_use_pure_jax:
+                if can_use_pure_jax:
                     print_msg(f"Using JAX automatic differentiation with JIT compilation ({likelihood_name} likelihood)")
                     self.jax_objective, self.jax_grad_func = create_pure_jax_objective(
                         dalia_instance=self,
@@ -426,6 +409,21 @@ class DALIA:
 
         print_msg(str_representation, flush=True)
 
+    def _print_optimization_summary(self):
+        """Print summary statistics for per-gradient times."""
+        import numpy as _np
+        times = self.objective_function_time[1:]
+        if times:
+            print(
+                f"rank {comm_rank} | optimization summary:"
+                f" n_iters={len(times)}"
+                f" | objfunc_time: mean={_np.mean(times):.6f}"
+                f" std={_np.std(times):.6f}"
+                f" min={_np.min(times):.6f}"
+                f" max={_np.max(times):.6f}",
+                flush=True,
+            )
+
     def _release_jax_gpu_memory(self):
         """Release JAX/XLA GPU memory after optimization.
 
@@ -489,9 +487,13 @@ class DALIA:
 
     def run(self) -> dict:
         """Run the DALIA"""
+        t_run_start = time.perf_counter()
 
         # compute mode of the hyperparameters theta
+        t_opt_start = time.perf_counter()
         minimization_result = self.minimize()
+        self.t_optimization = time.perf_counter() - t_opt_start
+        print_msg(f"Optimization completed in {self.t_optimization:.2f}s", flush=True)
 
         theta_star = get_device(minimization_result["theta"])
         x_star = get_device(minimization_result["x"])
@@ -515,9 +517,12 @@ class DALIA:
 
         # compute marginal variances of the latent parameters
         print_msg("Computing marginal variances...", flush=True)
+        t_marg_start = time.perf_counter()
         marginal_variances_latent = self.get_marginal_variances_latent_parameters(
             theta_star, x_star
         )
+        self.t_marginals = time.perf_counter() - t_marg_start
+        print_msg(f"Marginal variances computed in {self.t_marginals:.2f}s", flush=True)
 
         # compute marginal variances of the observations
         # TODO: only run by default when dense multiplcation issue is fixed, see issue #78
@@ -525,18 +530,26 @@ class DALIA:
         #     theta_star, x_star
         # )
 
+        self.t_wallclock = time.perf_counter() - t_run_start
+
         # construct new dictionary with the results
         results = {
             "theta": minimization_result["theta"],
             "x": minimization_result["x"],
             "f": minimization_result["f"],
             "cov_theta": cov_theta,
+            "t_optimization": self.t_optimization,
             "t_hessian": self.t_hessian,
+            "t_marginals": self.t_marginals,
+            "t_wallclock": self.t_wallclock,
             "marginal_variances_latent": marginal_variances_latent,
             # "marginal_variances_observations": get_host(
             #     marginal_variances_observations
             # ),
         }
+
+        # Add per-iteration gradient times (skip iter 0 warmup)
+        results["objective_function_time"] = self.objective_function_time[1:]
 
         # Add optimization-specific results if they exist
         if "grad_f" in minimization_result:
@@ -545,6 +558,14 @@ class DALIA:
             results["f_values"] = minimization_result["f_values"]
         if "theta_values" in minimization_result:
             results["theta_values"] = minimization_result["theta_values"]
+
+        print_msg(
+            f"Total wall-clock: {self.t_wallclock:.2f}s "
+            f"(optimization: {self.t_optimization:.2f}s, "
+            f"hessian: {self.t_hessian:.2f}s, "
+            f"marginals: {self.t_marginals:.2f}s)",
+            flush=True,
+        )
 
         return results
 
@@ -716,11 +737,7 @@ class DALIA:
                     callback=callback,
                 )
             except OptimizationConvergedEarlyExit:
-                print(
-                    f"rank {comm_rank} | objfunc_time: "
-                    f"{self.objective_function_time[1:]}",
-                    flush=True,
-                )
+                self._print_optimization_summary()
                 if self.objective_function_energy:
                     node_j = [s["node_joules"] for s in self.objective_function_energy[1:]]
                     gpu_j = [s["gpu_joules"] for s in self.objective_function_energy[1:]]
@@ -742,9 +759,7 @@ class DALIA:
                         )
                 return self.minimization_result
 
-            print(
-                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]}"
-            )
+            self._print_optimization_summary()
             if self.objective_function_energy:
                 node_j = [s["node_joules"] for s in self.objective_function_energy[1:]]
                 gpu_j = [s["gpu_joules"] for s in self.objective_function_energy[1:]]
@@ -883,9 +898,16 @@ class DALIA:
             energy_str = ""
             if self.objective_function_energy:
                 e = self.objective_function_energy[-1]
-                energy_str = f" | energy: node={e['node_joules']}J gpu={e['gpu_joules']}J cpu={e['cpu_joules']}J ({e['node_watts_avg']:.0f}W)"
+                energy_str = (
+                    f" | energy: node={e['node_joules']}J gpu={e['gpu_joules']}J"
+                    f" cpu={e['cpu_joules']}J ({e['node_watts_avg']:.0f}W)"
+                )
             print(
-                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]} | solver_time: {self.solver_time[1:]} | construction_time: {self.construction_time[1:]}{energy_str}",
+                f"rank {comm_rank} | iter {self.iter}"
+                f" | objfunc_time: {self.objective_function_time[-1]:.6f}"
+                f" | solver_time: {self.solver_time[-1]:.6f}"
+                f" | construction_time: {self.construction_time[-1]:.6f}"
+                f"{energy_str}",
                 flush=True,
             )
         self.iter += 1
@@ -941,9 +963,14 @@ class DALIA:
             energy_str = ""
             if self.objective_function_energy:
                 e = self.objective_function_energy[-1]
-                energy_str = f" | energy: node={e['node_joules']}J gpu={e['gpu_joules']}J cpu={e['cpu_joules']}J ({e['node_watts_avg']:.0f}W)"
+                energy_str = (
+                    f" | energy: node={e['node_joules']}J gpu={e['gpu_joules']}J"
+                    f" cpu={e['cpu_joules']}J ({e['node_watts_avg']:.0f}W)"
+                )
             print(
-                f"rank {comm_rank} | objfunc_time: {self.objective_function_time[1:]}{energy_str}",
+                f"rank {comm_rank} | iter {self.iter}"
+                f" | objfunc_time: {self.objective_function_time[-1]:.6f}"
+                f"{energy_str}",
                 flush=True,
             )
         self.iter += 1
