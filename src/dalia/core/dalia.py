@@ -504,7 +504,16 @@ class DALIA:
         t_opt_start = time.perf_counter()
         minimization_result = self.minimize()
         self.t_optimization = time.perf_counter() - t_opt_start
-        print_msg(f"Optimization completed in {self.t_optimization:.2f}s", flush=True)
+
+        # Print optimization summary before Hessian (in case Hessian crashes)
+        n_iters = len(self.objective_function_time) - 1
+        grad_times = np.array(self.objective_function_time[1:])
+        f_final = float(minimization_result.get("f", float("nan")))
+        print_msg(
+            f"Optimization completed in {self.t_optimization:.2f}s "
+            f"({n_iters} iterations, {grad_times.mean():.2f}s/grad, f={f_final:.6f})",
+            flush=True,
+        )
 
         theta_star = get_device(minimization_result["theta"])
         x_star = get_device(minimization_result["x"])

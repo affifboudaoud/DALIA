@@ -433,6 +433,21 @@ class DistSerinvSolver(Solver):
             rows = coo.row[self.bta_cache_block_sort_index]
             cols = coo.col[self.bta_cache_block_sort_index]
 
+            # When xp is CuPy, rows/cols are GPU arrays. Index arithmetic
+            # (slicing, subtraction) on CuPy arrays produces CuPy arrays that
+            # cannot be stacked with xp.array() — CuPy forbids implicit
+            # conversion to NumPy. We move indices to CPU for the bookkeeping
+            # loop below, then transfer the final per-block index arrays back
+            # to GPU.
+            if hasattr(rows, "get"):
+                rows_h = rows.get()
+                cols_h = cols.get()
+                block_offsets_h = block_offsets.get() if hasattr(block_offsets, "get") else block_offsets
+            else:
+                rows_h = xp_host.asarray(rows)
+                cols_h = xp_host.asarray(cols)
+                block_offsets_h = xp_host.asarray(block_offsets)
+
             self.bta_diag_rows = []
             self.bta_diag_cols = []
             self.bta_diag_slices = []
@@ -449,16 +464,16 @@ class DistSerinvSolver(Solver):
             self.bta_arrow_tip_cols = None
             self.bta_arrow_tip_slice = None
 
-            n_idx = xp.array([0] + self.n_locals)
-            start_idx = int(xp.cumsum(n_idx)[self.rank])
-            end_idx = int(xp.cumsum(n_idx)[self.rank + 1])
+            n_idx = xp_host.array([0] + self.n_locals)
+            start_idx = int(xp_host.cumsum(n_idx)[self.rank])
+            end_idx = int(xp_host.cumsum(n_idx)[self.rank + 1])
             for i in range(start_idx, end_idx):
                 inds = compute_block_slice(
                     rows, cols, block_offsets, block_row=i, block_col=i
                 )
                 slice_idx = slice(int(inds[0]), int(inds[-1] + 1), 1)
-                self.bta_diag_rows.append(rows[slice_idx] - block_offsets[i])
-                self.bta_diag_cols.append(cols[slice_idx] - block_offsets[i])
+                self.bta_diag_rows.append(rows_h[slice_idx] - block_offsets_h[i])
+                self.bta_diag_cols.append(cols_h[slice_idx] - block_offsets_h[i])
                 self.bta_diag_slices.append(slice_idx)
 
                 if i < self.n_diag_blocks - 1:
@@ -466,8 +481,8 @@ class DistSerinvSolver(Solver):
                         rows, cols, block_offsets, block_row=i + 1, block_col=i
                     )
                     slice_idx = slice(int(inds[0]), int(inds[-1] + 1), 1)
-                    self.bta_lower_rows.append(rows[slice_idx] - block_offsets[i + 1])
-                    self.bta_lower_cols.append(cols[slice_idx] - block_offsets[i])
+                    self.bta_lower_rows.append(rows_h[slice_idx] - block_offsets_h[i + 1])
+                    self.bta_lower_cols.append(cols_h[slice_idx] - block_offsets_h[i])
                     self.bta_lower_slice.append(slice_idx)
 
                 inds = compute_block_slice(
@@ -479,9 +494,9 @@ class DistSerinvSolver(Solver):
                 )
                 slice_idx = slice(int(inds[0]), int(inds[-1] + 1), 1)
                 self.bta_arrow_bottom_rows.append(
-                    rows[slice_idx] - block_offsets[self.n_diag_blocks]
+                    rows_h[slice_idx] - block_offsets_h[self.n_diag_blocks]
                 )
-                self.bta_arrow_bottom_cols.append(cols[slice_idx] - block_offsets[i])
+                self.bta_arrow_bottom_cols.append(cols_h[slice_idx] - block_offsets_h[i])
                 self.bta_arrow_bottom_slice.append(slice_idx)
 
             # Arrow tip block
@@ -494,34 +509,35 @@ class DistSerinvSolver(Solver):
             )
             slice_idx = slice(int(inds[0]), int(inds[-1] + 1), 1)
             self.bta_arrow_tip_rows = (
-                rows[slice_idx] - block_offsets[self.n_diag_blocks]
+                rows_h[slice_idx] - block_offsets_h[self.n_diag_blocks]
             )
             self.bta_arrow_tip_cols = (
-                cols[slice_idx] - block_offsets[self.n_diag_blocks]
+                cols_h[slice_idx] - block_offsets_h[self.n_diag_blocks]
             )
             self.bta_arrow_tip_slice = slice_idx
 
-            self.bta_diag_rows = xp.array(self.bta_diag_rows, dtype=xp.int32)
-            self.bta_diag_cols = xp.array(self.bta_diag_cols, dtype=xp.int32)
-            self.bta_lower_rows = xp.array(self.bta_lower_rows, dtype=xp.int32)
-            self.bta_lower_cols = xp.array(self.bta_lower_cols, dtype=xp.int32)
-            self.bta_arrow_bottom_rows = xp.array(
-                self.bta_arrow_bottom_rows, dtype=xp.int32
-            )
-            self.bta_arrow_bottom_cols = xp.array(
-                self.bta_arrow_bottom_cols, dtype=xp.int32
-            )
-            self.bta_arrow_tip_rows = xp.array(self.bta_arrow_tip_rows, dtype=xp.int32)
-            self.bta_arrow_tip_cols = xp.array(self.bta_arrow_tip_cols, dtype=xp.int32)
+            # Transfer per-block index arrays to GPU. Stored as lists (not
+            # stacked into a 2D array) because blocks can have different
+            # numbers of nonzeros — e.g. coregional models with non-uniform
+            # sparsity patterns produce ragged index arrays.
+            _to_gpu_int32 = lambda a: xp.asarray(xp_host.asarray(a, dtype=xp_host.int32))
+            self.bta_diag_rows = [_to_gpu_int32(a) for a in self.bta_diag_rows]
+            self.bta_diag_cols = [_to_gpu_int32(a) for a in self.bta_diag_cols]
+            self.bta_lower_rows = [_to_gpu_int32(a) for a in self.bta_lower_rows]
+            self.bta_lower_cols = [_to_gpu_int32(a) for a in self.bta_lower_cols]
+            self.bta_arrow_bottom_rows = [_to_gpu_int32(a) for a in self.bta_arrow_bottom_rows]
+            self.bta_arrow_bottom_cols = [_to_gpu_int32(a) for a in self.bta_arrow_bottom_cols]
+            self.bta_arrow_tip_rows = _to_gpu_int32(self.bta_arrow_tip_rows)
+            self.bta_arrow_tip_cols = _to_gpu_int32(self.bta_arrow_tip_cols)
 
             # Print the allocated memory for the BTA-array
             total_bta_bytes: int = (
-                self.bta_diag_rows.nbytes
-                + self.bta_diag_cols.nbytes
-                + self.bta_lower_rows.nbytes
-                + self.bta_lower_cols.nbytes
-                + self.bta_arrow_bottom_rows.nbytes
-                + self.bta_arrow_bottom_cols.nbytes
+                sum(a.nbytes for a in self.bta_diag_rows)
+                + sum(a.nbytes for a in self.bta_diag_cols)
+                + sum(a.nbytes for a in self.bta_lower_rows)
+                + sum(a.nbytes for a in self.bta_lower_cols)
+                + sum(a.nbytes for a in self.bta_arrow_bottom_rows)
+                + sum(a.nbytes for a in self.bta_arrow_bottom_cols)
                 + self.bta_arrow_tip_rows.nbytes
                 + self.bta_arrow_tip_cols.nbytes
             )
