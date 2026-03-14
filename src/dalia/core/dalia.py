@@ -105,6 +105,14 @@ class DALIA:
 
         self.n_f_evaluations = 2 * self.model.n_hyperparameters + 1
 
+        # JAX autodiff computes the objective and gradient analytically in a
+        # single evaluation — there is nothing to parallelize at the F() or Q()
+        # level. Keep all ranks together so they collaborate on the distributed
+        # BTA solver (S() level) instead.
+        is_jax_autodiff = (self.config.gradient_method == "jax_autodiff")
+        if is_jax_autodiff:
+            self.n_f_evaluations = 1
+
         # Create the appropriate communicators
         min_q_parallel = 1
         min_solver_size = self.config.solver.min_processes
@@ -112,6 +120,9 @@ class DALIA:
         if self.model.is_likelihood_gaussian():
             self.n_qeval = 2
         else:
+            self.n_qeval = 1
+
+        if is_jax_autodiff:
             self.n_qeval = 1
 
         if backend_flags["mpi_avail"]:
@@ -124,7 +135,7 @@ class DALIA:
                 min_group_size=min_solver_size * min_q_parallel,
             )
             self.world_size = self.comm_world.size
-            
+
             self.qeval_world, self.comm_qeval, self.color_qeval = smartsplit(
                 comm=self.comm_feval,
                 n_parallelizable_evaluations=self.n_qeval,
@@ -294,12 +305,12 @@ class DALIA:
                     )
                 # Check solver type compatibility
                 is_spatial_only = getattr(self.model, 'coregionalization_type', 'spatio_temporal') == 'spatial'
-                if backend_flags["mpi_avail"] and comm_size > 1:
+                if self.comm_qeval.size > 1:
                     if self.config.solver.type != "serinv":
                         raise NotImplementedError(
                             "Distributed JAX autodiff for CoregionalModel requires the serinv solver "
                             "(block-tridiagonal-arrowhead sparsity is needed for distributed partitioning).")
-                    print_msg(f"Using distributed JAX autodiff (two-phase) with {comm_size} ranks "
+                    print_msg(f"Using distributed JAX autodiff (two-phase) with {self.comm_qeval.size} ranks "
                               f"(CoregionalModel, {self.model.n_models} variates)")
                     self.jax_objective, self.jax_grad_func = \
                         create_pure_jax_objective_distributed_coregional_twophase(
@@ -316,7 +327,7 @@ class DALIA:
                 all_supported = likelihood_type in supported_likelihoods
                 likelihood_name = likelihood_type.capitalize()
 
-                if backend_flags["mpi_avail"] and comm_size > 1:
+                if self.comm_qeval.size > 1:
                     raise NotImplementedError(
                         "Distributed JAX autodiff is only supported for CoregionalModel. "
                         "For univariate distributed models, use gradient_method='finite_diff'."

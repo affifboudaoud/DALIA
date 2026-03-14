@@ -147,9 +147,14 @@ def create_pure_jax_objective(dalia_instance, dtype=None, ad_mode="default") -> 
     objective_pure_jax = jax.jit(objective_pure_jax)
     value_and_grad_fn = jax.jit(value_and_grad_fn)
 
-    # Warmup JIT compilation
+    # JIT compilation (one-time cost)
+    from dalia.utils import print_msg
+    import time as _t
+    print_msg("JIT compiling objective + gradient...", flush=True)
+    _t0 = _t.perf_counter()
     theta_init = jnp.ones(n_hyperparameters, dtype=dtype)
     _ = value_and_grad_fn(theta_init)
+    print_msg(f"JIT compilation done in {_t.perf_counter() - _t0:.1f}s.")
 
     def objective_with_grad(theta):
         """Returns (f_val, grad, x) where x is the latent parameters."""
@@ -219,9 +224,14 @@ def create_pure_jax_objective_coregional(dalia_instance, dtype=None, ad_mode="de
     objective_pure_jax = jax.jit(objective_pure_jax)
     value_and_grad_fn = jax.jit(value_and_grad_fn)
 
-    # Warmup JIT compilation
+    # JIT compilation (one-time cost)
+    from dalia.utils import print_msg
+    import time as _t
+    print_msg("JIT compiling coregional objective + gradient...", flush=True)
+    _t0 = _t.perf_counter()
     theta_init = jnp.ones(n_hyperparameters, dtype=dtype)
     _ = value_and_grad_fn(theta_init)
+    print_msg(f"JIT compilation done in {_t.perf_counter() - _t0:.1f}s.")
 
     def objective_with_grad(theta):
         theta_jax = jnp.asarray(theta, dtype=dtype)

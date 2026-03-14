@@ -26,6 +26,7 @@ from dalia.core.autodiff.spatial_precompute import (
 )
 from dalia.core.autodiff.distributed import (
     twophase_logdet_Q_prior_coregional_scan,
+    twophase_logdet_Q_prior_coregional_grad,
     pipeline_logdet_Q_prior_coregional_grad,
     pipeline_compute_grad_quad_coregional,
 )
@@ -91,6 +92,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
     comm_size = static_data['comm_size']
     n_local = static_data['n_local']
     start_idx = static_data['start_idx']
+    _max_n_local = static_data['max_n_local']
 
     manifolds = [md.get('manifold', 'plane') for md in models_data]
     n_hyperparameters = dalia_instance.model.n_hyperparameters
@@ -598,7 +600,19 @@ def create_pure_jax_objective_distributed_coregional_twophase(
     _scan_chunk = max(1, int(50 * 2**30 / (4 * 2 * block_size**2 * 8)))
     _scan_chunk = min(_scan_chunk, 64)
 
-    # Reduced system assembly and factorization
+    # Spatial precompute cache: populated by _chol_fn/_chol_fn_fori during the
+    # forward Cholesky, then reused by _bwd_and_si_fn, _grad_prior_fn, and
+    # _grad_quad_fn to avoid redundant _theta_to_sc_coreg calls (~4s each).
+    # Cleared at the start of each objective_with_grad call.
+    _sc_cache = {}
+
+    import time as _time_mod  # for diagnostic timing inside _rs_aggregate_and_factorize
+
+    # ---- Reduced system assembly and factorization ----
+    # The reduced system has 2*P blocks (2 boundary blocks per rank).
+    # For small blocks (WA1, bs=3741): use lax.scan on GPU — all RS data fits.
+    # For large blocks (AP1/WA2, bs>10000): use per-block JIT with CPU staging
+    # to avoid GPU OOM (RS data would be ~50-70 GiB on GPU).
     n_rs = 2 * comm_size
 
     @jax.jit
@@ -648,74 +662,159 @@ def create_pure_jax_objective_distributed_coregional_twophase(
                 new_rhs_carry, arrow_rhs,
                 schur, arrow_schur, y_j, L_j, L_lower_j, L_arrow_j)
 
-    def _rs_aggregate_and_factorize(
-        my_diag, my_lower, my_arrow, my_tip, my_rhs,
-        arrow_tip_initial,
-    ):
-        """Allgather boundary blocks, then factorize reduced system with Python loop.
+    @jax.jit
+    def _rs_scan_factorize(rs_diag, rs_lower, rs_arrow, rs_tip, rs_rhs):
+        """Scan-based BTA Cholesky on reduced system — all on GPU, no CPU copies."""
+        def rs_scan_body(carry, idx):
+            schur, arrow_schur, tip_acc, logdet, rhs_carry, arrow_rhs = carry
+            diag_j = rs_diag[idx] - schur + _chol_eps_reg * _chol_eye_bs
+            L_j = _jax_cholesky(diag_j)
+            d_vals = jnp.diag(L_j)
+            safe_d = jnp.maximum(d_vals, _chol_eps)
+            logdet = logdet + 2.0 * jnp.sum(jnp.log(safe_d))
 
-        Uses per-block JIT and CPU storage to avoid keeping all (n_rs, bs, bs)
-        arrays on GPU simultaneously.
-        """
-        rs_diag, rs_lower, rs_arrow, rs_tip, rs_rhs = _rs_allgather(
-            my_diag, my_lower, my_arrow, my_tip, my_rhs, arrow_tip_initial)
+            lower_j = rs_lower[idx]
+            arrow_j = rs_arrow[idx]
+            L_lower_j = jax.scipy.linalg.solve_triangular(
+                L_j, lower_j.T, lower=True).T
+            L_arrow_j = jax.scipy.linalg.solve_triangular(
+                L_j, (arrow_j - arrow_schur).T, lower=True).T
 
-        # Copy to CPU and free GPU copies
-        rs_diag_np = np.asarray(rs_diag)
-        rs_lower_np = np.asarray(rs_lower)
-        rs_arrow_np = np.asarray(rs_arrow)
-        rs_tip_np = np.asarray(rs_tip)
-        rs_rhs_np = np.asarray(rs_rhs)
-        del rs_diag, rs_lower, rs_arrow, rs_rhs
+            new_schur = L_lower_j @ L_lower_j.T
+            new_arrow_schur = L_arrow_j @ L_lower_j.T
+            tip_acc = tip_acc - L_arrow_j @ L_arrow_j.T
 
-        # CPU storage for reduced system L factors
-        rs_stored_L_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
-        rs_stored_Ll_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
-        rs_stored_La_h = np.zeros((n_rs, n_fe, block_size), dtype=np_dtype)
-        rs_stored_cs_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
-        rs_stored_as_h = np.zeros((n_rs, n_fe, block_size), dtype=np_dtype)
-        rs_y_h = np.zeros((n_rs, block_size), dtype=np_dtype)
+            is_last = (idx == n_rs - 1)
+            new_schur = jnp.where(is_last, jnp.zeros_like(new_schur), new_schur)
+            new_arrow_schur = jnp.where(is_last,
+                                        jnp.zeros_like(new_arrow_schur), new_arrow_schur)
 
-        # Sequential BTA Cholesky on reduced system [1..n_rs-1]
-        schur = jnp.zeros((block_size, block_size), dtype=dtype)
-        arrow_schur = jnp.zeros((n_fe, block_size), dtype=dtype)
-        tip_acc = jnp.array(rs_tip_np, dtype=dtype)
-        logdet = jnp.array(0.0, dtype=dtype)
-        rhs_carry = jnp.zeros(block_size, dtype=dtype)
-        arrow_rhs = jnp.zeros(n_fe, dtype=dtype)
+            rhs_j = rs_rhs[idx]
+            y_j = jax.scipy.linalg.solve_triangular(L_j, rhs_j - rhs_carry, lower=True)
+            new_rhs_carry = L_lower_j @ y_j
+            new_rhs_carry = jnp.where(is_last,
+                                      jnp.zeros_like(new_rhs_carry), new_rhs_carry)
+            arrow_rhs = arrow_rhs - L_arrow_j @ y_j
 
-        for j_py in range(n_rs - 1):
-            idx = j_py + 1
-            is_last = jnp.array(idx == n_rs - 1)
-            (schur, arrow_schur, tip_acc, logdet,
-             rhs_carry, arrow_rhs,
-             cs_out, as_out, y_out,
-             L_out, Ll_out, La_out) = _rs_fwd_one_block(
-                schur, arrow_schur, tip_acc, logdet,
-                rhs_carry, arrow_rhs,
-                jnp.array(rs_diag_np[idx]),
-                jnp.array(rs_lower_np[idx]),
-                jnp.array(rs_arrow_np[idx]),
-                jnp.array(rs_rhs_np[idx]),
-                is_last)
-            rs_stored_cs_h[idx] = np.asarray(cs_out)
-            rs_stored_as_h[idx] = np.asarray(as_out)
-            rs_stored_L_h[idx] = np.asarray(L_out)
-            rs_stored_Ll_h[idx] = np.asarray(Ll_out)
-            rs_stored_La_h[idx] = np.asarray(La_out)
-            rs_y_h[idx] = np.asarray(y_out)
-            del cs_out, as_out, y_out, L_out, Ll_out, La_out
+            new_carry = (new_schur, new_arrow_schur, tip_acc, logdet,
+                         new_rhs_carry, arrow_rhs)
+            per_step = (schur, arrow_schur, y_j, L_j, L_lower_j, L_arrow_j)
+            return new_carry, per_step
 
-        # Factorize arrow tip
+        init_carry = (jnp.zeros((block_size, block_size), dtype=dtype),
+                      jnp.zeros((n_fe, block_size), dtype=dtype),
+                      rs_tip,
+                      jnp.array(0.0, dtype=dtype),
+                      jnp.zeros(block_size, dtype=dtype),
+                      jnp.zeros(n_fe, dtype=dtype))
+
+        carry_out, (cs_scan, as_scan, y_scan,
+                    L_scan, Ll_scan, La_scan) = lax.scan(
+            rs_scan_body, init_carry, jnp.arange(1, n_rs))
+
+        (_, _, tip_acc, logdet, _, arrow_rhs) = carry_out
+
+        # Pad scan outputs to full [0..n_rs-1] indexing
+        _z_bs2 = jnp.zeros((1, block_size, block_size), dtype=dtype)
+        _z_nfe_bs = jnp.zeros((1, n_fe, block_size), dtype=dtype)
+        _z_bs1 = jnp.zeros((1, block_size), dtype=dtype)
+        rs_stored_cs = jnp.concatenate([_z_bs2, cs_scan], axis=0)
+        rs_stored_as = jnp.concatenate([_z_nfe_bs, as_scan], axis=0)
+        rs_stored_L = jnp.concatenate([_z_bs2, L_scan], axis=0)
+        rs_stored_Ll = jnp.concatenate([_z_bs2, Ll_scan], axis=0)
+        rs_stored_La = jnp.concatenate([_z_nfe_bs, La_scan], axis=0)
+        rs_y = jnp.concatenate([_z_bs1, y_scan], axis=0)
+
         L_tip_rs = _jax_cholesky(tip_acc + _chol_eps_reg * _chol_eye_nfe)
         tip_diag = jnp.diag(L_tip_rs)
         safe_tip = jnp.maximum(tip_diag, _chol_eps)
         rs_logdet = logdet + 2.0 * jnp.sum(jnp.log(safe_tip))
 
-        return (rs_diag_np, rs_lower_np, rs_arrow_np, np.asarray(tip_acc),
-                rs_stored_cs_h, rs_stored_as_h,
-                rs_stored_L_h, rs_stored_Ll_h, rs_stored_La_h,
-                rs_logdet, L_tip_rs, rs_rhs_np, rs_y_h, arrow_rhs)
+        return (rs_stored_cs, rs_stored_as,
+                rs_stored_L, rs_stored_Ll, rs_stored_La,
+                rs_logdet, L_tip_rs, rs_y, arrow_rhs)
+
+    # RS scan stores all L factors on GPU: (n_rs-1) × 6 arrays × bs² × 8 bytes.
+    # For WA1 (bs=3741): ~5 GiB — fits. For AP1/WA2 (bs>12000): ~50+ GiB — OOM.
+    _rs_scan_mem = (n_rs - 1) * 6 * block_size**2 * 8
+    _use_rs_scan = _rs_scan_mem < 20 * 2**30
+
+    def _rs_aggregate_and_factorize(
+        my_diag, my_lower, my_arrow, my_tip, my_rhs,
+        arrow_tip_initial,
+    ):
+        """Allgather boundary blocks from all ranks, then factorize the reduced BTA system.
+
+        Two paths based on block size:
+        - Small blocks: single JIT with lax.scan (all data on GPU, no transfers)
+        - Large blocks: per-block JIT Python loop with CPU staging (1 block on GPU at a time)
+
+        Returns the same 14-element tuple regardless of path, with JAX or numpy arrays.
+        """
+        rs_diag, rs_lower, rs_arrow, rs_tip, rs_rhs = _rs_allgather(
+            my_diag, my_lower, my_arrow, my_tip, my_rhs, arrow_tip_initial)
+
+        jax.block_until_ready(rs_diag)
+        if '_rs_t0' in _chol_detail_timing:
+            _chol_detail_timing['rs_allgather'] = _time_mod.perf_counter() - _chol_detail_timing['_rs_t0']
+            _chol_detail_timing['_rs_t0'] = _time_mod.perf_counter()
+
+        if _use_rs_scan:
+            (rs_stored_cs, rs_stored_as,
+             rs_stored_L, rs_stored_Ll, rs_stored_La,
+             rs_logdet, L_tip_rs, rs_y, arrow_rhs) = _rs_scan_factorize(
+                rs_diag, rs_lower, rs_arrow, rs_tip, rs_rhs)
+        else:
+            # Per-block JIT fallback for large blocks (keeps 1 block on GPU at a time)
+            rs_stored_cs_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
+            rs_stored_as_h = np.zeros((n_rs, n_fe, block_size), dtype=np_dtype)
+            rs_stored_L_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
+            rs_stored_Ll_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
+            rs_stored_La_h = np.zeros((n_rs, n_fe, block_size), dtype=np_dtype)
+            rs_y_h = np.zeros((n_rs, block_size), dtype=np_dtype)
+
+            schur = jnp.zeros((block_size, block_size), dtype=dtype)
+            arrow_schur = jnp.zeros((n_fe, block_size), dtype=dtype)
+            tip_acc = rs_tip
+            logdet = jnp.array(0.0, dtype=dtype)
+            rhs_carry = jnp.zeros(block_size, dtype=dtype)
+            arrow_rhs = jnp.zeros(n_fe, dtype=dtype)
+
+            for j_py in range(n_rs - 1):
+                idx = j_py + 1
+                is_last = jnp.array(idx == n_rs - 1)
+                (schur, arrow_schur, tip_acc, logdet,
+                 rhs_carry, arrow_rhs,
+                 cs_out, as_out, y_out,
+                 L_out, Ll_out, La_out) = _rs_fwd_one_block(
+                    schur, arrow_schur, tip_acc, logdet,
+                    rhs_carry, arrow_rhs,
+                    rs_diag[idx], rs_lower[idx], rs_arrow[idx],
+                    rs_rhs[idx], is_last)
+                rs_stored_cs_h[idx] = np.asarray(cs_out)
+                rs_stored_as_h[idx] = np.asarray(as_out)
+                rs_stored_L_h[idx] = np.asarray(L_out)
+                rs_stored_Ll_h[idx] = np.asarray(Ll_out)
+                rs_stored_La_h[idx] = np.asarray(La_out)
+                rs_y_h[idx] = np.asarray(y_out)
+                del cs_out, as_out, y_out, L_out, Ll_out, La_out
+
+            L_tip_rs = _jax_cholesky(tip_acc + _chol_eps_reg * _chol_eye_nfe)
+            tip_diag = jnp.diag(L_tip_rs)
+            safe_tip = jnp.maximum(tip_diag, _chol_eps)
+            rs_logdet = logdet + 2.0 * jnp.sum(jnp.log(safe_tip))
+
+            rs_stored_cs = rs_stored_cs_h
+            rs_stored_as = rs_stored_as_h
+            rs_stored_L = rs_stored_L_h
+            rs_stored_Ll = rs_stored_Ll_h
+            rs_stored_La = rs_stored_La_h
+            rs_y = rs_y_h
+
+        return (rs_diag, rs_lower, rs_arrow, rs_tip,
+                rs_stored_cs, rs_stored_as,
+                rs_stored_L, rs_stored_Ll, rs_stored_La,
+                rs_logdet, L_tip_rs, rs_rhs, rs_y, arrow_rhs)
 
     _chol_detail_timing = {}
     _tp_profile_perblock = [False]
@@ -909,6 +1008,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         for m in range(n_models):
             arrow_tip_initial_jax = arrow_tip_initial_jax + likelihood_precs[m] * per_model_ata_tip[m]
 
+        _chol_detail_timing['_rs_t0'] = _time.perf_counter()
         (rs_diag_g, rs_lower_g, rs_arrow_g, rs_tip_final,
          rs_stored_cs, rs_stored_as,
          rs_stored_L, rs_stored_Ll, rs_stored_La,
@@ -918,6 +1018,8 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             my_rhs, arrow_tip_initial_jax)
 
         jax.block_until_ready(rs_logdet)
+        if '_rs_t0' in _chol_detail_timing:
+            _chol_detail_timing['rs_factorize'] = _time.perf_counter() - _chol_detail_timing['_rs_t0']
         _chol_detail_timing['rs_aggregate'] = _time.perf_counter() - _t0
         _t0 = _time.perf_counter()
 
@@ -974,6 +1076,10 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         likelihood_precs = _theta_to_likelihood_precs(theta)
         sc_list, coreg_w = _theta_to_sc_coreg(theta)
         sc_padded = _pad_subdiags(sc_list)
+        _sc_cache['sc_list'] = sc_list
+        _sc_cache['coreg_w'] = coreg_w
+        _sc_cache['sc_padded'] = sc_padded
+        _sc_cache['likelihood_precs'] = likelihood_precs
 
         rhs = _build_rhs(theta)
         rhs_st_global = rhs[:nt * block_size].reshape(nt, block_size)
@@ -1326,6 +1432,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
         _chol_detail_timing['local_blocks'] = _time.perf_counter() - _t0
         _t0 = _time.perf_counter()
+        _chol_detail_timing['_rs_t0'] = _t0
 
         # Phase 2: Allgather (2, bs, bs) per rank and factorize reduced system
         (rs_diag_g, rs_lower_g, rs_arrow_g, rs_tip_final,
@@ -1337,6 +1444,8 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             my_rhs, arrow_tip_initial)
 
         jax.block_until_ready(rs_logdet)
+        if '_rs_t0' in _chol_detail_timing:
+            _chol_detail_timing['rs_factorize'] = _time.perf_counter() - _chol_detail_timing['_rs_t0']
         _chol_detail_timing['rs_aggregate'] = _time.perf_counter() - _t0
         _t0 = _time.perf_counter()
 
@@ -1603,6 +1712,10 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         likelihood_precs = _theta_to_likelihood_precs(theta)
         sc_list, coreg_w = _theta_to_sc_coreg(theta)
         sc_padded = _pad_subdiags(sc_list)
+        _sc_cache['sc_list'] = sc_list
+        _sc_cache['coreg_w'] = coreg_w
+        _sc_cache['sc_padded'] = sc_padded
+        _sc_cache['likelihood_precs'] = likelihood_precs
 
         rhs = _build_rhs(theta)
         rhs_st_global = rhs[:nt * block_size].reshape(nt, block_size)
@@ -1819,10 +1932,12 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             my_tip = arrow_tip_acc
             my_rhs = jnp.stack([block0_rhs_acc, last_rhs])
 
+        jax.block_until_ready(my_diag)
         _chol_detail_timing['local_blocks'] = _time.perf_counter() - _t0
         _t0 = _time.perf_counter()
+        _chol_detail_timing['_rs_t0'] = _t0
 
-        # Phase 2: Reduced system
+        # Phase 2: Reduced system (split into allgather + scan for diagnostics)
         (rs_diag_g, rs_lower_g, rs_arrow_g, rs_tip_final,
          rs_stored_cs, rs_stored_as,
          rs_stored_L, rs_stored_Ll, rs_stored_La,
@@ -1832,6 +1947,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             my_rhs, arrow_tip_initial)
 
         jax.block_until_ready(rs_logdet)
+        _chol_detail_timing['rs_factorize'] = _time.perf_counter() - _chol_detail_timing['_rs_t0']
         _chol_detail_timing['rs_aggregate'] = _time.perf_counter() - _t0
         _t0 = _time.perf_counter()
 
@@ -1881,8 +1997,11 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
     @jax.jit
     def _bwd_allgather_reduce(local_x_st, local_quad):
-        x_gathered = mpi4jax.allgather(local_x_st, comm=comm)
-        x_st_global = x_gathered.reshape(-1, block_size)[:nt]
+        # Place local x at correct global indices, then allreduce
+        x_global = jnp.zeros((nt, block_size), dtype=dtype)
+        x_global = x_global.at[start_idx:start_idx + n_local].set(
+            local_x_st[:n_local])
+        x_st_global = mpi4jax.allreduce(x_global, op=MPI.SUM, comm=comm)
         quad_global = mpi4jax.allreduce(local_quad, op=MPI.SUM, comm=comm)
         return x_st_global, quad_global
 
@@ -1894,22 +2013,29 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         rhs = jnp.where(is_last, rhs, rhs - L_lower_j.T @ x_next)
         return jax.scipy.linalg.solve_triangular(L_j.T, rhs, lower=False)
 
-    def _rs_backward_sub(rs_stored_L_h, rs_stored_Ll_h, rs_stored_La_h,
-                         rs_y_h, L_tip, y_fe, x_fe):
-        """Backward sub on the reduced BTA system with Python loop."""
-        rs_x_h = np.zeros((n_rs, block_size), dtype=np_dtype)
-        x_next = jnp.zeros(block_size, dtype=dtype)
-        for j_py in range(n_rs - 1, 0, -1):
-            is_last = jnp.array(j_py == n_rs - 1)
-            x_j = _rs_bwd_one_block_fn(
-                jnp.array(rs_stored_L_h[j_py]),
-                jnp.array(rs_stored_Ll_h[j_py]),
-                jnp.array(rs_stored_La_h[j_py]),
-                jnp.array(rs_y_h[j_py]),
-                x_next, x_fe, is_last)
-            rs_x_h[j_py] = np.asarray(x_j)
-            x_next = x_j
-        return rs_x_h
+    @jax.jit
+    def _rs_backward_sub(rs_stored_L, rs_stored_Ll, rs_stored_La,
+                         rs_y, L_tip, y_fe, x_fe):
+        """Backward sub on the reduced BTA system — single JIT, all on GPU."""
+        rs_x = jnp.zeros((n_rs, block_size), dtype=dtype)
+
+        idx_last = n_rs - 1
+        rhs_last = rs_y[idx_last] - rs_stored_La[idx_last].T @ x_fe
+        x_last = jax.scipy.linalg.solve_triangular(
+            rs_stored_L[idx_last].T, rhs_last, lower=False)
+        rs_x = rs_x.at[idx_last].set(x_last)
+
+        def bwd_body(j, state):
+            rs_x_a, x_next = state
+            idx = n_rs - 2 - j
+            rhs = rs_y[idx] - rs_stored_La[idx].T @ x_fe - rs_stored_Ll[idx].T @ x_next
+            x_j = jax.scipy.linalg.solve_triangular(
+                rs_stored_L[idx].T, rhs, lower=False)
+            rs_x_a = rs_x_a.at[idx].set(x_j)
+            return rs_x_a, x_j
+
+        rs_x, _ = lax.fori_loop(0, n_rs - 2, bwd_body, (rs_x, x_last))
+        return rs_x
 
     @jax.jit
     def _rs_si(rs_stored_L, rs_stored_Ll, rs_stored_La, S_tip):
@@ -1969,7 +2095,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             rs_stored_L, rs_stored_Ll, rs_stored_La,
             rs_y, L_tip, y_fe, x_fe)
 
-        max_n_local = (nt + comm_size - 1) // comm_size
+        max_n_local = _max_n_local
         local_x_host = np.zeros((max_n_local, block_size), dtype=np_dtype)
 
         if rank == 0:
@@ -2355,44 +2481,90 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         sd = (L_inv.T - sl.T @ L_lower_j - sa.T @ L_arrow_j) @ L_inv
         return x_j, sd, sl, sa
 
-    def _rs_bwd_and_si(rs_stored_L_h, rs_stored_Ll_h, rs_stored_La_h,
-                       rs_y_h, L_tip, y_fe, x_fe, S_tip):
-        """Merged RS backward sub + SI with Python loop and CPU storage."""
-        rs_x_h = np.zeros((n_rs, block_size), dtype=np_dtype)
-        rs_sd_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
-        rs_sl_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
-        rs_sa_h = np.zeros((n_rs, n_fe, block_size), dtype=np_dtype)
+    if _use_rs_scan:
+        @jax.jit
+        def _rs_bwd_and_si(rs_stored_L, rs_stored_Ll, rs_stored_La,
+                           rs_y, L_tip, y_fe, x_fe, S_tip):
+            """Merged RS backward sub + SI — single JIT, all on GPU."""
+            idx_last = n_rs - 1
+            L_last = rs_stored_L[idx_last]
+            L_inv_last = jax.scipy.linalg.solve_triangular(
+                L_last, _chol_eye_bs, lower=True)
+            L_arrow_last = rs_stored_La[idx_last]
 
-        idx_last = n_rs - 1
-        x_last, sd_last, sa_last = _rs_bwd_si_last_block_fn(
-            jnp.array(rs_stored_L_h[idx_last]),
-            jnp.array(rs_stored_La_h[idx_last]),
-            jnp.array(rs_y_h[idx_last]),
-            x_fe, S_tip)
-        rs_x_h[idx_last] = np.asarray(x_last)
-        rs_sd_h[idx_last] = np.asarray(sd_last)
-        rs_sa_h[idx_last] = np.asarray(sa_last)
+            rhs_last = rs_y[idx_last] - L_arrow_last.T @ x_fe
+            x_last = jax.scipy.linalg.solve_triangular(L_last.T, rhs_last, lower=False)
 
-        x_next = x_last
-        sd_prev = sd_last
-        sa_prev = sa_last
-        for j_py in range(n_rs - 2, 0, -1):
-            x_j, sd_j, sl_j, sa_j = _rs_bwd_si_interior_fn(
-                jnp.array(rs_stored_L_h[j_py]),
-                jnp.array(rs_stored_Ll_h[j_py]),
-                jnp.array(rs_stored_La_h[j_py]),
-                jnp.array(rs_y_h[j_py]),
-                x_next, x_fe, sd_prev, sa_prev, S_tip)
-            rs_x_h[j_py] = np.asarray(x_j)
-            rs_sd_h[j_py] = np.asarray(sd_j)
-            rs_sl_h[j_py] = np.asarray(sl_j)
-            rs_sa_h[j_py] = np.asarray(sa_j)
-            x_next = x_j
-            sd_prev = sd_j
-            sa_prev = sa_j
-            del sl_j
+            sa_last = -S_tip @ L_arrow_last @ L_inv_last
+            sd_last = (L_inv_last.T - sa_last.T @ L_arrow_last) @ L_inv_last
 
-        return rs_x_h, rs_sd_h, rs_sl_h, rs_sa_h
+            rs_x = jnp.zeros((n_rs, block_size), dtype=dtype)
+            rs_sd = jnp.zeros((n_rs, block_size, block_size), dtype=dtype)
+            rs_sl = jnp.zeros((n_rs, block_size, block_size), dtype=dtype)
+            rs_sa = jnp.zeros((n_rs, n_fe, block_size), dtype=dtype)
+
+            rs_x = rs_x.at[idx_last].set(x_last)
+            rs_sd = rs_sd.at[idx_last].set(sd_last)
+            rs_sa = rs_sa.at[idx_last].set(sa_last)
+
+            def bwd_si_body(j, state):
+                rs_x_a, rs_sd_a, rs_sl_a, rs_sa_a, x_next, sd_prev, sa_prev = state
+                idx = n_rs - 2 - j
+                L_j = rs_stored_L[idx]
+                L_inv_j = jax.scipy.linalg.solve_triangular(
+                    L_j, _chol_eye_bs, lower=True)
+                L_lower_j = rs_stored_Ll[idx]
+                L_arrow_j = rs_stored_La[idx]
+                rhs_j = rs_y[idx] - L_arrow_j.T @ x_fe - L_lower_j.T @ x_next
+                x_j = jax.scipy.linalg.solve_triangular(L_j.T, rhs_j, lower=False)
+                sl_j = (-sd_prev @ L_lower_j - sa_prev.T @ L_arrow_j) @ L_inv_j
+                sa_j = (-sa_prev @ L_lower_j - S_tip @ L_arrow_j) @ L_inv_j
+                sd_j = (L_inv_j.T - sl_j.T @ L_lower_j - sa_j.T @ L_arrow_j) @ L_inv_j
+                rs_x_a = rs_x_a.at[idx].set(x_j)
+                rs_sd_a = rs_sd_a.at[idx].set(sd_j)
+                rs_sl_a = rs_sl_a.at[idx].set(sl_j)
+                rs_sa_a = rs_sa_a.at[idx].set(sa_j)
+                return rs_x_a, rs_sd_a, rs_sl_a, rs_sa_a, x_j, sd_j, sa_j
+
+            rs_x, rs_sd, rs_sl, rs_sa, _, _, _ = lax.fori_loop(
+                0, n_rs - 2, bwd_si_body,
+                (rs_x, rs_sd, rs_sl, rs_sa, x_last, sd_last, sa_last))
+
+            return rs_x, rs_sd, rs_sl, rs_sa
+    else:
+        def _rs_bwd_and_si(rs_stored_L, rs_stored_Ll, rs_stored_La,
+                           rs_y, L_tip, y_fe, x_fe, S_tip):
+            """Per-block JIT fallback for large blocks."""
+            rs_x_h = np.zeros((n_rs, block_size), dtype=np_dtype)
+            rs_sd_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
+            rs_sl_h = np.zeros((n_rs, block_size, block_size), dtype=np_dtype)
+            rs_sa_h = np.zeros((n_rs, n_fe, block_size), dtype=np_dtype)
+
+            idx_last = n_rs - 1
+            x_last, sd_last, sa_last = _rs_bwd_si_last_block_fn(
+                rs_stored_L[idx_last], rs_stored_La[idx_last],
+                rs_y[idx_last], x_fe, S_tip)
+            rs_x_h[idx_last] = np.asarray(x_last)
+            rs_sd_h[idx_last] = np.asarray(sd_last)
+            rs_sa_h[idx_last] = np.asarray(sa_last)
+
+            x_next = x_last
+            sd_prev = sd_last
+            sa_prev = sa_last
+            for j_py in range(n_rs - 2, 0, -1):
+                x_j, sd_j, sl_j, sa_j = _rs_bwd_si_interior_fn(
+                    rs_stored_L[j_py], rs_stored_Ll[j_py],
+                    rs_stored_La[j_py], rs_y[j_py],
+                    x_next, x_fe, sd_prev, sa_prev, S_tip)
+                rs_x_h[j_py] = np.asarray(x_j)
+                rs_sd_h[j_py] = np.asarray(sd_j)
+                rs_sl_h[j_py] = np.asarray(sl_j)
+                rs_sa_h[j_py] = np.asarray(sa_j)
+                x_next = x_j
+                sd_prev = sd_j
+                sa_prev = sa_j
+
+            return rs_x_h, rs_sd_h, rs_sl_h, rs_sa_h
 
     # ---- Merged bwd+SI orchestrator ----
 
@@ -2402,11 +2574,17 @@ def create_pure_jax_objective_distributed_coregional_twophase(
                        rs_stored_L, rs_stored_Ll, rs_stored_La,
                        rs_y):
         """Merged backward sub + SI gradient computation in a single pass."""
-        likelihood_precs = _theta_to_likelihood_precs(theta)
-        sc_list, coreg_w = _theta_to_sc_coreg(theta)
-        sc_padded = _pad_subdiags(sc_list)
-        jac_sc_list = _theta_to_jac_sc(theta)
-        jac_coreg_w = _theta_to_jac_coreg_w(theta)
+        likelihood_precs = _sc_cache['likelihood_precs'] if 'likelihood_precs' in _sc_cache else _theta_to_likelihood_precs(theta)
+        if 'sc_padded' in _sc_cache:
+            sc_padded = _sc_cache['sc_padded']
+            coreg_w = _sc_cache['coreg_w']
+        else:
+            sc_list, coreg_w = _theta_to_sc_coreg(theta)
+            sc_padded = _pad_subdiags(sc_list)
+        jac_sc_list = _sc_cache['jac_sc_list'] if 'jac_sc_list' in _sc_cache else _theta_to_jac_sc(theta)
+        jac_coreg_w = _sc_cache['jac_coreg_w'] if 'jac_coreg_w' in _sc_cache else _theta_to_jac_coreg_w(theta)
+        _sc_cache['jac_sc_list'] = jac_sc_list
+        _sc_cache['jac_coreg_w'] = jac_coreg_w
 
         q1s_a = jnp.stack([sc_padded[m]['q1s'] for m in range(n_models)])
         q2s_a = jnp.stack([sc_padded[m]['q2s'] for m in range(n_models)])
@@ -2444,7 +2622,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             rs_stored_L, rs_stored_Ll, rs_stored_La,
             rs_y, L_tip, y_fe, x_fe, S_tip)
 
-        max_n_local = (nt + comm_size - 1) // comm_size
+        max_n_local = _max_n_local
         local_x_host = np.zeros((max_n_local, block_size), dtype=np_dtype)
 
         g_st_acc = jnp.zeros((n_models, 3), dtype=dtype)
@@ -2913,11 +3091,17 @@ def create_pure_jax_objective_distributed_coregional_twophase(
                             L_tip, y_st_local, arrow_rhs_total,
                             rs_stored_L, rs_stored_Ll, rs_stored_La,
                             rs_y):
-        likelihood_precs = _theta_to_likelihood_precs(theta)
-        sc_list, coreg_w = _theta_to_sc_coreg(theta)
-        sc_padded = _pad_subdiags(sc_list)
-        jac_sc_list = _theta_to_jac_sc(theta)
-        jac_coreg_w = _theta_to_jac_coreg_w(theta)
+        likelihood_precs = _sc_cache['likelihood_precs'] if 'likelihood_precs' in _sc_cache else _theta_to_likelihood_precs(theta)
+        if 'sc_padded' in _sc_cache:
+            sc_padded = _sc_cache['sc_padded']
+            coreg_w = _sc_cache['coreg_w']
+        else:
+            sc_list, coreg_w = _theta_to_sc_coreg(theta)
+            sc_padded = _pad_subdiags(sc_list)
+        jac_sc_list = _sc_cache['jac_sc_list'] if 'jac_sc_list' in _sc_cache else _theta_to_jac_sc(theta)
+        jac_coreg_w = _sc_cache['jac_coreg_w'] if 'jac_coreg_w' in _sc_cache else _theta_to_jac_coreg_w(theta)
+        _sc_cache['jac_sc_list'] = jac_sc_list
+        _sc_cache['jac_coreg_w'] = jac_coreg_w
 
         q1s_a = jnp.stack([sc_padded[m]['q1s'] for m in range(n_models)])
         q2s_a = jnp.stack([sc_padded[m]['q2s'] for m in range(n_models)])
@@ -2954,7 +3138,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             rs_stored_L, rs_stored_Ll, rs_stored_La,
             rs_y, L_tip, y_fe, x_fe, S_tip)
 
-        max_n_local = (nt + comm_size - 1) // comm_size
+        max_n_local = _max_n_local
 
         g_st_acc = jnp.zeros((n_models, 3), dtype=dtype)
         g_lik_acc = jnp.zeros(n_models, dtype=dtype)
@@ -3095,32 +3279,73 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
         return quad_global, x, g_st_acc, grad_lik, g_c_acc
 
-    # ---- Stage 3: logdet Q_prior gradients (pipeline send/recv) ----
+    # ---- Stage 3: logdet Q_prior gradients ----
+    # Two paths for grad_prior (BT Cholesky + SI + gradient traces on Q_prior):
+    #
+    # 1. Two-phase (parallel): all ranks compute simultaneously, then allgather
+    #    boundary + RS factorize. Requires storing (n_local, bs, bs) Schurs on GPU.
+    #    Used for small blocks (WA1: bs=3741, ~24 GiB fits on 96 GiB GPU).
+    #
+    # 2. Pipeline (sequential): rank 0 forward → rank 1 forward → ... → backward.
+    #    No GPU memory issues but zero parallelism.
+    #    Used for large blocks (AP1/WA2: bs>12000, Schurs would be >50 GiB).
+    _grad_prior_total_mem = (n_local + 3 * n_rs) * block_size**2 * 8
+    _use_twophase_grad_prior_gpu = _grad_prior_total_mem < 40 * 2**30
 
     @jax.jit
-    def _grad_prior_fn(theta):
-        sc_list, coreg_w = _theta_to_sc_coreg(theta)
-        sc_padded = _pad_subdiags(sc_list)
-        jac_sc_list_padded = _theta_to_jac_sc_padded(theta)
-        jac_coreg_w = _theta_to_jac_coreg_w(theta)
-
+    def _grad_prior_fn_pipeline_jit(theta, sc_padded, coreg_w, jac_sc_list_padded, jac_coreg_w):
         logdet_prior, grad_prior_st, grad_prior_coreg = \
             pipeline_logdet_Q_prior_coregional_grad(
                 sc_padded, jac_sc_list_padded, coreg_w, jac_coreg_w,
                 n_models, ns, nt, dtype,
                 rank, comm_size, n_local, start_idx, comm)
-
         grad_prior_st_arr = jnp.stack(grad_prior_st)
         return logdet_prior, grad_prior_st_arr, grad_prior_coreg
+
+    if _use_twophase_grad_prior_gpu:
+        @jax.jit
+        def _grad_prior_fn_jit(theta, sc_padded, coreg_w, jac_sc_list_padded, jac_coreg_w):
+            logdet_prior, grad_prior_st, grad_prior_coreg = \
+                twophase_logdet_Q_prior_coregional_grad(
+                    sc_padded, jac_sc_list_padded, coreg_w, jac_coreg_w,
+                    n_models, ns, nt, dtype,
+                    rank, comm_size, n_local, start_idx, comm)
+            grad_prior_st_arr = jnp.stack(grad_prior_st)
+            return logdet_prior, grad_prior_st_arr, grad_prior_coreg
+
+    def _pad_jac_sc(jac_sc_list):
+        jac_sc_list_padded = []
+        for m in range(n_models):
+            jac_padded = {}
+            for key, val in jac_sc_list[m].items():
+                if key.endswith('_subdiag'):
+                    jac_padded[key] = jnp.concatenate(
+                        [val, jnp.zeros((1,) + val.shape[1:], dtype=dtype)], axis=0)
+                else:
+                    jac_padded[key] = val
+            jac_sc_list_padded.append(jac_padded)
+        return jac_sc_list_padded
+
+    def _grad_prior_fn(theta):
+        if 'sc_padded' in _sc_cache:
+            sc_padded = _sc_cache['sc_padded']
+            coreg_w = _sc_cache['coreg_w']
+        else:
+            sc_list, coreg_w = _theta_to_sc_coreg(theta)
+            sc_padded = _pad_subdiags(sc_list)
+        jac_sc_list = _sc_cache['jac_sc_list'] if 'jac_sc_list' in _sc_cache else _theta_to_jac_sc(theta)
+        jac_coreg_w = _sc_cache['jac_coreg_w'] if 'jac_coreg_w' in _sc_cache else _theta_to_jac_coreg_w(theta)
+        jac_sc_list_padded = _pad_jac_sc(jac_sc_list)
+        if _use_twophase_grad_prior_gpu:
+            return _grad_prior_fn_jit(theta, sc_padded, coreg_w, jac_sc_list_padded, jac_coreg_w)
+        else:
+            return _grad_prior_fn_pipeline_jit(theta, sc_padded, coreg_w, jac_sc_list_padded, jac_coreg_w)
 
     # ---- Stage 4: Quadratic form gradients ----
 
     @jax.jit
-    def _grad_quad_fn(theta, x):
-        likelihood_precs = _theta_to_likelihood_precs(theta)
-        sc_list, coreg_w = _theta_to_sc_coreg(theta)
-        jac_sc_list = _theta_to_jac_sc(theta)
-        jac_coreg_w = _theta_to_jac_coreg_w(theta)
+    def _grad_quad_fn_jit(theta, x, sc_list, coreg_w, likelihood_precs,
+                          jac_sc_list, jac_coreg_w):
         rhs = _build_rhs(theta)
 
         grad_quad_st, grad_quad_lik, grad_quad_coreg = \
@@ -3137,6 +3362,18 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
         grad_quad_st_arr = jnp.stack(grad_quad_st)
         return grad_quad_st_arr, grad_quad_lik, grad_quad_coreg
+
+    def _grad_quad_fn(theta, x):
+        likelihood_precs = _sc_cache['likelihood_precs'] if 'likelihood_precs' in _sc_cache else _theta_to_likelihood_precs(theta)
+        if 'sc_list' in _sc_cache:
+            sc_list = _sc_cache['sc_list']
+            coreg_w = _sc_cache['coreg_w']
+        else:
+            sc_list, coreg_w = _theta_to_sc_coreg(theta)
+        jac_sc_list = _sc_cache['jac_sc_list'] if 'jac_sc_list' in _sc_cache else _theta_to_jac_sc(theta)
+        jac_coreg_w = _sc_cache['jac_coreg_w'] if 'jac_coreg_w' in _sc_cache else _theta_to_jac_coreg_w(theta)
+        return _grad_quad_fn_jit(theta, x, sc_list, coreg_w, likelihood_precs,
+                                 jac_sc_list, jac_coreg_w)
 
     # ---- Stage 5: Scalar gradient terms ----
 
@@ -3216,6 +3453,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
                  + 0.5 * logdet_prior - 0.5 * logdet_cond + 0.5 * quad)
 
     def objective_with_grad(theta):
+        _sc_cache.clear()
         theta_jax = jnp.asarray(theta, dtype=dtype)
 
         if _use_fori_loop[0]:
@@ -3276,6 +3514,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
     def timed_objective_with_grad(theta):
         import time as _time
+        _sc_cache.clear()
         timing = {}
         theta_jax = jnp.asarray(theta, dtype=dtype)
 
@@ -3400,6 +3639,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
     objective_with_grad._scan_chunk = _scan_chunk
 
     def objective_fn(theta):
+        _sc_cache.clear()
         theta_jax = jnp.asarray(theta, dtype=dtype)
         (L_h, Ll_h, La_h,
          cs_host, as_host, buf_host,
@@ -3417,16 +3657,26 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         f_val = _compute_objective(theta_jax, logdet_cond, quad, logdet_prior)
         return float(f_val), np.asarray(x_val, dtype=np_dtype)
 
-    # Warmup: compile each stage
+    # JIT compilation: trace and compile each stage with dummy inputs.
+    # This is a one-time cost; subsequent calls reuse the compiled XLA programs.
+    import time as _compile_time
     theta_init = jnp.ones(n_hyperparameters, dtype=dtype)
     from dalia.utils import print_msg
 
+    _use_scan_str = f"fori, chunk={_scan_chunk}" if _use_fori_loop[0] else "per-block"
+    _rs_str = "scan" if _use_rs_scan else "per-block"
+    _gp_str = "two-phase" if _use_twophase_grad_prior_gpu else "pipeline"
+    print_msg(f"Two-phase ({_use_scan_str}, RS={_rs_str}, grad_prior={_gp_str}): "
+              f"JIT compiling all stages...")
+
+    _t_compile = _compile_time.perf_counter()
+
     if _use_fori_loop[0]:
-        print_msg(f"Two-phase (fori, chunk={_scan_chunk}): compiling Cholesky + forward sub...")
+        print_msg("  compiling Cholesky + forward sub...", flush=True)
         (cs0, as0, buf0, yst0, lt0, arr0, logdet0,
          rsd0, rsl0, rsa0, rscs0, rsas0,
          rsL0, rsLl0, rsLa0, rsy0) = _chol_fn_fori(theta_init)
-        print_msg("Two-phase (fori): compiling merged bwd+SI...")
+        print_msg("  compiling merged bwd+SI...", flush=True)
         quad0, x0, _, _, _ = _bwd_and_si_fn_fori(
             theta_init, cs0, as0, buf0, lt0, yst0, arr0,
             rsL0, rsLl0, rsLa0, rsy0)
@@ -3434,11 +3684,11 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         del cs0, as0, buf0, lt0
         del rsd0, rsl0, rsa0, rscs0, rsas0, rsL0, rsLl0, rsLa0
     else:
-        print_msg("Two-phase: compiling Cholesky + forward sub...")
+        print_msg("  compiling Cholesky + forward sub...", flush=True)
         (L0, Ll0, La0, cs0, as0, buf0, yst0, lt0, arr0, logdet0,
          rsd0, rsl0, rsa0, rscs0, rsas0,
          rsL0, rsLl0, rsLa0, rsy0) = _chol_fn(theta_init)
-        print_msg("Two-phase: compiling merged bwd+SI...")
+        print_msg("  compiling merged bwd+SI...", flush=True)
         quad0, x0, _, _, _ = _bwd_and_si_fn(
             theta_init, L0, Ll0, La0, buf0, lt0, yst0, arr0,
             rsL0, rsLl0, rsLa0, rsy0)
@@ -3446,12 +3696,14 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         del L0, Ll0, La0, cs0, as0, buf0, lt0
         del rsd0, rsl0, rsa0, rscs0, rsas0, rsL0, rsLl0, rsLa0
 
-    print_msg("Two-phase: compiling prior logdet + gradient...")
+    print_msg("  compiling prior logdet + gradient...", flush=True)
     _ = _grad_prior_fn(theta_init)
-    print_msg("Two-phase: compiling quad gradient...")
+    print_msg("  compiling quad gradient...", flush=True)
     _ = _grad_quad_fn(theta_init, x0)
-    print_msg("Two-phase: compiling scalar gradient...")
+    print_msg("  compiling scalar gradient...", flush=True)
     _ = _grad_scalar_fn(theta_init)
-    print_msg("Two-phase: all stages compiled.")
+
+    _t_compile = _compile_time.perf_counter() - _t_compile
+    print_msg(f"  all stages compiled in {_t_compile:.1f}s.")
 
     return objective_fn, objective_with_grad

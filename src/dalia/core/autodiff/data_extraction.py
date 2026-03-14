@@ -535,8 +535,23 @@ def _extract_static_data_distributed_coregional(dalia_instance, comm, dtype=None
     nt = static_data['nt']
     n_models = static_data['n_models']
 
-    n_locals = [nt // comm_size] * comm_size
-    n_locals[0] += nt % comm_size
+    # Balance partition: root uses standard BTA (faster), non-root uses
+    # permuted BTA with buffer (~2x slower per block). Give root more
+    # blocks so both sides finish their local scan at the same time.
+    # Solve: root_n + (P-1)*nonroot_n = nt
+    #        (root_n - 1) * 1.0 = (nonroot_n - 2) * ratio
+    if comm_size > 1:
+        ratio = 2.0
+        P = comm_size
+        nonroot_n = int(round((nt - 1 + 2 * ratio) / (ratio + P - 1)))
+        nonroot_n = max(nonroot_n, 3)
+        root_n = nt - (P - 1) * nonroot_n
+        root_n = max(root_n, 3)
+        remainder = nt - root_n - (P - 1) * nonroot_n
+        root_n += remainder
+        n_locals = [root_n] + [nonroot_n] * (P - 1)
+    else:
+        n_locals = [nt]
     start_idx = sum(n_locals[:rank])
     n_local = n_locals[rank]
 
@@ -599,6 +614,7 @@ def _extract_static_data_distributed_coregional(dalia_instance, comm, dtype=None
     static_data['comm_size'] = comm_size
     static_data['n_local'] = n_local
     static_data['start_idx'] = start_idx
+    static_data['max_n_local'] = max(n_locals)
 
     # Cache numpy copies of spatial/temporal matrices for CuPy streaming path
     models_data_np = []
