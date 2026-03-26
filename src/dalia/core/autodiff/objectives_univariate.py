@@ -1,4 +1,31 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""INLA objective functions for univariate models (single response variable).
+
+Each function implements the INLA objective::
+
+    f(theta) = 1/2 log|Q_p| - 1/2 log|Q_c| - 1/2 x*^T Q_p x*
+             + log p(y|x*,theta) + log pi(theta)
+
+where Q_p is the prior precision, Q_c = Q_p + tau A^T A is the conditional
+precision, and x* = Q_c^{-1} r is the posterior mode.
+
+Multiple variants are provided, corresponding to different differentiation
+strategies and solver backends:
+
+- ``_objective_gaussian_dense``: Dense solver, JAX AD through dense Cholesky.
+  Corresponds to the AD-Dense strategy.
+
+- ``_objective_gaussian_scan_baseline``: BTA solver via ``lax.scan``, JAX AD
+  through the scan (AD-Loop / AD-Loop-Ckpt strategies).
+
+- ``_objective_gaussian_sparse``: BTA solver with ``custom_vjp`` that
+  uses the structure-preserving backward pass (AD-BTA strategy).  The
+  ``custom_vjp`` registers ``fused_core_bwd`` which computes analytical
+  gradients via the three-phase decomposition:
+    - Phase A: SI + log|Q_c| gradient (from Schur carries)
+    - Phase B: quadratic form gradient (from posterior mode x*)
+    - Phase C: prior log|Q_p| gradient (separate BT sweep)
+"""
 
 import jax
 import jax.numpy as jnp
@@ -548,26 +575,41 @@ def _bt_cholesky_step(carry, i):
 
 
 def _objective_gaussian_sparse(theta, static_data):
-    """Pure JAX objective for Gaussian likelihood with sparse serinv solver.
+    """INLA objective for Gaussian likelihood using structure-preserving AD (AD-BTA).
 
-    Uses a ``custom_vjp`` (``fused_core``) that computes analytical
-    gradients via selected inversion, avoiding JAX AD through the
-    expensive BTA Cholesky scan.  Peak memory in the backward pass is
-    ~60 GiB (one copy of L/Sigma factors) instead of ~418 GiB.
+    Registers a ``jax.custom_vjp`` (``fused_core``) for the computational
+    core (factorization + solve + log-determinants).  The custom backward
+    pass ``fused_core_bwd`` computes exact analytical gradients via the
+    three-phase decomposition, replacing JAX's automatic tape with
+    structure-preserving operations:
+
+    **Forward (``fused_core_fwd``)**: fused BTA Cholesky + forward sub
+    (stores Schur carries + forward-sub vectors z_i), backward sub
+    (recovers posterior mode x*), and BT Cholesky for log|Q_p|.
+    Residuals saved: theta, x*, Schur carries, L_tip.
+
+    **Backward (``fused_core_bwd``)**:
+
+    - Phase A: selected inversion + tr(Z dQ_c/dtheta) from carries
+    - Phase B: x*^T (dQ_p/dtheta) x* from posterior mode
+    - Phase C: tr(Z_p dQ_p/dtheta) via separate BT SI sweep
+
+    Peak memory is dominated by the n stored Schur carries (n x b x b),
+    approximately half the memory of the full Cholesky factor.
 
     Parameters
     ----------
     theta : jnp.ndarray
-        Hyperparameters ``[r_s, r_t, sigma_st, theta_likelihood]``.
+        Hyperparameters [r_s, r_t, sigma_st, theta_lik].
     static_data : dict
         Static data from :func:`_extract_static_data`.
 
     Returns
     -------
-    objective : float
-        INLA objective value.
+    objective : scalar
+        INLA objective value (negated for minimization by L-BFGS-B).
     x : jnp.ndarray
-        Latent parameters.
+        Posterior mode x* = Q_c^{-1} r.
     """
     nt = static_data['nt']
     ns = static_data['ns']
@@ -662,8 +704,8 @@ def _objective_gaussian_sparse(theta, static_data):
 
         logdet_st = logdet_Q_st_scan(theta_st, spatial_matrices, temporal_matrices, manifold, nt, ns, dtype)
 
-        # Residuals: theta + x (~8 MB) + carries (~32 GiB) + L_tip (tiny).
-        # Carries are reused in backward for selected inversion (no recomputation).
+        # Residuals: theta (d floats) + x (nt*ns) + carries (nt * ns * ns) + L_tip (n_fe * n_fe).
+        # Carries dominate memory. L factors are reconstructed from carries during backward.
         residuals = (theta_st, theta_lik, x, stored_cs, stored_as, L_tip)
         return (logdet_st, logdet_cond, quad, x), residuals
 
@@ -673,7 +715,7 @@ def _objective_gaussian_sparse(theta, static_data):
 
         lik_prec = jnp.exp(theta_lik_r)
 
-        # --- Phase A: selected inversion using residual carries (no recomputation) ---
+        # --- Phase A: SI gradients for log|Q_c| ---
         sc = precompute_spatial_components(theta_st_r, spatial_matrices, temporal_matrices, manifold)
 
         jac_sc = jax.jacfwd(precompute_spatial_components)(
@@ -691,6 +733,7 @@ def _objective_gaussian_sparse(theta, static_data):
             ata_tip, dtype,
         )
 
+        # --- Phase B: quadratic form gradients for x*^T Q_p x* ---
         rhs = lik_prec * (a_sparse.T @ y)
 
         grad_quad_st, grad_quad_lik = _compute_grad_quad(
@@ -703,7 +746,7 @@ def _objective_gaussian_sparse(theta, static_data):
             ata_tip,
         )
 
-        # --- Phase B: logdet_Q_st gradient via analytical BT inversion ---
+        # --- Phase C: prior log-determinant gradients for log|Q_p| ---
         grad_logdet_st = bt_logdet_grad(
             theta_st_r, spatial_matrices, temporal_matrices,
             manifold, nt, ns, n_theta_st, dtype,
@@ -734,6 +777,7 @@ def _objective_gaussian_sparse(theta, static_data):
     eta = jnp.zeros_like(y)
     log_lik = _evaluate_gaussian_likelihood_jax(eta, y, theta_likelihood)
 
+    # Negate for minimization (L-BFGS-B minimizes, f(θ) is maximized)
     objective = -(
         log_prior_hp
         + log_lik
@@ -750,7 +794,9 @@ def _objective_gaussian_scan_baseline(theta, static_data, checkpoint=False):
 
     JAX AD differentiates through the scan directly, storing the full carry
     trajectory in the backward pass.  This serves as a baseline to measure
-    the memory cost avoided by our ``custom_vjp`` approach.
+    the memory cost avoided by our ``custom_vjp`` approach. 
+    This is kept for testing and benchmarking, 
+    but is not used in the final implementation due to high memory usage.
 
     Parameters
     ----------

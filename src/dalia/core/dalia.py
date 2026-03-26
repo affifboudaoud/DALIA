@@ -506,8 +506,9 @@ class DALIA:
         self.t_optimization = time.perf_counter() - t_opt_start
 
         # Print optimization summary before Hessian (in case Hessian crashes)
+        import numpy as _np_summary
         n_iters = len(self.objective_function_time) - 1
-        grad_times = np.array(self.objective_function_time[1:])
+        grad_times = _np_summary.array(self.objective_function_time[1:])
         f_final = float(minimization_result.get("f", float("nan")))
         print_msg(
             f"Optimization completed in {self.t_optimization:.2f}s "
@@ -1513,7 +1514,7 @@ class DALIA:
             eta[:] = self.model.a @ x_star
 
             Q_conditional = self.model.construct_Q_conditional(eta)
-            self.solver.cholesky(A=Q_conditional)
+            self.solver.cholesky(A=Q_conditional, sparsity="bta")
 
             rhs: NDArray = self.model.construct_information_vector(
                 eta,

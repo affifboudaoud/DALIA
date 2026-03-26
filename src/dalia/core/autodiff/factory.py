@@ -1,4 +1,26 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""Factory functions for creating single-GPU INLA objectives with AD.
+
+These functions extract static data from a DALIA model instance, select
+the appropriate objective function based on the model configuration
+(likelihood type, solver type, number of variables), JIT-compile it
+together with ``jax.value_and_grad``, and return callable functions for
+use in L-BFGS-B optimization.
+
+Three AD strategies are supported via the ``ad_mode`` parameter:
+
+- ``"default"`` (AD-BTA): custom backward pass via ``jax.custom_vjp``
+  using the structure-preserving gradient decomposition (Phases A/B/C).
+  Most memory-efficient; scales to million-variable models.
+
+- ``"scan"``: JAX AD through the ``lax.scan`` loop (AD-Loop).
+  Simple but stores all loop carries; OOMs on large models.
+
+- ``"scan_ckpt"``: JAX AD with gradient checkpointing (AD-Loop-Ckpt).
+  Reduces memory vs ``"scan"`` by recomputing forward intermediates.
+
+For distributed (multi-GPU) models, see :mod:`factory_distributed`.
+"""
 
 from typing import Callable, Tuple
 

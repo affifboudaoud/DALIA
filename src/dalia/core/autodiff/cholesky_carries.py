@@ -1,4 +1,40 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""Carry-based BTA Cholesky factorization, forward/backward substitution, and
+selected-inversion gradient accumulation.
+
+This module implements the fused forward pass and the carry-based backward pass
+for block-tridiagonal arrowhead (BTA) precision matrices.  The key idea is to
+**fuse** the Cholesky factorization with the forward substitution in a single
+sequential sweep so that per-block Cholesky factors (L_D, L_B, L_C) are used
+as temporaries and never stored.  Only the compact Schur complement carries
+S_i = L_B_i @ L_B_i^T are retained, halving storage relative to keeping the
+full factor (~n dense b x b blocks instead of ~2n).
+
+During the backward pass (back-substitution and selected inversion), the
+Cholesky factors are **reconstructed on the fly** from the stored carries and
+the original input blocks: given S_{i-1} and D_i, one Cholesky factorization
+and two triangular solves recover L_D_i, L_B_i, and L_C_i.  This trades
+one extra Cholesky per block for O(b^2) peak working memory per block.
+
+The gradient of log|Q_c| is computed via a fused selected inversion + trace
+accumulation sweep (Phase A of the analytical gradient decomposition), which
+runs backward from block n to 1 reconstructing L factors, computing the
+selected inverse entries Z_D, Z_B, Z_C, and immediately accumulating the
+per-block gradient contributions tr(Z_block @ dQ/dtheta) before discarding
+each Z block.  This keeps only two Z blocks live at any time.
+
+Functions
+---------
+lazy_bta_cholesky_carries
+    BTA Cholesky storing Schur carries (no forward substitution).
+fused_cholesky_fwd_sub
+    Fused BTA Cholesky + forward substitution in a single lax.scan.
+backward_sub_from_carries
+    Backward substitution L^T x = z with on-the-fly L reconstruction.
+selected_inversion_grads_from_carries_jax
+    Fused selected inversion + log-determinant gradient accumulation
+    (Phase A) with on-the-fly L reconstruction.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -18,15 +54,26 @@ def lazy_bta_cholesky_carries(
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
     ata_tip, dtype,
 ):
-    """BTA Cholesky storing carries instead of L factor blocks.
+    """BTA Cholesky factorization storing only Schur complement carries.
 
-    Same computation as :func:`lazy_bta_cholesky` but outputs the scan
-    carries ``(cond_schur, arrow_schur)`` entering each step instead of
-    the L factor blocks ``(L_diag, L_lower, L_arrow)``.  This reduces
-    scan output storage from ~64 GiB to ~32 GiB for gst_large.
+    Factorizes the conditional precision Q_c = L L^T where Q_c has
+    block-tridiagonal arrowhead (BTA) structure::
 
-    L blocks can be reconstructed on-the-fly from stored carries via
-    :func:`selected_inversion_grads_from_carries_jax`.
+        Q_c = | D_1   B_1^T         C_1^T |
+              | B_1   D_2   B_2^T   C_2^T |
+              |       ...   ...     ...   |
+              | C_1   C_2   ...     T     |
+
+    Instead of storing the full Cholesky factor (L_D, L_B, L_C for all
+    n blocks), only the Schur complement carries entering each step are
+    retained.  At step i, the carry S_i = L_B_i @ L_B_i^T propagates
+    the coupling from block i to block i+1 via the Schur complement
+    update D_{i+1} - S_i.  This halves storage (~n blocks instead of
+    ~2n).
+
+    The L factors can be reconstructed on-the-fly from stored carries
+    during the backward pass (see :func:`backward_sub_from_carries` and
+    :func:`selected_inversion_grads_from_carries_jax`).
 
     Parameters
     ----------
@@ -159,44 +206,74 @@ def fused_cholesky_fwd_sub(
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
     ata_tip, dtype,
 ):
-    """Fused BTA Cholesky + forward substitution in a single scan.
+    """Fused BTA Cholesky + forward substitution in a single sweep.
 
-    Combines the Cholesky factorization and forward solve ``L y = rhs``
-    into one :func:`lax.scan`, so L blocks are per-step intermediates
-    that are never stored as scan outputs.  Outputs the Schur complement
-    carries (~32 GiB for gst_large) and forward-sub solutions y_st (~8 MB).
+    Combines the Cholesky factorization of Q_c with the forward
+    substitution L z = r into one ``lax.scan`` over temporal blocks.
+    At each step i the per-block factors L_D_i, L_B_i, L_C_i are
+    computed, used for both the Schur complement update and the
+    forward-substitution step, and then discarded.
+
+    The fused pass computes::
+
+        L_D_i = chol(D_i - S_{i-1})              # diagonal factor
+        L_B_i = B_i @ L_D_i^{-T}                 # sub-diagonal factor
+        L_C_i = (C_i - C^L_{i-1} L_B_{i-1}^T) @ L_D_i^{-T}   # arrow factor
+        S_i   = L_B_i @ L_B_i^T                  # Schur carry -> next step
+        z_i   = L_D_i^{-1} (r_i - L_B_{i-1} z_{i-1})          # fwd sub
+
+    Only the Schur carries {S_i} and forward-sub vectors {z_i} are
+    retained.  The carries are needed for L reconstruction during the
+    backward pass; the z_i are needed for back-substitution.
+
+    This is the univariate (single-variable) version.  For coregional
+    models with k variables, see
+    :func:`coregional_solvers.fused_cholesky_fwd_sub_coregional`.
 
     Parameters
     ----------
     spatial_comp : dict
-        Output of :func:`precompute_spatial_components`.
-    nt, ns, n_fe : int
+        Output of :func:`precompute_spatial_components`.  Contains
+        precomputed spatial FEM matrices and temporal coefficients
+        from which each Q_p block is reconstructed on the fly.
+    nt : int
+        Number of temporal blocks (n in the BTA structure).
+    ns : int
+        Spatial block size (b in the BTA structure).
+    n_fe : int
+        Number of fixed-effect parameters (arrowhead tip size t).
     fe_prec : float
+        Fixed-effects prior precision.
     likelihood_prec : scalar
+        Observation precision tau = exp(theta_lik).
     rhs_st : (nt, ns)
-        Spatio-temporal portion of the right-hand side.
+        Spatio-temporal portion of the right-hand side r = tau A^T y.
     rhs_fe : (n_fe,)
         Fixed-effects portion of the right-hand side.
     ata_diag_rows, ata_diag_cols, ata_diag_vals : jnp.ndarray
-        Sparse COO for diagonal AtA blocks, shape (nt, max_nnz).
+        Sparse COO for diagonal A^T A blocks, shape (nt, max_nnz).
     ata_lower_rows, ata_lower_cols, ata_lower_vals : jnp.ndarray
-        Sparse COO for lower-diagonal AtA blocks, shape (nt-1, max_nnz).
+        Sparse COO for lower-diagonal A^T A blocks, shape (nt-1, max_nnz).
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals : jnp.ndarray
-        Sparse COO for arrow AtA blocks, shape (nt, max_nnz).
+        Sparse COO for arrow A^T A blocks, shape (nt, max_nnz).
     ata_tip : jnp.ndarray
-        Arrow tip AtA block, shape (n_fe, n_fe).
+        Arrow tip A^T A block, shape (n_fe, n_fe).
     dtype : jnp.dtype
 
     Returns
     -------
     stored_cond_schurs : (nt, ns, ns)
+        Schur complement carries entering each step.
     stored_arrow_schurs : (nt, n_fe, ns)
+        Arrow Schur complement entering each step.
     y_st : (nt, ns)
-        Forward substitution result for spatio-temporal blocks.
+        Forward substitution result z_i for spatio-temporal blocks.
     L_tip : (n_fe, n_fe)
+        Cholesky factor of the updated arrowhead tip.
     arrow_rhs_acc : (n_fe,)
-        Modified arrow rhs: ``rhs_fe - sum_i L_arrow[i] @ y_i``.
+        Modified arrow RHS: r_fe - sum_i L_C_i @ z_i.
     logdet_Q_cond : scalar
+        log|Q_c| = 2 sum_i log diag(L_D_i) + 2 log diag(L_T).
     """
     eps = jnp.finfo(dtype).eps
     is_fp32 = (dtype == jnp.float32)
@@ -320,34 +397,54 @@ def backward_sub_from_carries(
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
     nt, ns, n_fe, dtype,
 ):
-    """Backward substitution ``L^T x = y``, reconstructing L from carries.
+    """Backward substitution L^T x* = z with on-the-fly L reconstruction.
 
-    Performs the backward solve to obtain ``x = Q_cond^{-1} rhs``, where
-    the Cholesky factor L is reconstructed on-the-fly from stored Schur
-    complement carries, avoiding materialization of full L arrays.
+    Given the forward-substitution result z from
+    :func:`fused_cholesky_fwd_sub`, solves L^T x* = z to obtain the
+    posterior mode x* = Q_c^{-1} r.  The Cholesky factors are not
+    stored; instead, at each block i they are reconstructed from the
+    stored Schur carry S_{i-1} and the original input blocks::
 
-    Also computes the quadratic form ``rhs^T Q_cond^{-1} rhs = ||y||^2``.
+        L_D_i = chol(D_i + tau * AtA_diag_i - S_{i-1})
+        L_B_i = (B_i + tau * AtA_lower_i) @ L_D_i^{-T}
+        L_C_i = (tau * AtA_arrow_i - arrow_schur_i) @ L_D_i^{-T}
+
+    The backward sweep proceeds from block n to 1::
+
+        x*_T = L_T^{-T} z_T
+        x*_n = L_D_n^{-T} (z_n - L_C_n^T x*_T)
+        x*_i = L_D_i^{-T} (z_i - L_B_i^T x*_{i+1} - L_C_i^T x*_T)
+
+    Also computes ||z||^2 = r^T Q_c^{-1} r (the quadratic form needed
+    for the INLA objective).
 
     Parameters
     ----------
     stored_cond_schurs : (nt, ns, ns)
+        Schur carries from the forward pass.
     stored_arrow_schurs : (nt, n_fe, ns)
+        Arrow Schur carries from the forward pass.
     L_tip : (n_fe, n_fe)
+        Cholesky factor of the arrowhead tip.
     y_st : (nt, ns)
-        Forward substitution result for spatio-temporal blocks.
+        Forward-substitution vectors z_i.
     arrow_rhs_acc : (n_fe,)
-        Modified arrow rhs: ``rhs_fe - sum_i L_arrow[i] @ y_i``.
+        Modified arrow RHS: r_fe - sum_i L_C_i z_i.
     sc : dict
         Output of :func:`precompute_spatial_components` (unpadded).
     likelihood_prec : scalar
+        Observation precision tau.
     ata_* : sparse COO data
+        Sparse representation of A^T A blocks.
     nt, ns, n_fe : int
     dtype : jnp.dtype
 
     Returns
     -------
     x : (nt * ns + n_fe,)
+        Posterior mode x* = Q_c^{-1} r.
     quad : scalar
+        Quadratic form ||z||^2 = r^T Q_c^{-1} r.
     """
     is_fp32 = (dtype == jnp.float32)
     eps_reg = jnp.where(is_fp32, 1e-4, 0.0)
@@ -429,35 +526,67 @@ def selected_inversion_grads_from_carries_jax(
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
     ata_tip, dtype,
 ):
-    """Fused selected inversion + gradient accumulation from stored carries.
+    """Phase A: fused selected inversion + log-determinant gradient from carries.
 
-    Like :func:`selected_inversion_grads_jax` but takes scan carries
-    instead of L blocks.  L blocks are reconstructed on-the-fly from
-    ``stored_cond_schurs`` and ``stored_arrow_schurs``, reducing peak
-    memory from ~64 GiB (full L arrays) to ~32 GiB (carries only).
+    Computes the gradient of -1/2 log|Q_c| with respect to the
+    hyperparameters theta via the identity::
+
+        d(log|Q|)/d(theta_k) = tr(Q^{-1} dQ/d(theta_k))
+
+    Rather than forming the full inverse Q^{-1}, we compute only the
+    *selected inverse* entries Z_D_i, Z_B_i, Z_C_i (the entries of
+    Q^{-1} at positions where Q is nonzero) via a backward sweep from
+    block n to 1.  These entries suffice because dQ/d(theta_k) shares
+    the same BTA sparsity as Q, so all other entries contribute zero to
+    the trace.
+
+    The selected inversion recurrence (backward from block n to 1)::
+
+        Z_T       = (L_T L_T^T)^{-1}
+        Z_C_n     = -Z_T L_C_n L_D_n^{-1}
+        Z_D_n     = (L_D_n L_D_n^T)^{-1} - Z_C_n^T L_C_n L_D_n^{-1}
+        Z_B_i     = -(Z_D_{i+1} L_B_i + Z_C_{i+1}^T L_C_i) L_D_i^{-1}
+        Z_C_i     = -(Z_C_{i+1} L_B_i + Z_T L_C_i) L_D_i^{-1}
+        Z_D_i     = (L_D_i L_D_i^T)^{-1} - Z_B_i^T L_B_i L_D_i^{-1}
+                    - Z_C_i^T L_C_i L_D_i^{-1}
+
+    At each step, L factors are reconstructed from stored Schur carries
+    (same reconstruction as in :func:`backward_sub_from_carries`), and
+    gradient contributions are accumulated immediately via::
+
+        d(log|Q_c|)/d(theta_k) = sum_i tr(Z_D_i dD_i/dtheta_k)
+                                + 2 sum_i tr(Z_B_i^T dB_i/dtheta_k)
+                                + 2 sum_i tr(Z_C_i^T dC_i/dtheta_k)
+                                + tr(Z_T dT/dtheta_k)
+
+    Only two Z blocks are ever live at a time (Z_D_{i+1} and Z_D_i),
+    giving O(b^2) working memory per block.
 
     Parameters
     ----------
     stored_cond_schurs : (nt, ns, ns)
-        Schur complement entering each BTA Cholesky step.
+        Schur carries from the forward pass.
     stored_arrow_schurs : (nt, n_fe, ns)
-        Arrow Schur complement entering each step.
+        Arrow Schur carries from the forward pass.
     L_tip : (n_fe, n_fe)
         Arrow tip Cholesky factor.
     sc : dict
-        Output of :func:`precompute_spatial_components` (unpadded).
+        Spatial components from :func:`precompute_spatial_components`.
     jac_sc : dict
-        Jacobians of sc w.r.t. theta_st (from ``jax.jacfwd``).
+        Jacobians of spatial components w.r.t. theta_st (from ``jax.jacfwd``).
     nt, ns, n_fe, n_theta_st : int
     likelihood_prec : scalar
-    ata_* : sparse COO data for AtA blocks
+        Observation precision tau.
+    ata_* : sparse COO data for A^T A blocks.
     ata_tip : (n_fe, n_fe)
     dtype : jnp.dtype
 
     Returns
     -------
     grad_st : (n_theta_st,)
+        d(log|Q_c|)/d(theta_st).
     grad_lik : scalar
+        d(log|Q_c|)/d(theta_lik).
     """
     is_fp32 = (dtype == jnp.float32)
     eps_reg = jnp.where(is_fp32, 1e-4, 0.0)

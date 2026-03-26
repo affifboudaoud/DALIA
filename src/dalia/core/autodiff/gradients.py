@@ -1,4 +1,43 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""Analytical gradient routines for the INLA objective.
+
+The INLA objective f(theta) decomposes into independently differentiable
+terms.  By the envelope theorem, x* satisfies Q_c x* = r, so the
+implicit dependence of x* on theta contributes nothing to the total
+derivative and drops out.  The gradient then splits into three phases:
+
+    df/d(theta_k) = Phase_A + Phase_B + Phase_C + prior/likelihood terms
+
+**Phase A** — Selected inversion gradient for -1/2 log|Q_c|:
+    -1/2 tr(Q_c^{-1} dQ_c/d(theta_k))
+    Implemented as a fused backward sweep of selected inversion + trace
+    accumulation.  See :func:`selected_inversion_grads_jax` (full-factor)
+    and :func:`cholesky_carries.selected_inversion_grads_from_carries_jax`
+    (carry-based).
+
+**Phase B** — Quadratic form gradient for -1/2 x*^T Q_p x*:
+    -1/2 x*^T (dQ_p/d(theta_k)) x*
+    Since x* is treated as constant at the mode, differentiation passes
+    through directly to the BT blocks of Q_p.  See :func:`_compute_grad_quad`.
+
+**Phase C** — Prior log-determinant gradient for +1/2 log|Q_p|:
+    +1/2 tr(Q_p^{-1} dQ_p/d(theta_k))
+    Same structure as Phase A but for the prior precision Q_p (BT, no
+    arrowhead).  See :func:`bt_logdet_grad`.
+
+Functions
+---------
+bt_logdet_grad
+    Phase C: analytical gradient of log|Q_p| via BT selected inversion.
+_spatial_traces
+    Helper: compute tr(Z_block @ spatial_matrix) for all blocks.
+_compute_grad_logdet_cond
+    Phase A (full-factor): gradient of log|Q_c| from stored SI entries.
+_compute_grad_quad
+    Phase B: gradient of the quadratic form x*^T Q_p x*.
+selected_inversion_grads_jax
+    Phase A (full-factor): fused SI + gradient accumulation.
+"""
 
 import jax.numpy as jnp
 from jax import lax
@@ -17,17 +56,25 @@ import jax.scipy.linalg
 def bt_logdet_grad(
     theta_st, spatial_matrices, temporal_matrices, manifold, nt, ns, n_theta_st, dtype
 ):
-    """Analytical gradient of logdet(Q_st) via BT selected inversion.
+    """Phase C: analytical gradient of log|Q_p| via BT selected inversion.
 
-    Replaces ``jax.grad(logdet_Q_st_scan)`` with an analytical computation
-    that avoids the 32 GiB scan carry trajectory from AD.
+    Computes d(log|Q_p|)/d(theta_st) for the prior precision Q_p, which
+    has block-tridiagonal (BT) structure (no arrowhead).  This replaces
+    ``jax.grad(logdet_Q_st_scan)`` with a hand-derived computation that
+    avoids the AD tape entirely.
 
-    Algorithm:
-      1. Forward BT Cholesky scan storing Schur carries (``nt`` blocks of
-         ``(ns, ns)``).
-      2. Backward BT selected inversion sweep, reconstructing L blocks from
-         stored carries and accumulating ``tr(Σ_block @ ∂Q_st/∂θ)``
-         block-by-block.  Only one S block is live at a time.
+    The algorithm mirrors Phase A but is simpler (no arrowhead):
+
+    1. **Forward BT Cholesky** storing incoming Schur carries
+       S_i = L_B_i L_B_i^T (n blocks of (ns, ns)).
+    2. **Backward BT selected inversion** reconstructing L_D_i and
+       L_B_i from stored carries at each step, computing the SI
+       entries Z_D_i and Z_B_i, and immediately accumulating::
+
+           d(log|Q_p|)/d(theta_k) += tr(Z_D_i dD_i^p/d(theta_k))
+                                   + 2 tr(Z_B_i^T dB_i^p/d(theta_k))
+
+       Only one Z_D block is live at a time.
 
     Parameters
     ----------
@@ -214,12 +261,19 @@ def _compute_grad_logdet_cond(
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
     ata_tip,
 ):
-    """Compute d(logdet Q_cond)/d(theta_st) and d(logdet Q_cond)/d(theta_lik) analytically.
+    """Phase A (full-factor): gradient of log|Q_c| from stored SI entries.
 
-    Uses the identity: d(logdet Q)/d(theta) = tr(Q^{-1} dQ/d(theta)) = tr(Sigma dQ/d(theta)).
+    Given the full selected inverse entries (Z_D, Z_B, Z_C, Z_T) from
+    :func:`pobtasi_jax`, computes the log-determinant gradients via::
 
-    For theta_st: dQ_cond/d(theta_st) = dQ_st/d(theta_st) (likelihood term doesn't depend on theta_st).
-    For theta_lik: dQ_cond/d(theta_lik) = lik_prec * AtA.
+        d(log|Q_c|)/d(theta_k) = sum_i tr(Z_D_i dD_i/dtheta_k)
+                                + 2 sum_i tr(Z_B_i^T dB_i/dtheta_k)
+                                + 2 sum_i tr(Z_C_i^T dC_i/dtheta_k)
+                                + tr(Z_T dT/dtheta_k)
+
+    For spatio-temporal hyperparameters theta_st, only the prior part of
+    Q_c contributes (the A^T A term is independent of theta_st).
+    For the likelihood precision theta_lik, dQ_c/d(theta_lik) = tau * A^T A.
 
     Parameters
     ----------
@@ -365,11 +419,22 @@ def _compute_grad_quad(
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
     ata_tip,
 ):
-    """Compute total derivative of quad = rhs^T Q_cond^{-1} rhs w.r.t. theta.
+    """Phase B: gradient of the quadratic form x*^T Q_p x*.
 
-    Since x = Q_cond^{-1} rhs and quad = x^T Q_cond x = rhs^T Q_cond^{-1} rhs:
-    - d(quad)/d(theta_st[k]) = -x^T (dQ_st/d(theta_st[k])) x
-    - d(quad)/d(theta_lik) = 2 x^T rhs - lik_prec * x^T AtA x
+    The quadratic form x*^T Q_p x* expands via the BT block structure
+    of Q_p as::
+
+        x*^T Q_p x* = sum_i x*_i^T D_i^p x*_i
+                     + 2 sum_i x*_i^T B_i^{p,T} x*_{i+1}
+
+    By the envelope theorem, x* is treated as fixed at the posterior
+    mode, so differentiation passes directly to the blocks::
+
+        d(x*^T Q_p x*)/d(theta_k) = sum_i x*_i^T (dD_i^p/dtheta_k) x*_i
+                                   + 2 sum_i x*_i^T (dB_i^p/dtheta_k)^T x*_{i+1}
+
+    For theta_lik, the derivative of the full quadratic form
+    r^T Q_c^{-1} r also includes the A^T A contribution.
 
     Parameters
     ----------
@@ -514,13 +579,20 @@ def selected_inversion_grads_jax(
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
     ata_tip,
 ):
-    """Fused selected inversion + logdet-gradient accumulation.
+    """Phase A (full-factor, fused): SI + log-determinant gradient in one sweep.
 
-    Combines :func:`pobtasi_jax` and :func:`_compute_grad_logdet_cond`
-    into a single backward sweep so that only **one block** of Sigma is
-    live at a time.  This reduces peak memory from
-    ``L (64 GiB) + S (64 GiB) = 128 GiB`` to
-    ``L (64 GiB) + one S block (~128 MB) = ~64 GiB``.
+    Fuses the selected inversion (:func:`pobtasi_jax`) with the gradient
+    trace accumulation (:func:`_compute_grad_logdet_cond`) into a single
+    backward sweep.  At each block i, the SI entries Z_D_i, Z_B_i, Z_C_i
+    are computed, the gradient contributions tr(Z @ dQ/dtheta) are
+    accumulated, and the Z entries are discarded.  Only one Z_D block is
+    live at a time, reducing peak memory from
+    ``L (64 GiB) + full Z (64 GiB) = 128 GiB`` to
+    ``L (64 GiB) + one Z block (~128 MiB) = ~64 GiB``.
+
+    This version takes pre-computed L factor blocks.  For the carry-based
+    variant that also reconstructs L on the fly, see
+    :func:`cholesky_carries.selected_inversion_grads_from_carries_jax`.
 
     Parameters
     ----------

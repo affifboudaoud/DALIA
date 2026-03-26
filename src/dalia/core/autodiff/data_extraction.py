@@ -1,4 +1,15 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""Static data extraction from DALIA model instances for JAX compilation.
+
+JAX's JIT compiler requires all array shapes and static values to be known
+at compile time.  These functions extract model-specific data (observations,
+FEM matrices, A^T A sparse blocks, prior configurations, etc.) from a DALIA
+model instance into a flat dictionary of JAX arrays and Python scalars that
+can be closed over by the JIT-compiled objective function.
+
+The extraction is performed once before JIT compilation.  All dynamic data
+(hyperparameters theta) are passed as function arguments at call time.
+"""
 
 from typing import Dict, Any
 
@@ -152,6 +163,7 @@ def _extract_static_data(dalia_instance, dtype=None) -> Dict[str, Any]:
                 'm2': jnp.array(_to_numpy(st_submodel.m2.toarray()), dtype=dtype),
             },
         }
+
     else:
         # For dense solver, store A as dense
         a_matrix = _to_numpy(model.a.toarray()) if hasattr(model.a, 'toarray') else _to_numpy(model.a)
@@ -584,21 +596,15 @@ def _extract_static_data_distributed_coregional(dalia_instance, comm, dtype=None
         full_lc = static_data['per_model_ata_lower_cols'][m]
         full_lv = static_data['per_model_ata_lower_vals'][m]
 
-        if rank == 0:
-            zero_r = jnp.zeros((1, full_lr.shape[1]), dtype=jnp.int32)
-            zero_c = jnp.zeros((1, full_lc.shape[1]), dtype=jnp.int32)
-            zero_v = jnp.zeros((1, full_lv.shape[1]), dtype=full_lv.dtype)
-            sliced_lower_rows.append(
-                jnp.concatenate([zero_r, full_lr[:n_local - 1]], axis=0))
-            sliced_lower_cols.append(
-                jnp.concatenate([zero_c, full_lc[:n_local - 1]], axis=0))
-            sliced_lower_vals.append(
-                jnp.concatenate([zero_v, full_lv[:n_local - 1]], axis=0))
-        else:
-            lower_start = start_idx - 1
-            sliced_lower_rows.append(full_lr[lower_start:lower_start + n_local])
-            sliced_lower_cols.append(full_lc[lower_start:lower_start + n_local])
-            sliced_lower_vals.append(full_lv[lower_start:lower_start + n_local])
+        pad_r = jnp.zeros((1, full_lr.shape[1]), dtype=jnp.int32)
+        pad_c = jnp.zeros((1, full_lc.shape[1]), dtype=jnp.int32)
+        pad_v = jnp.zeros((1, full_lv.shape[1]), dtype=full_lv.dtype)
+        padded_lr = jnp.concatenate([full_lr, pad_r], axis=0)
+        padded_lc = jnp.concatenate([full_lc, pad_c], axis=0)
+        padded_lv = jnp.concatenate([full_lv, pad_v], axis=0)
+        sliced_lower_rows.append(padded_lr[start_idx:start_idx + n_local])
+        sliced_lower_cols.append(padded_lc[start_idx:start_idx + n_local])
+        sliced_lower_vals.append(padded_lv[start_idx:start_idx + n_local])
 
     static_data['per_model_ata_diag_rows'] = sliced_diag_rows
     static_data['per_model_ata_diag_cols'] = sliced_diag_cols

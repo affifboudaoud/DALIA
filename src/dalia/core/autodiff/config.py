@@ -1,4 +1,11 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""JAX configuration, precision management, and shared utility functions.
+
+Provides the precision configuration (float32/float64), format conversion
+utilities (scipy sparse to JAX BCOO, CuPy to numpy), likelihood evaluation
+functions in pure JAX, and the inner Newton iteration for non-Gaussian
+likelihoods (Poisson, Binomial).
+"""
 
 from typing import Tuple
 

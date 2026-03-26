@@ -1,4 +1,30 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""Spatial component precomputation and lazy BTA block reconstruction.
+
+The spatio-temporal prior precision Q_p has BTA structure where each block
+is a Kronecker-like combination of spatial FEM matrices and temporal
+coefficients::
+
+    Q_p = exp(gamma_st)^2 * (kron(M0, Q3s) + exp(gamma_t)*kron(M1, Q2s)
+                            + exp(gamma_t)^2*kron(M2, Q1s))
+
+Rather than materializing the full (nt, b, b) block arrays, we precompute
+the three spatial matrices Q1s, Q2s, Q3s (b x b each) and the temporal
+coefficient vectors from M0, M1, M2.  Each block can then be reconstructed
+on the fly at any time step i via::
+
+    D_i = scale * (m0_diag[i]*Q3s + exp_gt*m1_diag[i]*Q2s + exp_gt^2*m2_diag[i]*Q1s)
+    B_i = scale * (m0_sub[i]*Q3s  + exp_gt*m1_sub[i]*Q2s  + exp_gt^2*m2_sub[i]*Q1s)
+
+where scale = exp(gamma_st)^2 and exp_gt = exp(gamma_t).
+
+This lazy reconstruction is used throughout the Cholesky factorization,
+selected inversion, and gradient computations, saving O(nt * b^2) memory.
+
+For coregional models, each of k per-variable Q_m is precomputed
+independently, and the super-block is assembled by combining them with
+the coregional weight matrix W.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -136,7 +162,10 @@ def precompute_spatial_components(theta_st, spatial_matrices, temporal_matrices,
 
 
 def _reconstruct_diag_block(sc, i):
-    """Reconstruct diagonal block i of Q_st from spatial components."""
+    """Reconstruct diagonal block D_i of Q_p from precomputed spatial components.
+
+    D_i = scale * (m0_diag[i]*Q3s + exp_gt*m1_diag[i]*Q2s + exp_gt^2*m2_diag[i]*Q1s)
+    """
     return sc['scale'] * (
         sc['m0_diag'][i] * sc['q3s']
         + sc['exp_gt'] * sc['m1_diag'][i] * sc['q2s']
@@ -145,7 +174,10 @@ def _reconstruct_diag_block(sc, i):
 
 
 def _reconstruct_lower_block(sc, i):
-    """Reconstruct lower-diagonal block i of Q_st from spatial components."""
+    """Reconstruct sub-diagonal block B_i of Q_p from precomputed spatial components.
+
+    B_i = scale * (m0_sub[i]*Q3s + exp_gt*m1_sub[i]*Q2s + exp_gt^2*m2_sub[i]*Q1s)
+    """
     return sc['scale'] * (
         sc['m0_subdiag'][i] * sc['q3s']
         + sc['exp_gt'] * sc['m1_subdiag'][i] * sc['q2s']

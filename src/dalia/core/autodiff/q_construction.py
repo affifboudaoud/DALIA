@@ -1,4 +1,21 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""Construction and manipulation of BTA-structured precision matrices.
+
+Provides functions for building the prior precision Q_p and conditional
+precision Q_c = Q_p + tau A^T A in block-tridiagonal arrowhead (BTA)
+format, along with direct solvers and operations on BTA matrices.
+
+The BTA structure arises from the Kronecker product of temporal (tridiagonal)
+and spatial (dense) FEM matrices.  Each block D_i, B_i is a weighted
+combination of spatial matrices with temporal coefficients.  The arrowhead
+(columns C_i and tip T) comes from the observation model A^T A coupling
+the spatio-temporal blocks with fixed-effect regression coefficients.
+
+For large models, the block-level operations (Cholesky, solve, SI) in
+:mod:`cholesky`, :mod:`cholesky_carries`, and :mod:`gradients` should be
+used instead of the functions here, which operate on full dense or
+materialized BTA arrays.
+"""
 
 import jax.numpy as jnp
 from typing import Tuple

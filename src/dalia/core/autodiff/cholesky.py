@@ -1,4 +1,28 @@
 # Copyright 2024-2025 DALIA authors. All rights reserved.
+"""BTA Cholesky factorization and selected inversion (full-factor variants).
+
+This module provides the **full-factor** BTA Cholesky and selected inversion
+routines that store the complete Cholesky factor (L_D, L_B, L_C for all n
+blocks).  These correspond to the AD-Loop strategy: JAX's automatic
+differentiation can differentiate through the ``lax.scan`` loop, but must
+store all n loop carries for the backward pass, requiring ~2n dense b x b
+blocks in memory.
+
+For large models where this exceeds GPU capacity, the carry-based variants
+in :mod:`cholesky_carries` should be used instead; they store only the
+Schur complement carries and reconstruct L on the fly.
+
+Functions
+---------
+lazy_bta_cholesky
+    Full BTA Cholesky via lax.scan with lazy block reconstruction
+    (AD-Loop / AD-Loop-Ckpt strategies).
+pobtasi_jax
+    Selected inversion of a BTA matrix from its stored Cholesky factor.
+logdet_Q_st_scan
+    Differentiable log-determinant of the prior precision Q_p via a
+    checkpointed BT Cholesky scan (used for Phase C gradient).
+"""
 
 import jax.numpy as jnp
 from jax import lax
@@ -22,35 +46,50 @@ def lazy_bta_cholesky(
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals,
     ata_tip, dtype, checkpoint=False,
 ):
-    """Q_cond BTA Cholesky via ``lax.scan`` with lazy block reconstruction.
+    """BTA Cholesky storing the full factor (AD-Loop / AD-Loop-Ckpt strategy).
 
-    Each Q_cond block is reconstructed on the fly from three (ns, ns)
-    spatial matrices, avoiding the full (nt, ns, ns) materialization.
+    Factorizes Q_c = L L^T via ``lax.scan`` and outputs the complete
+    Cholesky factor blocks (L_D, L_B, L_C) for all n temporal steps.
+    Each Q_c block is reconstructed on the fly from precomputed spatial
+    components, avoiding materialization of the full block array.
+
+    When ``checkpoint=False`` (AD-Loop), JAX AD stores all n loop carries
+    and per-step L factors in the AD tape for the backward pass.
+    When ``checkpoint=True`` (AD-Loop-Ckpt), ``jax.checkpoint`` wraps
+    the scan body so intermediates are recomputed during backward,
+    reducing memory at the cost of extra forward computation.
+
+    For models where even the checkpointed variant exceeds GPU memory,
+    use the carry-based approach in :mod:`cholesky_carries` (AD-BTA
+    strategy) which stores only Schur carries and reconstructs L factors
+    on the fly during the backward pass.
 
     Parameters
     ----------
     spatial_comp : dict
         Output of :func:`precompute_spatial_components`.
-    nt, ns, n_fe : int
-        Number of temporal blocks, spatial block size, fixed-effects size.
+    nt : int
+        Number of temporal blocks (n in the BTA structure).
+    ns : int
+        Spatial block size (b in the BTA structure).
+    n_fe : int
+        Number of fixed-effect parameters (arrowhead tip size t).
     fe_prec : float
         Fixed-effects prior precision.
     likelihood_prec : scalar
-        Likelihood precision (exp(theta_likelihood)).
+        Observation precision tau = exp(theta_lik).
     ata_diag_rows, ata_diag_cols, ata_diag_vals : jnp.ndarray
-        Sparse COO for diagonal AtA blocks, shape (nt, max_nnz).
+        Sparse COO for diagonal A^T A blocks, shape (nt, max_nnz).
     ata_lower_rows, ata_lower_cols, ata_lower_vals : jnp.ndarray
-        Sparse COO for lower-diagonal AtA blocks, shape (nt-1, max_nnz).
+        Sparse COO for lower-diagonal A^T A blocks, shape (nt-1, max_nnz).
     ata_arrow_rows, ata_arrow_cols, ata_arrow_vals : jnp.ndarray
-        Sparse COO for arrow AtA blocks, shape (nt, max_nnz).
+        Sparse COO for arrow A^T A blocks, shape (nt, max_nnz).
     ata_tip : jnp.ndarray
-        Arrow tip AtA block, shape (n_fe, n_fe).
+        Arrow tip A^T A block, shape (n_fe, n_fe).
     dtype : jnp.dtype
-        Working dtype.
     checkpoint : bool, optional
         If True, wrap scan body with ``jax.checkpoint`` to trade compute
-        for memory — JAX will recompute the forward pass during backward
-        instead of storing the full carry trajectory. Default False.
+        for memory (AD-Loop-Ckpt strategy). Default False.
 
     Returns
     -------
@@ -169,14 +208,27 @@ def lazy_bta_cholesky(
 
 
 def pobtasi_jax(L_diag, L_lower, L_arrow, L_tip):
-    """Selected inversion of a BTA matrix from its Cholesky factors.
+    """Selected inversion of a BTA matrix from its stored Cholesky factor.
 
-    Computes the selected elements of the inverse (diagonal, lower-diagonal,
-    arrow-bottom and arrow-tip blocks) of a symmetric positive-definite
-    block-tridiagonal-arrowhead matrix given its lower Cholesky factor.
+    Given the Cholesky factor L of a BTA matrix Q = L L^T, computes the
+    *selected inverse* entries of Q^{-1}: those at positions where Q is
+    nonzero.  These are the block-diagonal Z_D_i = [Q^{-1}]_{ii},
+    block-sub-diagonal Z_B_i = [Q^{-1}]_{i+1,i}, arrow column
+    Z_C_i = [Q^{-1}]_{T,i}, and arrow tip Z_T = [Q^{-1}]_{T,T}.
+
+    Selected inversion is used in two contexts:
+    1. After optimization, to extract posterior marginal variances.
+    2. During the backward pass (Phase A), to compute the gradient of
+       log|Q_c| via tr(Q^{-1} dQ/dtheta).
+
+    The recurrence sweeps backward from block n to 1 (see the
+    ``selected_inversion_grads_from_carries_jax`` docstring for the
+    full recurrence equations).
 
     This is a pure-JAX port of :func:`serinv.algs.pobtasi._pobtasi`.
-    Arrays are **not** modified in-place; new arrays are returned.
+    Unlike the fused variants in :mod:`cholesky_carries`, this version
+    takes pre-computed L factor blocks rather than reconstructing them
+    from carries.
 
     Parameters
     ----------
@@ -265,31 +317,39 @@ def pobtasi_jax(L_diag, L_lower, L_arrow, L_tip):
 
 
 def logdet_Q_st_scan(theta_st, spatial_matrices, temporal_matrices, manifold, nt, ns, dtype):
-    """Compute logdet(Q_st) via a checkpointed BT Cholesky scan.
+    """Phase C (AD-Loop variant): log|Q_p| via checkpointed BT Cholesky.
 
-    This is a standalone differentiable function whose gradient w.r.t.
-    ``theta_st`` is computed by JAX AD (``jax.grad``).  The scan body is
-    wrapped with ``jax.checkpoint(prevent_cse=True)`` so that per-step
-    intermediates are recomputed during the backward pass instead of
-    stored (memory: ~32 GiB carry trajectory for gst_large).
+    Computes log|Q_p| for the prior precision Q_p, which has
+    block-tridiagonal (BT) structure (no arrowhead — the arrowhead
+    arises only in Q_c from the A^T A observation term).
+
+    This function is designed to be differentiated by ``jax.grad`` to
+    obtain d(log|Q_p|)/d(theta_st), producing the Phase C gradient
+    contribution to the INLA objective.  The scan body is wrapped with
+    ``jax.checkpoint`` so that per-step intermediates are recomputed
+    during the backward pass instead of stored.
+
+    For the custom analytical variant that avoids the AD tape entirely,
+    see :func:`gradients.bt_logdet_grad`.
 
     Parameters
     ----------
     theta_st : jnp.ndarray
-        Spatio-temporal hyperparameters ``[r_s, r_t, sigma_st]``.
+        Spatio-temporal hyperparameters [r_s, r_t, sigma_st].
     spatial_matrices, temporal_matrices : dict
-        FEM matrices.
+        FEM matrices for spatial and temporal discretization.
     manifold : str
         ``"sphere"`` or ``"plane"``.
-    nt, ns : int
-        Number of temporal blocks and spatial block size.
+    nt : int
+        Number of temporal blocks.
+    ns : int
+        Spatial block size.
     dtype : jnp.dtype
-        Working precision.
 
     Returns
     -------
     logdet : scalar
-        ``log|Q_st|``.
+        log|Q_p|.
     """
     sc = precompute_spatial_components(theta_st, spatial_matrices, temporal_matrices, manifold)
     eps = jnp.finfo(dtype).eps
