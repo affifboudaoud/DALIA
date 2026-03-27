@@ -567,7 +567,7 @@ def twophase_logdet_Q_prior_coregional_scan(
         last_lower = jnp.where(
             n_local > 1,
             _reconstruct_coregional_lower_block(
-                sc_list, coreg_w, n_models, ns, last_gi - 1),
+                sc_list, coreg_w, n_models, ns, last_gi),
             jnp.zeros((block_size, block_size), dtype=dtype))
         rs_lower_local = rs_lower_local.at[1].set(last_lower)
     else:
@@ -770,7 +770,7 @@ def twophase_logdet_Q_prior_coregional_grad(
         last_lower = jnp.where(
             n_local > 1,
             _reconstruct_coregional_lower_block(
-                sc_list, coreg_w, n_models, ns, last_gi - 1),
+                sc_list, coreg_w, n_models, ns, last_gi),
             jnp.zeros((block_size, block_size), dtype=dtype))
         rs_lower_local = rs_lower_local.at[1].set(last_lower)
     else:
@@ -781,27 +781,30 @@ def twophase_logdet_Q_prior_coregional_grad(
         block0_diag = _reconstruct_coregional_diag_block(
             sc_list, coreg_w, n_models, ns, first_gi)
 
+        stored_bufs = jnp.zeros((n_local, block_size, block_size), dtype=dtype)
+
         def nonroot_fwd_body(j, state):
-            schur, stored_, logdet, buf, b0_diag = state
+            schur, stored_, logdet, buf, b0_diag, stored_bufs_ = state
             local_j = j + 1
             stored_ = stored_.at[local_j].set(schur)
             global_i = global_indices[local_j]
             L_i, L_lower_i, new_schur, logdet_i = _bt_chol_step(schur, global_i)
             buf_solved = jax.scipy.linalg.solve_triangular(
                 L_i, buf.T, lower=True).T
+            stored_bufs_ = stored_bufs_.at[local_j].set(buf_solved)
             b0_diag = b0_diag - buf_solved @ buf_solved.T
             new_buf = -buf_solved @ L_lower_i.T
             new_buf = jnp.where(global_i < nt_global - 1,
                                 new_buf, jnp.zeros_like(new_buf))
-            return new_schur, stored_, logdet + logdet_i, new_buf, b0_diag
+            return new_schur, stored_, logdet + logdet_i, new_buf, b0_diag, stored_bufs_
 
         n_interior_nr = jnp.where(n_local > 2, n_local - 2, 0)
-        final_schur_nr, stored_schurs, local_logdet, final_buf, block0_diag_acc = \
+        final_schur_nr, stored_schurs, local_logdet, final_buf, block0_diag_acc, stored_bufs = \
             lax.fori_loop(
                 0, n_interior_nr, nonroot_fwd_body,
                 (jnp.zeros((block_size, block_size), dtype=dtype),
                  stored_schurs, jnp.array(0.0, dtype=dtype),
-                 buffer_init, block0_diag))
+                 buffer_init, block0_diag, stored_bufs))
 
         last_gi = start_idx + n_local - 1
         last_diag = _reconstruct_coregional_diag_block(
@@ -993,27 +996,31 @@ def twophase_logdet_Q_prior_coregional_grad(
         _, g_st_acc, g_c_acc = lax.fori_loop(
             0, n_local - 1, root_bwd_body, (sd_last, g_st_acc, g_c_acc))
     else:
-        # Non-root: block[0] SI comes from rs_sd[2*rank]
+        # Non-root: block[0] SI diagonal from RS, backward buffer from RS lower
         sd_block0 = rs_sd[2 * rank]
-        sl_block0 = rs_sl[2 * rank]
+        buf_X_init = rs_sl[2 * rank].T  # X_{top, last} = (X_{last, top})^T
 
-        # Interior blocks [n_local-2 .. 1] backward
+        # Interior blocks [n_local-2 .. 1] backward with permuted SI
+        # (matches serinv _pobtsi_permuted: carries backward buffer buf_X)
         def nonroot_bwd_body(i_rev, carry):
-            sd_prev, g_st_, g_c_ = carry
+            sd_prev, buf_X, g_st_, g_c_ = carry
             local_i = last_local - 1 - i_rev
             global_i = start_idx + local_i
             L_i, L_lower_i = _reconstruct_L_local(local_i)
             L_inv_i = jax.scipy.linalg.solve_triangular(L_i, eye_bs, lower=True)
-            sl_i = -sd_prev @ L_lower_i @ L_inv_i
-            sd_i = (L_inv_i.T - sl_i.T @ L_lower_i) @ L_inv_i
+            buf_fwd_i = stored_bufs[local_i]
+            sl_i = (-buf_X.T @ buf_fwd_i - sd_prev @ L_lower_i) @ L_inv_i
+            buf_X_new = (-buf_X @ L_lower_i - sd_block0 @ buf_fwd_i) @ L_inv_i
+            sd_i = (L_inv_i.T - sl_i.T @ L_lower_i - buf_X_new.T @ buf_fwd_i) @ L_inv_i
             g_st_i, g_c_i = _accumulate_traces(sd_i, sl_i, global_i, global_i)
-            return (sd_i, g_st_ + g_st_i, g_c_ + g_c_i)
+            return (sd_i, buf_X_new, g_st_ + g_st_i, g_c_ + g_c_i)
 
         n_bwd = jnp.where(n_local > 2, n_local - 2, 0)
-        _, g_st_acc, g_c_acc = lax.fori_loop(
-            0, n_bwd, nonroot_bwd_body, (sd_last, g_st_acc, g_c_acc))
+        _, buf_X_final, g_st_acc, g_c_acc = lax.fori_loop(
+            0, n_bwd, nonroot_bwd_body, (sd_last, buf_X_init, g_st_acc, g_c_acc))
 
-        # Block[0] traces
+        # Block[0] lower SI = buf_X_final^T (from permuted backward sweep)
+        sl_block0 = buf_X_final.T
         g_st_0, g_c_0 = _accumulate_traces(
             sd_block0, sl_block0, start_idx, start_idx)
         g_st_acc = g_st_acc + g_st_0
