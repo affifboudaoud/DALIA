@@ -3452,6 +3452,8 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         return -(log_prior_hp + log_lik
                  + 0.5 * logdet_prior - 0.5 * logdet_cond + 0.5 * quad)
 
+    _debug_components = {}
+
     def objective_with_grad(theta):
         _sc_cache.clear()
         theta_jax = jnp.asarray(theta, dtype=dtype)
@@ -3509,6 +3511,10 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             grad_prior_st, grad_prior_coreg,
             grad_quad_st, grad_quad_lik, grad_quad_coreg,
             grad_scalar)
+
+        _debug_components['grad_cond_lik'] = np.asarray(grad_cond_lik, dtype=np_dtype)
+        _debug_components['grad_quad_lik'] = np.asarray(grad_quad_lik, dtype=np_dtype)
+        _debug_components['grad_scalar'] = np.asarray(grad_scalar, dtype=np_dtype)
 
         return float(f_val), np.asarray(grad_val, dtype=np_dtype), np.asarray(x_val, dtype=np_dtype)
 
@@ -3637,6 +3643,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
     objective_with_grad._use_cupy_streaming = _use_cupy_streaming
     objective_with_grad._use_fori_loop = _use_fori_loop
     objective_with_grad._scan_chunk = _scan_chunk
+    objective_with_grad._debug_components = _debug_components
 
     def objective_fn(theta):
         _sc_cache.clear()

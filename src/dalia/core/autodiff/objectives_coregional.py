@@ -922,61 +922,20 @@ def _objective_gaussian_coregional_sparse_fused(theta, static_data):
                 per_model_ata_arrow_rows, per_model_ata_arrow_cols, per_model_ata_arrow_vals,
                 per_model_ata_tip, per_model_offsets)
 
-        # Compute per-model likelihood quad gradient properly
-        x_st = x_r[:nt * block_size].reshape(nt, block_size)
-        x_fe = x_r[nt * block_size:]
+        # d(quad)/d(prec_m) = prec_m * (2*x^T A_m^T y_m - x^T AtA_m x)
+        #                   = prec_m * eta_m^T (2*y_m - eta_m)   where eta_m = A_m x
+        # The naive formula subtracts two O(1e9) scalars to get an O(1e3) result,
+        # losing ~6 digits to cancellation. The eta formulation avoids this.
         grad_quad_lik = jnp.zeros(n_models, dtype=dtype)
 
         for m in range(n_models):
-            m_off = per_model_offsets[m] * ns
             prec_m = likelihood_precs[m]
-
-            # x^T AtA_m x
-            xAtAx_d = jnp.array(0.0, dtype=dtype)
-            for t in range(nt):
-                xAtAx_d = xAtAx_d + jnp.sum(
-                    x_st[t, m_off + per_model_ata_diag_rows[m][t]]
-                    * per_model_ata_diag_vals[m][t]
-                    * x_st[t, m_off + per_model_ata_diag_cols[m][t]])
-
-            xAtAx_l = jnp.array(0.0, dtype=dtype)
-            for t in range(nt - 1):
-                xAtAx_l = xAtAx_l + jnp.sum(
-                    x_st[t + 1, m_off + per_model_ata_lower_rows[m][t]]
-                    * per_model_ata_lower_vals[m][t]
-                    * x_st[t, m_off + per_model_ata_lower_cols[m][t]])
-
-            xAtAx_a = jnp.array(0.0, dtype=dtype)
-            for t in range(nt):
-                xAtAx_a = xAtAx_a + jnp.sum(
-                    x_fe[per_model_ata_arrow_rows[m][t]]
-                    * per_model_ata_arrow_vals[m][t]
-                    * x_st[t, m_off + per_model_ata_arrow_cols[m][t]])
-
-            xAtAx_tip = x_fe @ per_model_ata_tip[m] @ x_fe
-            xAtAx_m = xAtAx_d + 2.0 * xAtAx_l + 2.0 * xAtAx_a + xAtAx_tip
-
-            # x^T A_m^T y_m: reconstruct from sparse COO structure
-            # Actually use: d(quad)/d(theta_lik_m) = 2*x^T*rhs_m - prec_m*x^T*AtA_m*x
-            # where rhs_m = prec_m * A_m^T y_m
-            # Reconstruct rhs_m from AtA structure: rhs_m is the contribution from
-            # model m alone. We can get x^T A_m^T y_m from:
-            # Note that x^T rhs = sum_m x^T rhs_m, and for the gradient we need:
-            # d(quad)/d(theta_lik_m) = 2*prec_m*(x^T A_m^T y_m) - prec_m*xAtAx_m
-            # = prec_m * (2*(x^T rhs_m / prec_m) - xAtAx_m)
-            # Hmm, simpler: rhs_m = prec_m * A_m^T y_m, so x^T A_m^T y_m = x^T rhs_m / prec_m
-            # And x^T rhs_m can be computed: build rhs_m
-            rhs_m = jnp.zeros(nt * block_size + n_fe, dtype=dtype)
             obs_start = n_observations_idx[m]
             obs_end = n_observations_idx[m + 1]
-            y_m_weighted = jnp.zeros_like(y)
-            y_m_weighted = y_m_weighted.at[obs_start:obs_end].set(y[obs_start:obs_end])
-            rhs_m = a_sparse.T @ y_m_weighted
-
-            xTAmy = jnp.dot(x_r, rhs_m)
-
+            y_m = y[obs_start:obs_end]
+            a_m_x = a_sparse[obs_start:obs_end] @ x_r
             grad_quad_lik = grad_quad_lik.at[m].set(
-                prec_m * (2.0 * xTAmy - xAtAx_m))
+                prec_m * jnp.dot(a_m_x, 2.0 * y_m - a_m_x))
 
         # --- Phase C: logdet_prior gradient ---
         jac_sc_list_padded = []

@@ -441,53 +441,22 @@ def pipeline_compute_grad_quad_coregional(
         0, n_local, quad_body, (grad_per_model_st, grad_coreg))
 
     # --- Likelihood gradient ---
+    # d(quad)/d(prec_m) = prec_m * (2*x^T A_m^T y_m - x^T AtA_m x)
+    #                   = prec_m * eta_m^T (2*y_m - eta_m)   where eta_m = A_m x
+    # The naive formula subtracts two O(1e9) scalars to get an O(1e3) result,
+    # losing ~6 digits to cancellation. The eta formulation avoids this by
+    # working directly with the O(n_obs) linear predictor.
     grad_per_model_lik = jnp.zeros(n_models, dtype=dtype)
 
     for m in range(n_models):
-        m_off = per_model_offsets[m] * ns
         prec_m = likelihood_precs[m]
-
-        # Local x^T AtA_m x contributions
-        local_xAtAx_d = jnp.array(0.0, dtype=dtype)
-        for t_local in range(n_local):
-            t = start_idx + t_local
-            local_xAtAx_d = local_xAtAx_d + jnp.sum(
-                x_st[t, m_off + per_model_ata_diag_rows[m][t_local]]
-                * per_model_ata_diag_vals[m][t_local]
-                * x_st[t, m_off + per_model_ata_diag_cols[m][t_local]])
-
-        local_xAtAx_l = jnp.array(0.0, dtype=dtype)
-        for t_local in range(n_local):
-            t = start_idx + t_local
-            t_next = min(t + 1, nt_global - 1)
-            valid = jnp.array(1.0 if t < nt_global - 1 else 0.0, dtype=dtype)
-            local_xAtAx_l = local_xAtAx_l + valid * jnp.sum(
-                x_st[t_next, m_off + per_model_ata_lower_rows[m][t_local]]
-                * per_model_ata_lower_vals[m][t_local]
-                * x_st[t, m_off + per_model_ata_lower_cols[m][t_local]])
-
-        local_xAtAx_a = jnp.array(0.0, dtype=dtype)
-        for t_local in range(n_local):
-            t = start_idx + t_local
-            local_xAtAx_a = local_xAtAx_a + jnp.sum(
-                x_fe[per_model_ata_arrow_rows[m][t_local]]
-                * per_model_ata_arrow_vals[m][t_local]
-                * x_st[t, m_off + per_model_ata_arrow_cols[m][t_local]])
-
-        xAtAx_tip = jnp.where(rank == 0, x_fe @ per_model_ata_tip[m] @ x_fe, 0.0)
-
-        local_xAtAx = local_xAtAx_d + 2.0 * local_xAtAx_l + 2.0 * local_xAtAx_a + xAtAx_tip
-        xAtAx_m = mpi4jax.allreduce(local_xAtAx, op=MPI.SUM, comm=comm)
-
         obs_start = n_observations_idx[m]
         obs_end = n_observations_idx[m + 1]
-        y_m_weighted = jnp.zeros_like(y)
-        y_m_weighted = y_m_weighted.at[obs_start:obs_end].set(y[obs_start:obs_end])
-        rhs_m = a_sparse.T @ y_m_weighted
-        xTAmy = jnp.dot(x, rhs_m)
 
+        y_m = y[obs_start:obs_end]
+        a_m_x = a_sparse[obs_start:obs_end] @ x
         grad_per_model_lik = grad_per_model_lik.at[m].set(
-            prec_m * (2.0 * xTAmy - xAtAx_m))
+            prec_m * jnp.dot(a_m_x, 2.0 * y_m - a_m_x))
 
     grad_per_model_st = mpi4jax.allreduce(grad_per_model_st, op=MPI.SUM, comm=comm)
     grad_coreg = mpi4jax.allreduce(grad_coreg, op=MPI.SUM, comm=comm)
