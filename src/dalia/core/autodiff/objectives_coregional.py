@@ -926,16 +926,17 @@ def _objective_gaussian_coregional_sparse_fused(theta, static_data):
         #                   = prec_m * eta_m^T (2*y_m - eta_m)   where eta_m = A_m x
         # The naive formula subtracts two O(1e9) scalars to get an O(1e3) result,
         # losing ~6 digits to cancellation. The eta formulation avoids this.
+        eta = a_sparse @ x_r
         grad_quad_lik = jnp.zeros(n_models, dtype=dtype)
 
         for m in range(n_models):
             prec_m = likelihood_precs[m]
             obs_start = n_observations_idx[m]
             obs_end = n_observations_idx[m + 1]
+            eta_m = eta[obs_start:obs_end]
             y_m = y[obs_start:obs_end]
-            a_m_x = a_sparse[obs_start:obs_end] @ x_r
             grad_quad_lik = grad_quad_lik.at[m].set(
-                prec_m * jnp.dot(a_m_x, 2.0 * y_m - a_m_x))
+                prec_m * jnp.dot(eta_m, 2.0 * y_m - eta_m))
 
         # --- Phase C: logdet_prior gradient ---
         jac_sc_list_padded = []

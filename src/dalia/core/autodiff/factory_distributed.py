@@ -3437,6 +3437,16 @@ def create_pure_jax_objective_distributed_coregional_twophase(
 
         return bar_theta
 
+    def _sync_outputs(f_val, grad_val, x_val):
+        """Broadcast f, grad, x from rank 0 so all ranks give scipy identical values."""
+        f_np = np.array([float(f_val)], dtype=np_dtype)
+        grad_np = np.array(grad_val, dtype=np_dtype, copy=True)
+        x_np = np.array(x_val, dtype=np_dtype, copy=True)
+        comm.Bcast(f_np, root=0)
+        comm.Bcast(grad_np, root=0)
+        comm.Bcast(x_np, root=0)
+        return float(f_np[0]), grad_np, x_np
+
     # ---- Public API ----
 
     def _compute_objective(theta_jax, logdet_cond, quad, logdet_prior):
@@ -3516,7 +3526,7 @@ def create_pure_jax_objective_distributed_coregional_twophase(
         _debug_components['grad_quad_lik'] = np.asarray(grad_quad_lik, dtype=np_dtype)
         _debug_components['grad_scalar'] = np.asarray(grad_scalar, dtype=np_dtype)
 
-        return float(f_val), np.asarray(grad_val, dtype=np_dtype), np.asarray(x_val, dtype=np_dtype)
+        return _sync_outputs(f_val, grad_val, x_val)
 
     def timed_objective_with_grad(theta):
         import time as _time
@@ -3600,8 +3610,8 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             grad_quad_st, grad_quad_lik, grad_quad_coreg,
             grad_scalar)
 
-        return float(f_val), np.asarray(grad_val, dtype=np_dtype), \
-            np.asarray(x_val, dtype=np_dtype), timing
+        f_sync, grad_sync, x_sync = _sync_outputs(f_val, grad_val, x_val)
+        return f_sync, grad_sync, x_sync, timing
 
     def timed_perblock_objective_with_grad(theta):
         _tp_profile_perblock[0] = True
@@ -3662,7 +3672,11 @@ def create_pure_jax_objective_distributed_coregional_twophase(
             rs_y)
         logdet_prior = _logdet_prior_fn(theta_jax)
         f_val = _compute_objective(theta_jax, logdet_cond, quad, logdet_prior)
-        return float(f_val), np.asarray(x_val, dtype=np_dtype)
+        f_np = np.array([float(f_val)], dtype=np_dtype)
+        x_np = np.array(x_val, dtype=np_dtype, copy=True)
+        comm.Bcast(f_np, root=0)
+        comm.Bcast(x_np, root=0)
+        return float(f_np[0]), x_np
 
     # JIT compilation: trace and compile each stage with dummy inputs.
     # This is a one-time cost; subsequent calls reuse the compiled XLA programs.

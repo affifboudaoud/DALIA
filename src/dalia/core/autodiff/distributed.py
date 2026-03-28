@@ -446,6 +446,7 @@ def pipeline_compute_grad_quad_coregional(
     # The naive formula subtracts two O(1e9) scalars to get an O(1e3) result,
     # losing ~6 digits to cancellation. The eta formulation avoids this by
     # working directly with the O(n_obs) linear predictor.
+    eta = a_sparse @ x
     grad_per_model_lik = jnp.zeros(n_models, dtype=dtype)
 
     for m in range(n_models):
@@ -453,10 +454,10 @@ def pipeline_compute_grad_quad_coregional(
         obs_start = n_observations_idx[m]
         obs_end = n_observations_idx[m + 1]
 
+        eta_m = eta[obs_start:obs_end]
         y_m = y[obs_start:obs_end]
-        a_m_x = a_sparse[obs_start:obs_end] @ x
         grad_per_model_lik = grad_per_model_lik.at[m].set(
-            prec_m * jnp.dot(a_m_x, 2.0 * y_m - a_m_x))
+            prec_m * jnp.dot(eta_m, 2.0 * y_m - eta_m))
 
     grad_per_model_st = mpi4jax.allreduce(grad_per_model_st, op=MPI.SUM, comm=comm)
     grad_coreg = mpi4jax.allreduce(grad_coreg, op=MPI.SUM, comm=comm)
